@@ -1,0 +1,23 @@
+GO ?= go
+
+.PHONY: fmt vet lint test test-race quality clean
+
+fmt:
+	$(GO) fmt ./...
+
+vet:
+	$(GO) vet ./...
+
+lint:
+	golangci-lint run ./...
+
+test:
+	$(GO) test ./... -count=1
+
+test-race:
+	$(GO) test ./... -race -count=1
+
+quality: fmt vet test
+
+clean:
+	$(GO) clean -testcache
