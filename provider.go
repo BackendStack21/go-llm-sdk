@@ -100,6 +100,24 @@ func modelForbidsTemperature(model string) bool {
 	return false
 }
 
+// completionTokenModels lists model prefixes that reject max_tokens in
+// favor of max_completion_tokens (OpenAI o-series and gpt-5 families).
+// Deliberately narrower than temperatureForbiddenModels: Z.ai/Moonshot
+// models documented against max_tokens keep it.
+var completionTokenModels = []string{"o1", "o3", "o4", "gpt-5"}
+
+// modelUsesCompletionTokens reports whether this model's token limit must
+// be sent as max_completion_tokens.
+func modelUsesCompletionTokens(model string) bool {
+	m := strings.ToLower(model)
+	for _, prefix := range completionTokenModels {
+		if strings.HasPrefix(m, prefix) {
+			return true
+		}
+	}
+	return false
+}
+
 // builtinProviders returns the built-in registry, in stable order.
 func builtinProviders() []ProviderConfig {
 	return []ProviderConfig{

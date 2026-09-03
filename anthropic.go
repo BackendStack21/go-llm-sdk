@@ -378,7 +378,7 @@ func listModelsAnthropic(ctx context.Context, pc *providerClient) ([]Model, erro
 	for page := 0; page < 10; page++ {
 		url := pc.base + "/v1/models?limit=100"
 		if pageID != "" {
-			url += "&page_id=" + pageID
+			url += "&after_id=" + pageID
 		}
 		data, _, err := pc.get(ctx, url)
 		if err != nil {

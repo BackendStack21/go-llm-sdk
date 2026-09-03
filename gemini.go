@@ -170,11 +170,7 @@ func buildGeminiRequest(req *ChatRequest, model string, stream bool) ([]byte, er
 	if len(req.Tools) > 0 {
 		g := gmToolGroup{}
 		for _, t := range req.Tools {
-			g.FunctionDeclarations = append(g.FunctionDeclarations, gmFnDecl{
-				Name:        t.Name,
-				Description: t.Description,
-				Parameters:  t.Parameters,
-			})
+			g.FunctionDeclarations = append(g.FunctionDeclarations, gmFnDecl(t))
 		}
 		out.Tools = []gmToolGroup{g}
 	}
@@ -307,7 +303,7 @@ func parseGeminiResponse(body []byte) (*ChatResult, error) {
 
 type gmStreamChunk struct {
 	Candidates    []gmCandidate `json:"candidates"`
-	UsageMetadata gmUsage       `json:"usageMetadata"`
+	UsageMetadata *gmUsage      `json:"usageMetadata"` // nil = chunk carries no usage update
 }
 
 // mapGeminiStreamEvent folds one Gemini SSE chunk into acc. Chunks carry
@@ -326,7 +322,9 @@ func mapGeminiStreamEvent(data []byte, acc *streamAccum) ([]Delta, bool, error) 
 	if cand.FinishReason != "" {
 		acc.finishReason = mapGeminiFinishReason(cand.FinishReason)
 	}
-	acc.usage = mapGeminiUsage(c.UsageMetadata)
+	if c.UsageMetadata != nil {
+		acc.usage = mapGeminiUsage(*c.UsageMetadata)
+	}
 	return deltas, false, nil
 }
 

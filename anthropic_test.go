@@ -224,7 +224,7 @@ func TestListModelsAnthropic_Pagination(t *testing.T) {
 			w.WriteHeader(400)
 			return
 		}
-		if r.URL.Query().Get("page_id") == "" {
+		if r.URL.Query().Get("after_id") == "" {
 			fmt.Fprint(w, `{"data":[{"id":"claude-a","display_name":"Claude A","created_at":"2026-01-02T15:04:05Z"}],"has_more":true,"last_id":"claude-a"}`)
 			return
 		}
@@ -244,7 +244,7 @@ func TestListModelsAnthropic_Pagination(t *testing.T) {
 	if models[0].CreatedAt.IsZero() {
 		t.Errorf("CreatedAt = %v, want parsed RFC3339", models[0].CreatedAt)
 	}
-	if len(paths) != 2 || paths[1] != "/v1/models?limit=100&page_id=claude-a" {
-		t.Errorf("requests = %v, want page_id follow-up", paths)
+	if len(paths) != 2 || paths[1] != "/v1/models?limit=100&after_id=claude-a" {
+		t.Errorf("requests = %v, want after_id follow-up", paths)
 	}
 }

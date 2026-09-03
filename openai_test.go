@@ -328,3 +328,33 @@ func TestListModelsOpenAI_ModelsWrapper(t *testing.T) {
 		t.Fatalf("models = %+v", models)
 	}
 }
+
+// Models in the o-series/gpt-5 family reject max_tokens in favor of
+// max_completion_tokens; everyone else keeps the classic parameter.
+func TestBuildOpenAIRequestTokenParamRouting(t *testing.T) {
+	req := &ChatRequest{Messages: []Message{{Role: RoleUser, Content: "hi"}}, MaxTokens: 100}
+	for _, model := range []string{"o3", "o4-mini", "gpt-5-mini"} {
+		b, err := json.Marshal(buildOpenAIRequest(ProviderConfig{ID: "openai", Format: FormatOpenAI}, req, model, false, false))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !strings.Contains(string(b), `"max_completion_tokens":100`) {
+			t.Errorf("%s: body missing max_completion_tokens: %s", model, b)
+		}
+		if strings.Contains(string(b), `"max_tokens"`) {
+			t.Errorf("%s: body must not send max_tokens: %s", model, b)
+		}
+	}
+	for _, model := range []string{"gpt-4o", "deepseek-v4"} {
+		b, err := json.Marshal(buildOpenAIRequest(ProviderConfig{ID: "openai", Format: FormatOpenAI}, req, model, false, false))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !strings.Contains(string(b), `"max_tokens":100`) {
+			t.Errorf("%s: body missing max_tokens: %s", model, b)
+		}
+		if strings.Contains(string(b), "max_completion_tokens") {
+			t.Errorf("%s: body must not send max_completion_tokens: %s", model, b)
+		}
+	}
+}

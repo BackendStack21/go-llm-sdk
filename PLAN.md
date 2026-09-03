@@ -15,7 +15,7 @@ inference endpoints, with:
 
 1. **Multiple authenticated endpoints simultaneously**, auto-discovered from the environment via
    `<PROVIDER>_API_KEY` (e.g. `OPENAI_API_KEY`, `GEMINI_API_KEY`, `DEEPSEEK_API_KEY`, `ZAI_API_KEY`,
-   `KIM_API_KEY`, `ANTHROPIC_API_KEY`).
+   `KIMI_API_KEY`, `ANTHROPIC_API_KEY`).
 2. **Dynamic model discovery on the fly** — `ListModels(ctx)` hits each provider's models endpoint
    and returns what the account can actually access. **No static model profile tables** (replaces
    odek's `KnownProfiles` / `ModelProfile`).
@@ -101,7 +101,7 @@ instance, exactly as odek does today.
 
 OpenAI-compatible shape is the canonical type system (odek's loop already speaks it):
 `Message{Role, Content, ReasoningContent, ToolCalls, ToolCallID}`, `ToolDef`,
-`ChatRequest{Model, Messages, Tools, Thinking, ThinkingBudget, MaxTokens, Temperature, SystemBlocks}`,
+`ChatRequest{Model, Messages, Tools, Thinking, ThinkingBudget, MaxTokens, Temperature, System}`,
 `ChatResult{Content, ReasoningContent, ToolCalls, FinishReason, Usage}`.
 Adapters translate to/from Anthropic (`system` top-level, content blocks, `tool_use`/`tool_result`,
 `thinking` blocks) and Gemini (`contents`/`parts`, `functionDeclarations`, `functionCall`/`functionResponse`,
@@ -121,7 +121,7 @@ Thinking control maps per format: `reasoning_effort` (openai) / `thinking:{type,
 - **Gemini**: system prompts go to `systemInstruction`; `functionResponse` parts ride `role:"user"`
   per current API docs; model in URL path (`/v1beta/models/{m}:generateContent`); no tool-call IDs
   — SDK synthesizes `call_<n>` ids; `finishReason` mapping (STOP→stop, MAX_TOKENS→length,
-  SAFETY/RECISATION→content_filter); reasoning = parts with `thought:true` + `includeThoughts`.
+  SAFETY/RECITATION→content_filter); reasoning = parts with `thought:true` + `includeThoughts`.
 - **Canonical**: multi-part content (images/audio) is **out of scope for v0** and documented as a
   limitation — `Content` is plain text; if a provider returns multi-part, text parts concatenate.
 

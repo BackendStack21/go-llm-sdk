@@ -50,24 +50,31 @@ type oaStreamOptions struct {
 }
 
 type oaRequest struct {
-	Model           string           `json:"model"`
-	Messages        []oaMessage      `json:"messages"`
-	Tools           []oaToolDef      `json:"tools,omitempty"`
-	MaxTokens       int              `json:"max_tokens,omitempty"`
-	Temperature     *float64         `json:"temperature,omitempty"`
-	Stream          bool             `json:"stream,omitempty"`
-	StreamOptions   *oaStreamOptions `json:"stream_options,omitempty"`
-	ReasoningEffort string           `json:"reasoning_effort,omitempty"`
-	Thinking        *oaThinking      `json:"thinking,omitempty"`
+	Model               string           `json:"model"`
+	Messages            []oaMessage      `json:"messages"`
+	Tools               []oaToolDef      `json:"tools,omitempty"`
+	MaxTokens           int              `json:"max_tokens,omitempty"`
+	MaxCompletionTokens int              `json:"max_completion_tokens,omitempty"`
+	Temperature         *float64         `json:"temperature,omitempty"`
+	Stream              bool             `json:"stream,omitempty"`
+	StreamOptions       *oaStreamOptions `json:"stream_options,omitempty"`
+	ReasoningEffort     string           `json:"reasoning_effort,omitempty"`
+	Thinking            *oaThinking      `json:"thinking,omitempty"`
 }
 
 // buildOpenAIRequest renders the canonical request in OpenAI format.
 func buildOpenAIRequest(cfg ProviderConfig, req *ChatRequest, model string, stream, includeStreamOptions bool) oaRequest {
 	q := cfg.Quirks
 	out := oaRequest{
-		Model:     model,
-		MaxTokens: req.MaxTokens,
-		Stream:    stream,
+		Model:  model,
+		Stream: stream,
+	}
+	// OpenAI o-series/gpt-5 models reject max_tokens in favor of
+	// max_completion_tokens; everyone else keeps the classic parameter.
+	if modelUsesCompletionTokens(model) {
+		out.MaxCompletionTokens = req.MaxTokens
+	} else {
+		out.MaxTokens = req.MaxTokens
 	}
 
 	// System prompt: canonical blocks (+ any in-band system messages)
@@ -119,7 +126,7 @@ func buildOpenAIRequest(cfg ProviderConfig, req *ChatRequest, model string, stre
 	out.Messages = msgs
 
 	for _, t := range req.Tools {
-		fn, _ := json.Marshal(oaToolFn{Name: t.Name, Description: t.Description, Parameters: t.Parameters})
+		fn, _ := json.Marshal(oaToolFn(t))
 		out.Tools = append(out.Tools, oaToolDef{Type: "function", Function: fn})
 	}
 

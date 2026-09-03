@@ -47,8 +47,9 @@ type ToolCall struct {
 // Message is one canonical chat message. For RoleTool messages, ToolCallID
 // and ToolName identify the call being answered and Content carries the
 // tool result. ReasoningContent is provider-reported thinking text
-// (deepseek-reasoner, anthropic thinking, gemini thoughts); it is echoed
-// back to providers only where they accept it and is otherwise advisory.
+// (deepseek-reasoner, anthropic thinking, gemini thoughts). It is advisory
+// consumer metadata: the SDK captures it in results and never serializes
+// it back on requests.
 type Message struct {
 	Role             Role
 	Content          string

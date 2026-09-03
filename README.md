@@ -69,7 +69,22 @@ The registry carries explicit quirk flags (no URL sniffing): Anthropic/DeepSeek/
 
 ## Errors
 
-`*ConfigError` (unknown/unauthenticated provider), `*APIError{Provider, Status, Code, Message, Retryable}`, `*RateLimitError`, `*StreamAbortedError` (returned together with the partial `*ChatResult`). API keys never appear in any error text.
+`*ConfigError` (unknown/unauthenticated provider, invalid wiring), `*APIError{Provider, Status, Code, Message, Retryable}`, `*RateLimitError{Attempts, RetryAfter}` (unwraps to `*APIError`), `*StreamAbortedError` (returned together with the partial `*ChatResult`). A stream failure after partial output returns the partial `*ChatResult` plus a wrapped error and is never retried; the idle watchdog surfaces as `ErrIdleTimeout` (retried only before the first delta); wall-clock deadlines surface as context deadline errors. Recommended classification:
+
+```go
+var abort *llm.StreamAbortedError
+var rl *llm.RateLimitError
+var ae *llm.APIError
+switch {
+case errors.As(err, &abort): // consumer abort (partial result returned)
+case errors.As(err, &rl):    // back off rl.RetryAfter
+case errors.As(err, &ae):    // provider said no (ae.Status)
+case errors.Is(err, llm.ErrIdleTimeout): // stream went silent
+case errors.Is(err, context.DeadlineExceeded): // wall-clock budget spent
+}
+```
+
+API keys never appear in any error text.
 
 ## Design record
 
