@@ -252,7 +252,8 @@ func mapOpenAIFinishReason(s string) string {
 	case "":
 		return ""
 	default:
-		return s
+		// Non-canonical reasons never leak into the public vocabulary.
+		return ""
 	}
 }
 

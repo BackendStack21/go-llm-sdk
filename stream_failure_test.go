@@ -2,8 +2,10 @@ package llm
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -236,5 +238,101 @@ func TestHTTPErrorTruncatesUnparseableBody(t *testing.T) {
 	e := pc.httpError(500, []byte(strings.Repeat("x", 5000)))
 	if len(e.Message) != maxErrorBodyPreview {
 		t.Fatalf("preview = %d bytes, want %d", len(e.Message), maxErrorBodyPreview)
+	}
+}
+
+// A 200 + SSE headers response that closes with no events and no completion
+// signal is a transport failure (retryable), not a silent empty success.
+func TestCallStreamPrematureCloseNoEventsIsRetryable(t *testing.T) {
+	var mu sync.Mutex
+	var n int
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		n++
+		mu.Unlock()
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.(http.Flusher).Flush()
+		// close: no events, no [DONE]
+	}))
+	defer srv.Close()
+
+	cc := newTestClient(t, ProviderConfig{ID: "openai", Format: FormatOpenAI, BaseURL: srv.URL, APIKey: "k"}, srv)
+	res, err := cc.CallStream(context.Background(), &ChatRequest{Messages: []Message{{Role: RoleUser, Content: "hi"}}}, func(Delta) error {
+		return nil
+	})
+	if err == nil {
+		t.Fatalf("premature close returned empty success (res=%+v)", res)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if n != maxRetries+1 {
+		t.Errorf("requests = %d, want %d (retryable: nothing was emitted)", n, maxRetries+1)
+	}
+}
+
+// Deltas followed by a premature close (no completion signal) must return
+// the partial result with a wrapped error, never retried.
+func TestCallStreamPrematureCloseAfterDeltasKeepsPartial(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		fmt.Fprint(w, "data: {\"choices\":[{\"delta\":{\"content\":\"a\"}}]}\n\n")
+		w.(http.Flusher).Flush()
+		// close: no finish_reason, no [DONE]
+	}))
+	defer srv.Close()
+
+	cc := newTestClient(t, ProviderConfig{ID: "openai", Format: FormatOpenAI, BaseURL: srv.URL, APIKey: "k"}, srv)
+	res, err := cc.CallStream(context.Background(), &ChatRequest{Messages: []Message{{Role: RoleUser, Content: "hi"}}}, func(Delta) error {
+		return nil
+	})
+	if res == nil || res.Content != "a" {
+		t.Fatalf("partial result lost after premature close: res=%v err=%v", res, err)
+	}
+	if err == nil || !strings.Contains(err.Error(), "before completion") {
+		t.Fatalf("err = %v, want premature-completion error", err)
+	}
+}
+
+// The stream path must learn the force-none-effort fallback exactly like
+// the buffered path does.
+func TestCallStreamLearnsEffortNone(t *testing.T) {
+	var mu sync.Mutex
+	var bodies []string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		b, _ := io.ReadAll(r.Body)
+		mu.Lock()
+		bodies = append(bodies, string(b))
+		mu.Unlock()
+		if strings.Contains(string(b), `"reasoning_effort"`) && !strings.Contains(string(b), `"reasoning_effort":"none"`) {
+			w.WriteHeader(400)
+			fmt.Fprint(w, `{"error":{"message":"reasoning_effort is not supported with tools on this model"}}`)
+			return
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		fmt.Fprint(w, "data: {\"choices\":[{\"delta\":{\"content\":\"ok\"}}]}\n\n")
+		fmt.Fprint(w, "data: [DONE]\n\n")
+	}))
+	defer srv.Close()
+
+	cc := newTestClient(t, ProviderConfig{ID: "openai", Format: FormatOpenAI, BaseURL: srv.URL, APIKey: "k", Quirks: Quirks{ReasoningEffort: true}}, srv)
+	req := &ChatRequest{
+		Messages: []Message{{Role: RoleUser, Content: "hi"}},
+		Tools:    []ToolDef{{Name: "f", Parameters: json.RawMessage(`{"type":"object"}`)}},
+		Thinking: "high",
+	}
+	_, err := cc.CallStream(context.Background(), req, func(Delta) error { return nil })
+	if err != nil {
+		t.Fatalf("CallStream: %v", err)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if len(bodies) != 2 {
+		t.Fatalf("requests = %d, want 2", len(bodies))
+	}
+	if !strings.Contains(bodies[0], `"reasoning_effort":"high"`) {
+		t.Errorf("first body missing effort: %s", bodies[0])
+	}
+	if !strings.Contains(bodies[1], `"reasoning_effort":"none"`) {
+		t.Errorf("second body must pin effort none: %s", bodies[1])
 	}
 }

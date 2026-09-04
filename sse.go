@@ -167,6 +167,8 @@ func pumpSSE(ctx context.Context, r io.ReadCloser, idle time.Duration, handle fu
 	var timer *time.Timer
 	var timeout <-chan time.Time
 	if idle > 0 {
+		// No drain-before-Reset dance is needed: since Go 1.23 a Timer's
+		// channel never delivers stale values after Reset (go.mod: 1.25).
 		timer = time.NewTimer(idle)
 		defer timer.Stop()
 		timeout = timer.C

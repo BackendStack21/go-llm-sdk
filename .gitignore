@@ -4,3 +4,4 @@ bin/
 coverage.*
 .DS_Store
 .odek-artifacts/
+.tmp-spincheck/

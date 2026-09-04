@@ -309,7 +309,7 @@ func (c *ChatClient) SetRequestTimeout(d time.Duration) {
 	if d <= 0 {
 		return
 	}
-	c.pc.http = newBufferedHTTP(c.pc.http.Transport, d)
+	c.pc.bufPtr.Store(newBufferedHTTP(c.pc.buffered().Transport, d))
 }
 
 // ProviderID returns the bound provider's id.
