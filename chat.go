@@ -228,6 +228,11 @@ func (pc *providerClient) httpError(status int, body []byte) *APIError {
 		msg = string(b)
 	}
 	e.Message, e.Code = msg, code
+	if e.Status == http.StatusTooManyRequests && billingExhausted(e) {
+		// Permanent billing/resource exhaustion: never retryable — fail
+		// fast instead of burning the backoff ladder.
+		e.Retryable = false
+	}
 	return e
 }
 
@@ -299,6 +304,20 @@ func streamRejected(e *APIError) bool {
 	return false
 }
 
+// billingExhausted reports whether a 429 is really a permanent
+// billing/resource failure (e.g. Z.ai "Insufficient balance or no resource
+// package", OpenAI "insufficient_quota"). Only a recharge fixes it, so
+// running the full backoff ladder is wasted time.
+func billingExhausted(e *APIError) bool {
+	if e == nil || e.Status != http.StatusTooManyRequests {
+		return false
+	}
+	m := strings.ToLower(e.Message)
+	return strings.Contains(m, "insufficient balance") ||
+		strings.Contains(m, "insufficient_quota") ||
+		strings.Contains(m, "no resource package")
+}
+
 // retryDelay picks Retry-After when present, else exponential backoff.
 func retryDelay(ra time.Duration, attempt int) time.Duration {
 	if ra > 0 {
@@ -330,6 +349,10 @@ func (pc *providerClient) call(ctx context.Context, req *ChatRequest, model stri
 			if errors.As(err, &apiErr) {
 				switch {
 				case apiErr.Status == http.StatusTooManyRequests:
+					if billingExhausted(apiErr) {
+						// Permanent: only a recharge fixes this.
+						return nil, apiErr
+					}
 					rateErr, rateRA, lastErr = apiErr, ra, apiErr
 					if attempt < maxRetries {
 						if !retrySleep(ctx, retryDelay(ra, attempt)) {

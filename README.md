@@ -203,6 +203,14 @@ make test-race  # race detector
 make lint       # golangci-lint (v2 config)
 ```
 
+Live end-to-end tests against the real DeepSeek API (tag-gated, never run in CI):
+
+```bash
+go test -tags e2e -run 'TestE2E' -timeout 15m -v .
+```
+
+Credentials come from `DEEPSEEK_API_KEY` in the environment or a repo-root `.env` file (`KEY=VALUE`); the file is gitignored and its contents are never logged. Tests skip cleanly when no key resolves.
+
 Coverage sits at **97.7%** of statements, including the streaming failure-orchestration paths (deadline, 429, premature close, partial-output) that are usually the blind spot of SDK test suites. The residual ~2% is provably unreachable defensive code (documented in the review record).
 
 ## Repo guidance
