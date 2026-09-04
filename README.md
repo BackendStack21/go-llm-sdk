@@ -5,18 +5,18 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 ![Go](https://img.shields.io/badge/Go-1.25%2B-00ADD8)
 
-Multi-provider Go SDK for LLM inference endpoints — **OpenAI, Google Gemini, DeepSeek, Z.ai, Kimi (Moonshot) and Anthropic**, plus any custom OpenAI-compatible gateway. Stdlib only, zero external dependencies.
+Multi-provider Go SDK for LLM inference endpoints — **OpenAI, Google Gemini, DeepSeek, Z.ai, Kimi (Moonshot) and Anthropic**, plus any OpenAI-compatible gateway. Stdlib only; zero external dependencies.
 
 - **Multiple authenticated endpoints at once** — auto-discovered from `<PROVIDER>_API_KEY` environment variables (aliases supported).
-- **Dynamic model discovery** — `ListModels` returns what the account can actually access, on the fly. No static model tables, ever.
-- **One canonical API** — OpenAI-shaped requests/responses; Anthropic and Gemini wire formats are translated for you.
-- **Production streaming semantics** (ported from [odek](https://github.com/BackendStack21/odek)'s battle-tested client): SSE with idle watchdog + hard wall-clock deadline, abort-with-partial-result, retries that never duplicate partial output, premature-close detection, and learn-once fallbacks for providers that reject `stream_options`, streaming, or `reasoning_effort`+tools.
-- **Hardened by adversarial review** — three sequential adversarial review passes (contract, concurrency, wire fidelity) with every finding reproduced and fixed RED-first. Goroutine-leak-free streaming, race-clean shared state, canonical-only error vocabulary.
+- **Dynamic model discovery** — `ListModels` returns what the account can actually access. No static model tables.
+- **One canonical API** — OpenAI-shaped requests and responses; Anthropic and Gemini wire formats are translated for you.
+- **Production streaming** — SSE with an idle watchdog and a hard wall-clock deadline, abort-with-partial-result, retries that never duplicate partial output, premature-close detection, and learn-once fallbacks for providers that reject `stream_options`, streaming, or `reasoning_effort`+tools.
+- **Predictable under load** — goroutine-leak-free streaming, race-clean shared state, and a canonical-only error vocabulary (API keys never leak into error text).
 
 ## Install
 
 ```bash
-go get github.com/BackendStack21/go-llm-sdk@v0.1.0
+go get github.com/BackendStack21/go-llm-sdk@v0.2.2
 ```
 
 Requires Go 1.25+. No dependencies beyond the standard library.
@@ -24,33 +24,56 @@ Requires Go 1.25+. No dependencies beyond the standard library.
 ## Quickstart
 
 ```go
-sdk := llm.New(llm.FromEnv()) // reads OPENAI_API_KEY, GEMINI_API_KEY, DEEPSEEK_API_KEY,
-                              // ZAI_API_KEY, KIMI_API_KEY, ANTHROPIC_API_KEY (+ aliases)
+package main
 
-for _, p := range sdk.Providers() { // authenticated endpoints, registry order
-    models, err := p.ListModels(ctx)
-    // → []llm.Model{ID, DisplayName, CreatedAt, ContextWindow, MaxOutputTokens, Capabilities}
+import (
+	"context"
+	"fmt"
+	"log"
+
+	llm "github.com/BackendStack21/go-llm-sdk"
+)
+
+func main() {
+	ctx := context.Background()
+	sdk := llm.New(llm.FromEnv()) // OPENAI_API_KEY, GEMINI_API_KEY, DEEPSEEK_API_KEY,
+	                             // ZAI_API_KEY, KIMI_API_KEY, ANTHROPIC_API_KEY (+ aliases)
+
+	for _, p := range sdk.Providers() { // authenticated endpoints, registry order
+		models, err := p.ListModels(ctx)
+		if err != nil {
+			log.Fatal(err)
+		}
+		fmt.Printf("%s: %d models\n", p.ID(), len(models))
+		// models[i] → ID, DisplayName, CreatedAt, ContextWindow, MaxOutputTokens, Capabilities
+	}
+
+	chat, err := sdk.Chat("deepseek", "deepseek-chat")
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	res, err := chat.Call(ctx, &llm.ChatRequest{
+		System:   []llm.SystemBlock{{Text: "Be terse."}},
+		Messages: []llm.Message{{Role: llm.RoleUser, Content: "Hello"}},
+	})
+	if err != nil {
+		log.Fatal(err)
+	}
+	fmt.Println(res.Content)
 }
-
-chat, err := sdk.Chat("deepseek", "deepseek-v4-flash")
-
-res, err := chat.Call(ctx, &llm.ChatRequest{
-    System:   []llm.SystemBlock{{Text: "Be terse."}},
-    Messages: []llm.Message{{Role: llm.RoleUser, Content: "Hello"}},
-    Tools:    []llm.ToolDef{{Name: "get_weather", Parameters: schema}},
-})
 ```
 
 Streaming:
 
 ```go
 res, err = chat.CallStream(ctx, req, func(d llm.Delta) error {
-    switch d.Kind {
-    case llm.DeltaReasoning: // thinking fragment
-    case llm.DeltaContent:   // text fragment
-    case llm.DeltaToolArgs:  // tool-call argument fragment (d.ToolID, d.ToolName)
-    }
-    return nil // or an error to abort — partial result comes back with *StreamAbortedError
+	switch d.Kind {
+	case llm.DeltaReasoning: // thinking fragment
+	case llm.DeltaContent:   // text fragment
+	case llm.DeltaToolArgs:  // tool-call argument fragment (d.ToolID, d.ToolName)
+	}
+	return nil // or an error to abort — partial result comes back with *StreamAbortedError
 })
 ```
 
@@ -65,15 +88,15 @@ res, err = chat.CallStream(ctx, req, func(d llm.Delta) error {
 | `kimi` | openai | `https://api.moonshot.ai/v1` | `KIMI_API_KEY` (`MOONSHOT_API_KEY`) | `KIMI_BASE_URL` |
 | `anthropic` | anthropic | `https://api.anthropic.com` | `ANTHROPIC_API_KEY` | `ANTHROPIC_BASE_URL` |
 
-Primary env var beats its alias. Explicit keys (`WithAPIKey`) beat env. Base-URL overrides accept any gateway speaking the provider's format. Override validation runs at wiring time — a bad base URL fails loudly at `New`, not per request.
+Primary env var beats its alias. Explicit keys (`WithAPIKey`) beat env. Base-URL overrides accept any gateway speaking the provider's format. A bad URL passed to `WithBaseURL` is rejected at wiring time: the provider is marked invalid, `Providers()` omits it, and `Chat` returns a `*ConfigError` — no request is sent.
 
 Custom gateways:
 
 ```go
 sdk := llm.New(llm.WithProvider("my-gateway",
-    llm.WithFormat(llm.FormatOpenAI),
-    llm.WithBaseURL("http://localhost:11434/v1"),
-    llm.WithAPIKey("local"),
+	llm.WithFormat(llm.FormatOpenAI),
+	llm.WithBaseURL("http://localhost:11434/v1"),
+	llm.WithAPIKey("local"),
 ))
 ```
 
@@ -83,27 +106,27 @@ Requests and results are provider-neutral. Unknown message roles are rejected at
 
 ```go
 type ChatRequest struct {
-    Model          string         // optional; ChatClient's model wins when both set
-    Messages       []Message      // RoleUser | RoleAssistant | RoleSystem | RoleTool; Message.Cache → Anthropic user-block cache_control
-    System         []SystemBlock  // {Text, Cache} — Cache marks Anthropic prompt-cache blocks
-    Tools          []ToolDef      // {Name, Description, Parameters json.RawMessage}
-    Thinking       string         // "", "enabled", "disabled", "low", "medium", "high", "max"
-    ThinkingBudget int            // explicit token budget where the provider supports it
-    MaxTokens      int            // routed to max_completion_tokens on o-series/gpt-5
-    Temperature    float64        // 0 = provider default; negative = explicit 0
+	Model          string         // optional; ChatClient's model wins when both set
+	Messages       []Message      // RoleUser | RoleAssistant | RoleSystem | RoleTool; Message.Cache → Anthropic user-block cache_control
+	System         []SystemBlock  // {Text, Cache} — Cache marks Anthropic prompt-cache blocks
+	Tools          []ToolDef      // {Name, Description, Parameters json.RawMessage}
+	Thinking       string         // "", "enabled", "disabled", "low", "medium", "high", "max"
+	ThinkingBudget int            // explicit token budget where the provider supports it
+	MaxTokens      int            // routed to max_completion_tokens on o-series/gpt-5
+	Temperature    float64        // 0 = provider default; negative = explicit 0
 }
 
 type ChatResult struct {
-    Content           string
-    ReasoningContent  string      // provider thinking text; replayed as reasoning_content on OpenAI-format assistant turns
-    ThinkingSignature string      // Anthropic: replay via Message.ThinkingSignature
-    ToolCalls         []ToolCall  // {ID, Name, Arguments}
-    FinishReason      string      // stop | length | tool_calls | content_filter | ""
-    Usage             Usage       // PromptTokens is uncached-only; cache volumes in CacheRead/Creation/CachedTokens
+	Content           string
+	ReasoningContent  string      // provider thinking text; replayed as reasoning_content on OpenAI-format assistant turns
+	ThinkingSignature string      // Anthropic: replay via Message.ThinkingSignature
+	ToolCalls         []ToolCall  // {ID, Name, Arguments}
+	FinishReason      string      // stop | length | tool_calls | content_filter | ""
+	Usage             Usage       // PromptTokens is uncached-only; cache volumes in CacheReadTokens / CacheCreationTokens / CachedTokens
 }
 ```
 
-Finish reasons are canonical: anything a provider reports outside the vocabulary maps to `""` (unknown) rather than leaking provider-specific strings.
+Finish reasons are canonical: anything a provider reports outside that vocabulary maps to `""` (unknown) rather than leaking provider-specific strings.
 
 ## Streaming semantics
 
@@ -120,21 +143,21 @@ Aborting from the delta handler returns the partial result alongside `*StreamAbo
 
 ```go
 for {
-    res, err := chat.CallStream(ctx, req, func(d llm.Delta) error { return nil })
-    if err != nil {
-        return err
-    }
-    if len(res.ToolCalls) == 0 {
-        return nil
-    }
-    req.Messages = append(req.Messages,
-        Message{Role: RoleAssistant, Content: res.Content,
-                ReasoningContent: res.ReasoningContent, ThinkingSignature: res.ThinkingSignature,
-                ToolCalls: res.ToolCalls})
-    for _, tc := range res.ToolCalls {
-        req.Messages = append(req.Messages,
-            Message{Role: RoleTool, ToolCallID: tc.ID, ToolName: tc.Name, Content: execute(tc)})
-    }
+	res, err := chat.CallStream(ctx, req, func(d llm.Delta) error { return nil })
+	if err != nil {
+		return err
+	}
+	if len(res.ToolCalls) == 0 {
+		return nil
+	}
+	req.Messages = append(req.Messages,
+		llm.Message{Role: llm.RoleAssistant, Content: res.Content,
+			ReasoningContent: res.ReasoningContent, ThinkingSignature: res.ThinkingSignature,
+			ToolCalls: res.ToolCalls})
+	for _, tc := range res.ToolCalls {
+		req.Messages = append(req.Messages,
+			llm.Message{Role: llm.RoleTool, ToolCallID: tc.ID, ToolName: tc.Name, Content: execute(tc)})
+	}
 }
 ```
 
@@ -144,7 +167,7 @@ On Gemini, a tool result's `ToolName` may be omitted — the SDK recovers the fu
 
 - **Anthropic** — `thinking` blocks are parsed in both buffered and streaming modes. `ChatResult.ThinkingSignature` carries the provider signature; for tool loops, replay it on the assistant message (`Message.ReasoningContent` + `Message.ThinkingSignature`) — the SDK re-serializes it as the first block, as Anthropic's API requires. Omitting it makes extended-thinking tool loops fail mid-conversation.
 - **DeepSeek / GLM** — reasoning streams as `DeltaReasoning` fragments and lands in `ReasoningContent`. Assistant-turn replay echoes it as `reasoning_content` (required for DeepSeek/GLM tool loops). GLM maps thinking `medium` → `reasoning_effort` `high` (no medium level) and `max` → `max`.
-- **Gemini** — `thought: true` parts map to reasoning deltas; `thinkingConfig` is derived from `Thinking`/`ThinkingBudget`.
+- **Gemini** — `thought: true` parts map to reasoning deltas; `thinkingConfig` is derived from `Thinking` / `ThinkingBudget`.
 
 ## Learn-once fallbacks
 
@@ -178,10 +201,10 @@ var abort *llm.StreamAbortedError
 var rl *llm.RateLimitError
 var ae *llm.APIError
 switch {
-case errors.As(err, &abort): // consumer abort (partial result returned)
-case errors.As(err, &rl):    // back off rl.RetryAfter
-case errors.As(err, &ae):    // provider said no (ae.Status)
-case errors.Is(err, llm.ErrIdleTimeout): // stream went silent
+case errors.As(err, &abort):                 // consumer abort (partial result returned)
+case errors.As(err, &rl):                    // back off rl.RetryAfter
+case errors.As(err, &ae):                    // provider said no (ae.Status)
+case errors.Is(err, llm.ErrIdleTimeout):     // stream went silent
 case errors.Is(err, context.DeadlineExceeded): // wall-clock budget spent
 }
 ```
@@ -204,15 +227,15 @@ make test-race  # race detector
 make lint       # golangci-lint (v2 config)
 ```
 
-Live end-to-end tests against the real DeepSeek API (tag-gated, never run in CI):
+Live end-to-end tests against real APIs (tag-gated, never run in CI). The suite covers every provider you have credentials for — currently DeepSeek, Z.ai, and a custom OpenRouter gateway. Each target skips when its key is absent.
 
 ```bash
 go test -tags e2e -run 'TestE2E' -timeout 15m -v .
 ```
 
-Credentials come from `DEEPSEEK_API_KEY` in the environment or a repo-root `.env` file (`KEY=VALUE`); the file is gitignored and its contents are never logged. Tests skip cleanly when no key resolves.
+Credentials come from the environment or a repo-root `.env` file (`KEY=VALUE`); the file is gitignored and its contents are never logged. Override a target's model with `<ID>_E2E_MODEL` (e.g. `DEEPSEEK_E2E_MODEL`). Adding a provider is one `e2eTarget` entry in `e2e_test.go`.
 
-Coverage sits at **97.7%** of statements, including the streaming failure-orchestration paths (deadline, 429, premature close, partial-output) that are usually the blind spot of SDK test suites. The residual ~2% is provably unreachable defensive code (documented in the review record).
+Coverage sits at **97.7%** of statements, including the streaming failure-orchestration paths (deadline, 429, premature close, partial-output) that are usually the blind spot of SDK test suites. The residual ~2% is unreachable defensive code.
 
 ## Repo guidance
 
@@ -220,7 +243,7 @@ See [AGENTS.md](AGENTS.md) for the architecture map, invariants, testing convent
 
 ## Status
 
-v0.1.0 — API may shift until the odek integration lands, then v1.0.
+v0.2.2 — API may shift until the odek integration lands, then v1.0.
 
 ## License
 
