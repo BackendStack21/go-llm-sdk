@@ -87,6 +87,7 @@ type e2eTarget struct {
 var e2eTargets = []e2eTarget{
 	{id: "deepseek", baseURL: "", keyEnv: "DEEPSEEK_API_KEY", model: "deepseek-chat", tools: true, streamUsage: true},
 	{id: "openrouter", baseURL: "https://openrouter.ai/api/v1", format: FormatOpenAI, keyEnv: "OPENROUTER_API_KEY", model: "openai/gpt-4o-mini", tools: true},
+	{id: "zai", baseURL: "", keyEnv: "ZAI_API_KEY", model: "glm-5-turbo", tools: true},
 }
 
 // chatModel resolves the target's model: <ID>_E2E_MODEL beats the default.
@@ -189,11 +190,17 @@ func (tg e2eTarget) testDiscovery(t *testing.T) {
 	if len(models) == 0 {
 		t.Fatal("expected at least one accessible model")
 	}
+	ids := make([]string, 0, len(models))
 	for _, m := range models {
 		if m.ID == "" {
 			t.Errorf("model with empty ID: %+v", m)
 		}
+		ids = append(ids, m.ID)
 	}
+	if len(ids) > 15 {
+		ids = ids[:15]
+	}
+	t.Logf("accessible models (%d total, first 15): %s", len(models), strings.Join(ids, ", "))
 }
 
 func (tg e2eTarget) testBuffered(t *testing.T) {

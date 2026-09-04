@@ -1002,3 +1002,54 @@ func TestListModelsGeminiMidPageError(t *testing.T) {
 		t.Fatal("mid-page failure must error")
 	}
 }
+
+// ── billing exhaustion: 429 that is really a permanent billing failure ───
+
+// Billing/resource exhaustion signalled as 429 is permanent — the SDK
+// must fail fast (1 request) instead of burning the full backoff ladder
+// on a condition only the operator can fix. Found live via the Z.ai e2e
+// suite ("Insufficient balance or no resource package").
+func TestCallBillingExhausted429FailsFast(t *testing.T) {
+	var n int
+	srv := httptestNewServer(func(w http.ResponseWriter, r *http.Request) {
+		n++
+		w.Header().Set("Retry-After", "0")
+		w.WriteHeader(429)
+		fmt.Fprint(w, `{"error":{"message":"Insufficient balance or no resource package. Please recharge."}}`)
+	})
+	defer srv.Close()
+	cc := newTestClient(t, ProviderConfig{ID: "zai", Format: FormatOpenAI, BaseURL: srv.URL, APIKey: "k"}, srv)
+	_, err := cc.Call(context.Background(), &ChatRequest{Messages: []Message{{Role: RoleUser, Content: "hi"}}})
+	var ae *APIError
+	if !errors.As(err, &ae) || ae.Status != http.StatusTooManyRequests {
+		t.Fatalf("err = %v (%T), want the 429 *APIError", err, err)
+	}
+	if ae.Retryable {
+		t.Error("billing exhaustion must not be marked retryable")
+	}
+	if n != 1 {
+		t.Errorf("requests = %d, want 1 (fail fast, no backoff ladder)", n)
+	}
+}
+
+func TestCallStreamBillingExhausted429FailsFast(t *testing.T) {
+	var n int
+	srv := httptestNewServer(func(w http.ResponseWriter, r *http.Request) {
+		n++
+		w.Header().Set("Retry-After", "0")
+		w.WriteHeader(429)
+		fmt.Fprint(w, `{"error":{"message":"Insufficient balance or no resource package. Please recharge."}}`)
+	})
+	defer srv.Close()
+	cc := newTestClient(t, ProviderConfig{ID: "zai", Format: FormatOpenAI, BaseURL: srv.URL, APIKey: "k"}, srv)
+	_, err := cc.CallStream(context.Background(), &ChatRequest{Messages: []Message{{Role: RoleUser, Content: "hi"}}}, func(Delta) error {
+		return nil
+	})
+	var ae *APIError
+	if !errors.As(err, &ae) || ae.Status != http.StatusTooManyRequests {
+		t.Fatalf("err = %v (%T), want the 429 *APIError", err, err)
+	}
+	if n != 1 {
+		t.Errorf("requests = %d, want 1 (fail fast, no backoff ladder)", n)
+	}
+}
