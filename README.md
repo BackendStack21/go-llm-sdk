@@ -213,9 +213,9 @@ Credentials come from `DEEPSEEK_API_KEY` in the environment or a repo-root `.env
 
 Coverage sits at **97.7%** of statements, including the streaming failure-orchestration paths (deadline, 429, premature close, partial-output) that are usually the blind spot of SDK test suites. The residual ~2% is provably unreachable defensive code (documented in the review record).
 
-## Design record
+## Repo guidance
 
-See [PLAN.md](PLAN.md) for the architecture, the provider-quirk table, and the odek migration path.
+See [AGENTS.md](AGENTS.md) for the architecture map, invariants, testing conventions, and the odek migration path.
 
 ## Status
 

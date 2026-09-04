@@ -6,6 +6,3 @@ coverage.*
 .odek-artifacts/
 .tmp-spincheck/
 .env
-
-.env
-*.env
