@@ -28,26 +28,47 @@ import (
 //   - Learn-once fallbacks: drop stream_options (field level), fall back to
 //     the buffered path (provider rejects streaming), pin reasoning_effort
 //     "none" (provider rejects effort combined with tools).
-type providerClient struct {
-	cfg        ProviderConfig
-	http       *http.Client // buffered, whole-request timeout
-	streamHTTP *http.Client // no deadline; SSE body reads
-	base       string       // trimmed base URL
-
-	// Learn-once, atomic: set after the provider taught us a constraint;
-	// subsequent calls avoid the failed round-trip.
+//
+// learnOnce holds the learn-once fallback flags. They live on the Provider
+// (shared across every ChatClient minted from it) so a constraint the
+// provider teaches one client is honored by all of them.
+type learnOnce struct {
 	dropStreamOptions atomic.Bool
 	forceBuffered     atomic.Bool
 	forceNoneEffort   atomic.Bool
 }
 
+type providerClient struct {
+	cfg        ProviderConfig
+	bufPtr     atomic.Pointer[http.Client] // buffered client; SetRequestTimeout swaps it atomically
+	streamHTTP *http.Client                // no deadline; SSE body reads
+	base       string                      // trimmed base URL
+	learn      *learnOnce                  // shared learn-once fallback state
+}
+
+// buffered returns the current buffered-path HTTP client.
+func (pc *providerClient) buffered() *http.Client { return pc.bufPtr.Load() }
+
 func newProviderClient(cfg ProviderConfig, buffered, stream *http.Client) *providerClient {
-	return &providerClient{
+	return newProviderClientWithLearn(cfg, buffered, stream, &learnOnce{})
+}
+
+// newProviderClientWithLearn builds a client that shares learn-once state.
+func newProviderClientWithLearn(cfg ProviderConfig, buffered, stream *http.Client, learn *learnOnce) *providerClient {
+	if learn == nil {
+		learn = &learnOnce{}
+	}
+	if buffered == nil {
+		buffered = newBufferedHTTP(nil, 0)
+	}
+	pc := &providerClient{
 		cfg:        cfg,
-		http:       buffered,
 		streamHTTP: stream,
 		base:       strings.TrimRight(cfg.BaseURL, "/"),
+		learn:      learn,
 	}
+	pc.bufPtr.Store(buffered)
+	return pc
 }
 
 // Response body read caps (DoS/OOM bound).
@@ -65,6 +86,13 @@ var streamIdleTimeout = 120 * time.Second
 // errStreamStop is the internal sentinel for a clean stream end.
 var errStreamStop = errors.New("llm: stream complete")
 
+// errPrematureClose marks a 200+SSE stream the provider closed before its
+// completion signal; retryable only before the first delta.
+var errPrematureClose = errors.New("llm: provider closed the stream before completion")
+
+// errNonSSE marks a streamed request answered with a regular body.
+var errNonSSE = errors.New("llm: provider answered a streamed request with a non-event-stream body")
+
 // consumerAbort wraps a delta-handler error through pumpSSE.
 type consumerAbort struct{ err error }
 
@@ -74,7 +102,7 @@ func (c *consumerAbort) Unwrap() error { return c.err }
 // requestTimeout is the per-request wall-clock budget; streaming uses it
 // as the hard overall deadline.
 func (pc *providerClient) requestTimeout() time.Duration {
-	if t := pc.http.Timeout; t > 0 {
+	if t := pc.buffered().Timeout; t > 0 {
 		return t
 	}
 	return DefaultTimeout
@@ -85,6 +113,15 @@ func (pc *providerClient) requestTimeout() time.Duration {
 // buildChatRequest dispatches format-specific serialization. stream=false
 // yields the buffered request; stream=true the SSE request.
 func (pc *providerClient) buildChatRequest(req *ChatRequest, model string, stream bool) ([]byte, string, error) {
+	// Reject unknown roles loudly: OpenAI would silently send them as user
+	// messages and Anthropic/Gemini would silently drop them.
+	for i, m := range req.Messages {
+		switch m.Role {
+		case RoleUser, RoleAssistant, RoleSystem, RoleTool:
+		default:
+			return nil, "", &ConfigError{Msg: fmt.Sprintf("message %d: unknown role %q", i, string(m.Role))}
+		}
+	}
 	if model == "" {
 		model = req.Model
 	}
@@ -102,8 +139,8 @@ func (pc *providerClient) buildChatRequest(req *ChatRequest, model string, strea
 		}
 		return body, fmt.Sprintf("%s/v1beta/models/%s:generateContent", pc.base, model), err
 	default: // FormatOpenAI
-		oa := buildOpenAIRequest(pc.cfg, req, model, stream, !pc.dropStreamOptions.Load())
-		if pc.forceNoneEffort.Load() && len(req.Tools) > 0 {
+		oa := buildOpenAIRequest(pc.cfg, req, model, stream, !pc.learn.dropStreamOptions.Load())
+		if pc.learn.forceNoneEffort.Load() && len(req.Tools) > 0 {
 			oa = reasoningEffortNonePatched(oa)
 		}
 		body, err := json.Marshal(oa)
@@ -160,11 +197,26 @@ func (pc *providerClient) httpError(status int, body []byte) *APIError {
 			msg, code = eb.Error.Message, eb.Error.Status
 		}
 	default:
-		var eb oaErrorBody
-		if json.Unmarshal(body, &eb) == nil && eb.Message != "" {
-			msg = eb.Message
-			if s, ok := eb.Code.(string); ok {
+		// OpenAI's canonical envelope nests the error object; some
+		// gateways send the fields top-level. Try nested first.
+		var nested struct {
+			Error struct {
+				Message string `json:"message"`
+				Code    any    `json:"code"`
+			} `json:"error"`
+		}
+		if json.Unmarshal(body, &nested) == nil && nested.Error.Message != "" {
+			msg = nested.Error.Message
+			if s, ok := nested.Error.Code.(string); ok {
 				code = s
+			}
+		} else {
+			var eb oaErrorBody
+			if json.Unmarshal(body, &eb) == nil && eb.Message != "" {
+				msg = eb.Message
+				if s, ok := eb.Code.(string); ok {
+					code = s
+				}
 			}
 		}
 	}
@@ -194,7 +246,7 @@ func (pc *providerClient) post(ctx context.Context, client *http.Client, url str
 	if err != nil {
 		return nil, 0, err
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	data, err = io.ReadAll(io.LimitReader(resp.Body, maxResponseSize+1))
 	if err != nil {
 		return nil, 0, err
@@ -227,12 +279,24 @@ func streamOptionsRejected(e *APIError) bool {
 		strings.Contains(e.Message, "stream_options")
 }
 
-// streamRejected classifies a 400 rejecting streaming itself.
+// streamRejected classifies a 400 rejecting streaming itself. Deliberately
+// narrow: the message must pair "stream" with an explicit rejection
+// phrase, so unrelated 400s that merely mention streaming (context-length
+// errors, parameter limits) never trigger the permanent buffered downgrade.
 func streamRejected(e *APIError) bool {
 	if e == nil || e.Status != http.StatusBadRequest {
 		return false
 	}
-	return strings.Contains(e.Message, "stream")
+	m := strings.ToLower(e.Message)
+	if !strings.Contains(m, "stream") || strings.Contains(m, "stream_options") {
+		return false
+	}
+	for _, phrase := range []string{"not support", "unsupported", "does not support", "not allowed", "disabled", "reject"} {
+		if strings.Contains(m, phrase) {
+			return true
+		}
+	}
+	return false
 }
 
 // retryDelay picks Retry-After when present, else exponential backoff.
@@ -248,10 +312,9 @@ func retryDelay(ra time.Duration, attempt int) time.Duration {
 // call runs a buffered chat completion with retries.
 func (pc *providerClient) call(ctx context.Context, req *ChatRequest, model string) (*ChatResult, error) {
 	var (
-		lastErr     error
-		rateErr     *APIError // last 429
-		rateRA      time.Duration
-		attempts429 int
+		lastErr error
+		rateErr *APIError // last 429
+		rateRA  time.Duration
 	)
 	for attempt := 0; attempt <= maxRetries; attempt++ {
 		if err := ctx.Err(); err != nil {
@@ -261,17 +324,19 @@ func (pc *providerClient) call(ctx context.Context, req *ChatRequest, model stri
 		if err != nil {
 			return nil, err
 		}
-		data, ra, err := pc.post(ctx, pc.http, url, body)
+		data, ra, err := pc.post(ctx, pc.buffered(), url, body)
 		if err != nil {
 			var apiErr *APIError
 			if errors.As(err, &apiErr) {
 				switch {
 				case apiErr.Status == http.StatusTooManyRequests:
-					rateErr, rateRA, attempts429 = apiErr, ra, attempts429+1
-					lastErr = apiErr
+					rateErr, rateRA, lastErr = apiErr, ra, apiErr
 					if attempt < maxRetries {
 						if !retrySleep(ctx, retryDelay(ra, attempt)) {
-							return nil, ctx.Err()
+							// The sleep died with the context (deadline or
+							// cancel); still surface the 429 — the caller
+							// needs Status/RetryAfter to plan the retry.
+							return nil, &RateLimitError{APIError: *rateErr, Attempts: attempt + 1, RetryAfter: rateRA}
 						}
 						continue
 					}
@@ -282,11 +347,15 @@ func (pc *providerClient) call(ctx context.Context, req *ChatRequest, model stri
 					}
 					continue
 				case apiErr.Status == http.StatusBadRequest && len(req.Tools) > 0 &&
-					!pc.forceNoneEffort.Load() && reasoningEffortRejected(apiErr):
+					!pc.learn.forceNoneEffort.Load() && reasoningEffortRejected(apiErr):
 					// Learn the constraint once; retry immediately with
 					// effort pinned to "none".
-					pc.forceNoneEffort.Store(true)
-					continue
+					pc.learn.forceNoneEffort.Store(true)
+					lastErr = apiErr
+					if attempt < maxRetries {
+						continue
+					}
+					return nil, apiErr
 				}
 				if rateErr != nil && !apiErr.Retryable && apiErr.Status != http.StatusTooManyRequests {
 					// A definitive failure after earlier 429s.
@@ -348,7 +417,7 @@ func (pc *providerClient) mapper() streamEventMapper {
 // fragments; returning an error from it aborts with the partial result and
 // *StreamAbortedError.
 func (pc *providerClient) callStream(ctx context.Context, req *ChatRequest, model string, onDelta func(Delta) error) (*ChatResult, error) {
-	if pc.forceBuffered.Load() {
+	if pc.learn.forceBuffered.Load() {
 		return pc.call(ctx, req, model)
 	}
 	deadlineCtx, cancel := context.WithTimeout(ctx, pc.requestTimeout())
@@ -364,7 +433,7 @@ func (pc *providerClient) callStream(ctx context.Context, req *ChatRequest, mode
 		if err := deadlineCtx.Err(); err != nil {
 			break
 		}
-		if pc.forceBuffered.Load() {
+		if pc.learn.forceBuffered.Load() {
 			cancel()
 			return pc.call(ctx, req, model)
 		}
@@ -373,14 +442,28 @@ func (pc *providerClient) callStream(ctx context.Context, req *ChatRequest, mode
 			return nil, err
 		}
 
-		out := pc.attemptStream(deadlineCtx, url, body, mapper, onDelta)
+		out := pc.attemptStream(deadlineCtx, url, body, mapper, onDelta, len(req.Tools) > 0)
 		switch {
 		case out.success():
 			return out.result, nil
 		case out.abort != nil:
 			return out.result, out.abort
+		case out.err != nil && out.result != nil:
+			// Partial output was delivered: never retry, surface with the
+			// partial result (a retry would duplicate user-visible output).
+			return out.result, out.err
 		case out.learnRetry: // learn-once applied; retry without backoff
-			continue
+			if out.apiErr != nil {
+				lastErr = out.apiErr
+			} else if out.err != nil {
+				lastErr = out.err
+			}
+			if attempt < maxRetries {
+				continue
+			}
+			// Learn trigger fired on the final attempt: surface the cause
+			// instead of falling off the loop with a nil error.
+			return nil, lastErr
 		case out.apiErr != nil && out.apiErr.Retryable:
 			if out.apiErr.Status == http.StatusTooManyRequests {
 				rateErr, rateRA = out.apiErr, out.retryAfter
@@ -399,6 +482,9 @@ func (pc *providerClient) callStream(ctx context.Context, req *ChatRequest, mode
 			lastErr = out.err
 			if retrySleep(deadlineCtx, retryDelay(0, attempt)) {
 				continue
+			}
+			if err := deadlineCtx.Err(); err != nil {
+				return nil, err // interrupted by deadline/cancel, not exhaustion
 			}
 			return nil, fmt.Errorf("llm: retry exhausted (%d attempts): %w", attempt+1, lastErr)
 		default:
@@ -429,8 +515,9 @@ func (o *streamOutcome) success() bool {
 	return o.err == nil && o.abort == nil && o.apiErr == nil && !o.learnRetry
 }
 
-// attemptStream performs one streaming attempt.
-func (pc *providerClient) attemptStream(ctx context.Context, url string, body []byte, mapper streamEventMapper, onDelta func(Delta) error) streamOutcome {
+// attemptStream performs one streaming attempt. learnEffort enables the
+// reasoning_effort learn-once trigger (set when the request carries tools).
+func (pc *providerClient) attemptStream(ctx context.Context, url string, body []byte, mapper streamEventMapper, onDelta func(Delta) error, learnEffort bool) streamOutcome {
 	req, rerr := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body))
 	if rerr != nil {
 		return streamOutcome{err: &ConfigError{Msg: "build request: " + rerr.Error()}}
@@ -443,7 +530,7 @@ func (pc *providerClient) attemptStream(ctx context.Context, url string, body []
 	if derr != nil {
 		return streamOutcome{err: derr} // transport error: retryable
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		data, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
@@ -451,11 +538,14 @@ func (pc *providerClient) attemptStream(ctx context.Context, url string, body []
 		e := pc.httpError(resp.StatusCode, data)
 		switch {
 		case streamOptionsRejected(e):
-			pc.dropStreamOptions.Store(true)
-			return streamOutcome{learnRetry: true}
+			pc.learn.dropStreamOptions.Store(true)
+			return streamOutcome{learnRetry: true, apiErr: e}
+		case learnEffort && !pc.learn.forceNoneEffort.Load() && reasoningEffortRejected(e):
+			pc.learn.forceNoneEffort.Store(true)
+			return streamOutcome{learnRetry: true, apiErr: e}
 		case streamRejected(e):
-			pc.forceBuffered.Store(true)
-			return streamOutcome{learnRetry: true}
+			pc.learn.forceBuffered.Store(true)
+			return streamOutcome{learnRetry: true, apiErr: e}
 		default:
 			return streamOutcome{apiErr: e, retryAfter: ra}
 		}
@@ -463,8 +553,8 @@ func (pc *providerClient) attemptStream(ctx context.Context, url string, body []
 
 	if ct := resp.Header.Get("Content-Type"); !strings.Contains(ct, "text/event-stream") {
 		// Provider answered a streamed request with a regular body.
-		pc.forceBuffered.Store(true)
-		return streamOutcome{learnRetry: true}
+		pc.learn.forceBuffered.Store(true)
+		return streamOutcome{learnRetry: true, err: errNonSSE}
 	}
 
 	acc := newStreamAccum()
@@ -490,6 +580,18 @@ func (pc *providerClient) attemptStream(ctx context.Context, url string, body []
 
 	switch {
 	case perr == nil, errors.Is(perr, errStreamStop):
+		if perr == nil && pc.cfg.Format != FormatGemini && acc.finishReason == "" {
+			// Gemini completes at EOF; every other format has an explicit
+			// completion signal that never arrived — the provider dropped
+			// the stream. Never surface this as an empty success.
+			if acc.emitted {
+				return streamOutcome{
+					result: acc.result(),
+					err:    fmt.Errorf("llm: stream closed before completion: %w", errPrematureClose),
+				}
+			}
+			return streamOutcome{err: errPrematureClose}
+		}
 		return streamOutcome{result: acc.result()}
 	default:
 		var ca *consumerAbort
@@ -522,13 +624,14 @@ type toolCallAccum struct {
 
 // streamAccum assembles a ChatResult from SSE chunks across formats.
 type streamAccum struct {
-	content      strings.Builder
-	reasoning    strings.Builder
-	calls        []*toolCallAccum
-	callIndex    map[int]*toolCallAccum
-	finishReason string
-	usage        Usage
-	emitted      bool // any delta delivered to the consumer
+	content           strings.Builder
+	reasoning         strings.Builder
+	calls             []*toolCallAccum
+	callIndex         map[int]*toolCallAccum
+	finishReason      string
+	usage             Usage
+	emitted           bool   // any delta delivered to the consumer
+	thinkingSignature string // anthropic signature_delta capture
 }
 
 func newStreamAccum() *streamAccum {
@@ -548,10 +651,11 @@ func (a *streamAccum) call(idx int) *toolCallAccum {
 
 func (a *streamAccum) result() *ChatResult {
 	res := &ChatResult{
-		Content:          a.content.String(),
-		ReasoningContent: a.reasoning.String(),
-		FinishReason:     a.finishReason,
-		Usage:            a.usage,
+		Content:           a.content.String(),
+		ReasoningContent:  a.reasoning.String(),
+		ThinkingSignature: a.thinkingSignature,
+		FinishReason:      a.finishReason,
+		Usage:             a.usage,
 	}
 	for _, c := range a.calls {
 		res.ToolCalls = append(res.ToolCalls, ToolCall{ID: c.id, Name: c.name, Arguments: c.args.String()})

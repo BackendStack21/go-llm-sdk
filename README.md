@@ -1,11 +1,25 @@
 # go-llm-sdk
 
+[![CI](https://github.com/BackendStack21/go-llm-sdk/actions/workflows/ci.yml/badge.svg)](https://github.com/BackendStack21/go-llm-sdk/actions/workflows/ci.yml)
+[![Go Reference](https://pkg.go.dev/badge/github.com/BackendStack21/go-llm-sdk.svg)](https://pkg.go.dev/github.com/BackendStack21/go-llm-sdk)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+![Go](https://img.shields.io/badge/Go-1.25%2B-00ADD8)
+
 Multi-provider Go SDK for LLM inference endpoints — **OpenAI, Google Gemini, DeepSeek, Z.ai, Kimi (Moonshot) and Anthropic**, plus any custom OpenAI-compatible gateway. Stdlib only, zero external dependencies.
 
 - **Multiple authenticated endpoints at once** — auto-discovered from `<PROVIDER>_API_KEY` environment variables (aliases supported).
 - **Dynamic model discovery** — `ListModels` returns what the account can actually access, on the fly. No static model tables, ever.
 - **One canonical API** — OpenAI-shaped requests/responses; Anthropic and Gemini wire formats are translated for you.
-- **Production streaming semantics** (ported from [odek](https://github.com/BackendStack21/odek)'s battle-tested client): SSE with idle watchdog + hard wall-clock deadline, abort-with-partial-result, retries that never duplicate partial output, and learn-once fallbacks for providers that reject `stream_options`, streaming, or `reasoning_effort`+tools.
+- **Production streaming semantics** (ported from [odek](https://github.com/BackendStack21/odek)'s battle-tested client): SSE with idle watchdog + hard wall-clock deadline, abort-with-partial-result, retries that never duplicate partial output, premature-close detection, and learn-once fallbacks for providers that reject `stream_options`, streaming, or `reasoning_effort`+tools.
+- **Hardened by adversarial review** — three sequential adversarial review passes (contract, concurrency, wire fidelity) with every finding reproduced and fixed RED-first. Goroutine-leak-free streaming, race-clean shared state, canonical-only error vocabulary.
+
+## Install
+
+```bash
+go get github.com/BackendStack21/go-llm-sdk@v0.1.0
+```
+
+Requires Go 1.25+. No dependencies beyond the standard library.
 
 ## Quickstart
 
@@ -25,7 +39,11 @@ res, err := chat.Call(ctx, &llm.ChatRequest{
     Messages: []llm.Message{{Role: llm.RoleUser, Content: "Hello"}},
     Tools:    []llm.ToolDef{{Name: "get_weather", Parameters: schema}},
 })
+```
 
+Streaming:
+
+```go
 res, err = chat.CallStream(ctx, req, func(d llm.Delta) error {
     switch d.Kind {
     case llm.DeltaReasoning: // thinking fragment
@@ -47,7 +65,7 @@ res, err = chat.CallStream(ctx, req, func(d llm.Delta) error {
 | `kimi` | openai | `https://api.moonshot.ai/v1` | `KIMI_API_KEY` (`MOONSHOT_API_KEY`) | `KIMI_BASE_URL` |
 | `anthropic` | anthropic | `https://api.anthropic.com` | `ANTHROPIC_API_KEY` | `ANTHROPIC_BASE_URL` |
 
-Primary env var beats its alias. Explicit keys (`WithAPIKey`) beat env. Base-URL overrides accept any gateway speaking the provider's format.
+Primary env var beats its alias. Explicit keys (`WithAPIKey`) beat env. Base-URL overrides accept any gateway speaking the provider's format. Override validation runs at wiring time — a bad base URL fails loudly at `New`, not per request.
 
 Custom gateways:
 
@@ -59,26 +77,142 @@ sdk := llm.New(llm.WithProvider("my-gateway",
 ))
 ```
 
-## Provider quirks, handled
+## Canonical API
 
-The registry carries explicit quirk flags (no URL sniffing): Anthropic/DeepSeek/GLM thinking objects, OpenAI/GLM `reasoning_effort`, GLM-5.3 forced-thinking models (`disabled` → `enabled` + `reasoning_effort: low`), the `anthropic-version` header, Gemini `systemInstruction`/`thinkingConfig`, and temperature-forbidding models (`o1/o3/o4/gpt-5*/kimi-for-coding*/k3*` never receive an explicit temperature). Learn-once fallbacks fix provider rejections at runtime without repeated failed round-trips.
+Requests and results are provider-neutral. Unknown message roles are rejected at the SDK boundary (never silently dropped or reinterpreted).
+
+```go
+type ChatRequest struct {
+    Model          string         // optional; ChatClient's model wins when both set
+    Messages       []Message      // RoleUser | RoleAssistant | RoleSystem | RoleTool
+    System         []SystemBlock  // {Text, Cache} — Cache marks Anthropic prompt-cache blocks
+    Tools          []ToolDef      // {Name, Description, Parameters json.RawMessage}
+    Thinking       string         // "", "enabled", "disabled", "low", "medium", "high"
+    ThinkingBudget int            // explicit token budget where the provider supports it
+    MaxTokens      int            // routed to max_completion_tokens on o-series/gpt-5
+    Temperature    float64        // 0 = provider default; negative = explicit 0
+}
+
+type ChatResult struct {
+    Content           string
+    ReasoningContent  string      // provider thinking text (advisory)
+    ThinkingSignature string      // Anthropic: replay via Message.ThinkingSignature
+    ToolCalls         []ToolCall  // {ID, Name, Arguments}
+    FinishReason      string      // stop | length | tool_calls | content_filter | ""
+    Usage             Usage       // {PromptTokens, CompletionTokens, ReasoningTokens}
+}
+```
+
+Finish reasons are canonical: anything a provider reports outside the vocabulary maps to `""` (unknown) rather than leaking provider-specific strings.
+
+## Streaming semantics
+
+`CallStream` enforces four guarantees, each covered by regression tests:
+
+1. **Idle watchdog** — a stream silent longer than `streamIdleTimeout` (120s default) fails with `ErrIdleTimeout`. Keepalive comments reset it.
+2. **Hard wall-clock deadline** — the whole stream is bounded by the per-request timeout (`WithRequestTimeout`, default 120s; per-client via `SetRequestTimeout`).
+3. **Retries never duplicate output** — retries happen only before the first emitted delta. A failure after partial output returns the partial `*ChatResult` plus a wrapped error and is never retried.
+4. **No silent empty successes** — a provider that closes the stream before its completion signal (before `[DONE]` / `message_stop`) yields a retryable error, not an empty result. Gemini, whose streams legitimately end at EOF, is exempt.
+
+Aborting from the delta handler returns the partial result alongside `*StreamAbortedError` — the parser goroutine is always released, so aborted streams leak nothing.
+
+### Tool-call loop
+
+```go
+for {
+    res, err := chat.CallStream(ctx, req, func(d llm.Delta) error { return nil })
+    if err != nil {
+        return err
+    }
+    if len(res.ToolCalls) == 0 {
+        return nil
+    }
+    req.Messages = append(req.Messages,
+        Message{Role: RoleAssistant, Content: res.Content,
+                ReasoningContent: res.ReasoningContent, ThinkingSignature: res.ThinkingSignature,
+                ToolCalls: res.ToolCalls})
+    for _, tc := range res.ToolCalls {
+        req.Messages = append(req.Messages,
+            Message{Role: RoleTool, ToolCallID: tc.ID, ToolName: tc.Name, Content: execute(tc)})
+    }
+}
+```
+
+On Gemini, a tool result's `ToolName` may be omitted — the SDK recovers the function name from the assistant `ToolCall` it answers, and errors loudly if it cannot.
+
+## Extended thinking
+
+- **Anthropic** — `thinking` blocks are parsed in both buffered and streaming modes. `ChatResult.ThinkingSignature` carries the provider signature; for tool loops, replay it on the assistant message (`Message.ReasoningContent` + `Message.ThinkingSignature`) — the SDK re-serializes it as the first block, as Anthropic's API requires. Omitting it makes extended-thinking tool loops fail mid-conversation.
+- **DeepSeek / GLM** — reasoning streams as `DeltaReasoning` fragments and lands in `ReasoningContent` (advisory; not replayed).
+- **Gemini** — `thought: true` parts map to reasoning deltas; `thinkingConfig` is derived from `Thinking`/`ThinkingBudget`.
+
+## Learn-once fallbacks
+
+When a provider rejects a request pattern, the SDK learns the constraint **once per provider** (shared across every `ChatClient` you mint) and never re-pays the failed round-trip:
+
+| Trigger (provider 400) | Learned fallback |
+|---|---|
+| Rejects `stream_options` | omit `stream_options` from streaming requests |
+| Rejects `reasoning_effort` + tools | pin `reasoning_effort: "none"` |
+| Rejects streaming itself | downgrade to buffered calls permanently |
+| Answers a streamed request with a non-SSE body | downgrade to buffered calls permanently |
 
 ## Retry policy
 
-8 attempts, exponential backoff capped at 30s with ±20% jitter, `Retry-After` (seconds or HTTP-date) honored, context cancellation between attempts. Persistent 429s surface as `*llm.RateLimitError{Attempts, RetryAfter}`. Streaming retries happen only before the first emitted delta.
+8 attempts, exponential backoff capped at 30s with ±20% jitter, `Retry-After` (seconds or HTTP-date) honored, context cancellation honored between and during attempts. Persistent 429s surface as `*llm.RateLimitError{Attempts, RetryAfter}` — including when the retry sleep is cut short by a deadline, so the caller never loses the retry signal. `RateLimitError` unwraps to `*APIError` for `errors.As` access to `Status`/`Retryable`.
 
-## Errors
+## Timeouts & cancellation
 
-`*ConfigError` (unknown/unauthenticated provider), `*APIError{Provider, Status, Code, Message, Retryable}`, `*RateLimitError`, `*StreamAbortedError` (returned together with the partial `*ChatResult`). API keys never appear in any error text.
+- Buffered calls: per-request timeout on the HTTP client (`WithRequestTimeout`, per-client `SetRequestTimeout` — race-safe, swap is atomic).
+- Streaming: the same timeout becomes the hard wall-clock deadline via context; per-attempt SSE reads are additionally bounded by the idle watchdog.
+- Every wait (backoff, Retry-After, stream reads) selects on the caller's context — cancellation propagates everywhere, and a cancelled call never misreports as "retry exhausted".
+- Response bodies are capped (50 MB chat, 8 MB listings, 1 MiB SSE lines, 4 MiB SSE events) as an OOM bound.
+
+## Error handling
+
+`*ConfigError` (unknown/unauthenticated provider, invalid wiring, unknown role, no model), `*APIError{Provider, Status, Code, Message, Retryable}`, `*RateLimitError{Attempts, RetryAfter}` (unwraps to `*APIError`), `*StreamAbortedError` (returned together with the partial `*ChatResult`). A stream failure after partial output returns the partial `*ChatResult` plus a wrapped error and is never retried; the idle watchdog surfaces as `ErrIdleTimeout` (retried only before the first delta); wall-clock deadlines surface as context deadline errors. Recommended classification:
+
+```go
+var abort *llm.StreamAbortedError
+var rl *llm.RateLimitError
+var ae *llm.APIError
+switch {
+case errors.As(err, &abort): // consumer abort (partial result returned)
+case errors.As(err, &rl):    // back off rl.RetryAfter
+case errors.As(err, &ae):    // provider said no (ae.Status)
+case errors.Is(err, llm.ErrIdleTimeout): // stream went silent
+case errors.Is(err, context.DeadlineExceeded): // wall-clock budget spent
+}
+```
+
+API keys never appear in any error text. Provider error bodies are parsed per format (nested OpenAI envelope, Anthropic `error.type/message`, Gemini `error.status/message`) with a 512-byte raw-body fallback.
+
+## Thread safety
+
+`SDK` and `Provider` are safe for concurrent use. `ChatClient` is safe for concurrent `Call`/`CallStream`; `SetRequestTimeout` is race-safe (atomic swap) but should still be called before the first request so in-flight calls use one timeout. Learn-once state is shared per provider via atomics — monotonic, converging, race-free.
+
+## Model discovery
+
+`ListModels` hits each provider's models endpoint (Anthropic paginates with `after_id`, Gemini with `pageToken`), caches per SDK for 5 minutes (`WithModelCacheTTL(0)` disables, `ForceRefresh()` bypasses), and retries transient failures 3×. Fields the provider does not report stay zero — the SDK never guesses.
+
+## Testing
+
+```bash
+make quality    # fmt + vet + tests
+make test-race  # race detector
+make lint       # golangci-lint (v2 config)
+```
+
+Coverage sits at **97.7%** of statements, including the streaming failure-orchestration paths (deadline, 429, premature close, partial-output) that are usually the blind spot of SDK test suites. The residual ~2% is provably unreachable defensive code (documented in the review record).
 
 ## Design record
 
-See [PLAN.md](PLAN.md) for the architecture and the odek migration path.
+See [PLAN.md](PLAN.md) for the architecture, the provider-quirk table, and the odek migration path.
 
 ## Status
 
-v0 — API may shift until the odek integration lands, then v1.0.
+v0.1.0 — API may shift until the odek integration lands, then v1.0.
 
 ## License
 
-MIT — see [LICENSE](LICENSE).
+[MIT](LICENSE)

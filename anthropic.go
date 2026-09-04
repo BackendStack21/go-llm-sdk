@@ -28,6 +28,10 @@ type anSysBlock struct {
 type anBlock struct {
 	Type string `json:"type"` // "text" | "tool_use" | "tool_result"
 	Text string `json:"text,omitempty"`
+	// thinking (replayed assistant turns; must be the FIRST block and
+	// carry the provider signature)
+	Thinking  string `json:"thinking,omitempty"`
+	Signature string `json:"signature,omitempty"`
 	// tool_use
 	ID    string          `json:"id,omitempty"`
 	Name  string          `json:"name,omitempty"`
@@ -153,6 +157,12 @@ func buildAnthropicRequest(req *ChatRequest, model string, stream bool) ([]byte,
 			})
 		case RoleAssistant:
 			var blocks []anBlock
+			if m.ReasoningContent != "" && m.ThinkingSignature != "" {
+				// Anthropic requires a replayed thinking block to be the
+				// FIRST block and to carry its signature; extended-thinking
+				// tool loops are otherwise rejected mid-conversation.
+				blocks = append(blocks, anBlock{Type: "thinking", Thinking: m.ReasoningContent, Signature: m.ThinkingSignature})
+			}
 			if m.Content != "" {
 				blocks = append(blocks, anBlock{Type: "text", Text: m.Content})
 			}
@@ -194,12 +204,13 @@ func buildAnthropicRequest(req *ChatRequest, model string, stream bool) ([]byte,
 // ── response ─────────────────────────────────────────────────────────────
 
 type anRespBlock struct {
-	Type     string          `json:"type"` // "text" | "thinking" | "tool_use"
-	Text     string          `json:"text"`
-	Thinking string          `json:"thinking"`
-	ID       string          `json:"id"`
-	Name     string          `json:"name"`
-	Input    json.RawMessage `json:"input"`
+	Type      string          `json:"type"` // "text" | "thinking" | "tool_use"
+	Text      string          `json:"text"`
+	Thinking  string          `json:"thinking"`
+	Signature string          `json:"signature"`
+	ID        string          `json:"id"`
+	Name      string          `json:"name"`
+	Input     json.RawMessage `json:"input"`
 }
 
 type anResponse struct {
@@ -226,7 +237,9 @@ func mapAnthropicStopReason(s string) string {
 	case "refusal":
 		return FinishContentFilter
 	default:
-		return s
+		// Provider-specific reasons (pause_turn, model_context_window_exceeded,
+		// ...) stay out of the canonical vocabulary.
+		return ""
 	}
 }
 
@@ -257,6 +270,11 @@ func parseAnthropicResponse(body []byte) (*ChatResult, error) {
 	}
 	res.Content = strings.Join(content, "")
 	res.ReasoningContent = strings.Join(thinking, "")
+	for _, b := range r.Content {
+		if b.Type == "thinking" && b.Signature != "" {
+			res.ThinkingSignature = b.Signature
+		}
+	}
 	res.Usage = Usage{
 		PromptTokens:     r.Usage.InputTokens,
 		CompletionTokens: r.Usage.OutputTokens,
@@ -281,10 +299,11 @@ type anStreamEvent struct {
 	// delta and usage as top-level siblings, not nested under a
 	// "message_delta" key.
 	Delta struct {
-		Type        string `json:"type"` // "text_delta" | "thinking_delta" | "input_json_delta"
+		Type        string `json:"type"` // "text_delta" | "thinking_delta" | "signature_delta" | "input_json_delta"
 		StopReason  string `json:"stop_reason"`
 		Text        string `json:"text"`
 		Thinking    string `json:"thinking"`
+		Signature   string `json:"signature"`
 		PartialJSON string `json:"partial_json"`
 	} `json:"delta"`
 	// message_delta usage (top-level sibling of delta)
@@ -327,6 +346,8 @@ func mapAnthropicStreamEvent(data []byte, acc *streamAccum) ([]Delta, bool, erro
 		case "thinking_delta":
 			acc.reasoning.WriteString(ev.Delta.Thinking)
 			deltas = append(deltas, Delta{Kind: DeltaReasoning, Text: ev.Delta.Thinking})
+		case "signature_delta":
+			acc.thinkingSignature += ev.Delta.Signature
 		case "input_json_delta":
 			c := acc.call(ev.Index)
 			c.args.WriteString(ev.Delta.PartialJSON)
@@ -378,7 +399,7 @@ func listModelsAnthropic(ctx context.Context, pc *providerClient) ([]Model, erro
 	for page := 0; page < 10; page++ {
 		url := pc.base + "/v1/models?limit=100"
 		if pageID != "" {
-			url += "&page_id=" + pageID
+			url += "&after_id=" + pageID
 		}
 		data, _, err := pc.get(ctx, url)
 		if err != nil {

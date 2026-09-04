@@ -123,6 +123,7 @@ func buildGeminiRequest(req *ChatRequest, model string, stream bool) ([]byte, er
 		out.SystemInstruction = &gmContent{Parts: sysParts}
 	}
 
+	toolNameByID := make(map[string]string)
 	for i := 0; i < len(req.Messages); i++ {
 		m := req.Messages[i]
 		switch m.Role {
@@ -134,6 +135,11 @@ func buildGeminiRequest(req *ChatRequest, model string, stream bool) ([]byte, er
 				Parts: []gmPart{{Text: m.Content}},
 			})
 		case RoleAssistant:
+			for _, tc := range m.ToolCalls {
+				if tc.ID != "" {
+					toolNameByID[tc.ID] = tc.Name
+				}
+			}
 			parts := []gmPart{}
 			if m.Content != "" {
 				parts = append(parts, gmPart{Text: m.Content})
@@ -155,9 +161,19 @@ func buildGeminiRequest(req *ChatRequest, model string, stream bool) ([]byte, er
 			var parts []gmPart
 			for ; i < len(req.Messages) && req.Messages[i].Role == RoleTool; i++ {
 				tm := req.Messages[i]
+				name := tm.ToolName
+				if name == "" {
+					// Consumers ported from the OpenAI format set only
+					// ToolCallID; recover the function name from the
+					// assistant tool_call it answers.
+					name = toolNameByID[tm.ToolCallID]
+				}
+				if name == "" {
+					return nil, &ConfigError{Msg: "tool result for \"" + tm.ToolCallID + "\" has no ToolName and no matching assistant tool_call"}
+				}
 				parts = append(parts, gmPart{
 					FunctionResponse: &gmFnResp{
-						Name:     tm.ToolName,
+						Name:     name,
 						Response: wrapToolResponse(tm.Content),
 					},
 				})
@@ -170,11 +186,7 @@ func buildGeminiRequest(req *ChatRequest, model string, stream bool) ([]byte, er
 	if len(req.Tools) > 0 {
 		g := gmToolGroup{}
 		for _, t := range req.Tools {
-			g.FunctionDeclarations = append(g.FunctionDeclarations, gmFnDecl{
-				Name:        t.Name,
-				Description: t.Description,
-				Parameters:  t.Parameters,
-			})
+			g.FunctionDeclarations = append(g.FunctionDeclarations, gmFnDecl(t))
 		}
 		out.Tools = []gmToolGroup{g}
 	}
@@ -237,7 +249,8 @@ func mapGeminiFinishReason(s string) string {
 	case "":
 		return ""
 	default:
-		return strings.ToLower(s)
+		// Provider-specific reasons stay out of the canonical vocabulary.
+		return ""
 	}
 }
 
@@ -307,7 +320,7 @@ func parseGeminiResponse(body []byte) (*ChatResult, error) {
 
 type gmStreamChunk struct {
 	Candidates    []gmCandidate `json:"candidates"`
-	UsageMetadata gmUsage       `json:"usageMetadata"`
+	UsageMetadata *gmUsage      `json:"usageMetadata"` // nil = chunk carries no usage update
 }
 
 // mapGeminiStreamEvent folds one Gemini SSE chunk into acc. Chunks carry
@@ -318,6 +331,9 @@ func mapGeminiStreamEvent(data []byte, acc *streamAccum) ([]Delta, bool, error) 
 	if err := json.Unmarshal(data, &c); err != nil {
 		return nil, false, fmt.Errorf("llm: parse stream chunk: %w", err)
 	}
+	if c.UsageMetadata != nil {
+		acc.usage = mapGeminiUsage(*c.UsageMetadata)
+	}
 	if len(c.Candidates) == 0 {
 		return nil, false, nil
 	}
@@ -326,7 +342,6 @@ func mapGeminiStreamEvent(data []byte, acc *streamAccum) ([]Delta, bool, error) 
 	if cand.FinishReason != "" {
 		acc.finishReason = mapGeminiFinishReason(cand.FinishReason)
 	}
-	acc.usage = mapGeminiUsage(c.UsageMetadata)
 	return deltas, false, nil
 }
 

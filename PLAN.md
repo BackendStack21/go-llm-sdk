@@ -15,7 +15,7 @@ inference endpoints, with:
 
 1. **Multiple authenticated endpoints simultaneously**, auto-discovered from the environment via
    `<PROVIDER>_API_KEY` (e.g. `OPENAI_API_KEY`, `GEMINI_API_KEY`, `DEEPSEEK_API_KEY`, `ZAI_API_KEY`,
-   `KIM_API_KEY`, `ANTHROPIC_API_KEY`).
+   `KIMI_API_KEY`, `ANTHROPIC_API_KEY`).
 2. **Dynamic model discovery on the fly** — `ListModels(ctx)` hits each provider's models endpoint
    and returns what the account can actually access. **No static model profile tables** (replaces
    odek's `KnownProfiles` / `ModelProfile`).
@@ -101,7 +101,7 @@ instance, exactly as odek does today.
 
 OpenAI-compatible shape is the canonical type system (odek's loop already speaks it):
 `Message{Role, Content, ReasoningContent, ToolCalls, ToolCallID}`, `ToolDef`,
-`ChatRequest{Model, Messages, Tools, Thinking, ThinkingBudget, MaxTokens, Temperature, SystemBlocks}`,
+`ChatRequest{Model, Messages, Tools, Thinking, ThinkingBudget, MaxTokens, Temperature, System}`,
 `ChatResult{Content, ReasoningContent, ToolCalls, FinishReason, Usage}`.
 Adapters translate to/from Anthropic (`system` top-level, content blocks, `tool_use`/`tool_result`,
 `thinking` blocks) and Gemini (`contents`/`parts`, `functionDeclarations`, `functionCall`/`functionResponse`,
@@ -121,7 +121,7 @@ Thinking control maps per format: `reasoning_effort` (openai) / `thinking:{type,
 - **Gemini**: system prompts go to `systemInstruction`; `functionResponse` parts ride `role:"user"`
   per current API docs; model in URL path (`/v1beta/models/{m}:generateContent`); no tool-call IDs
   — SDK synthesizes `call_<n>` ids; `finishReason` mapping (STOP→stop, MAX_TOKENS→length,
-  SAFETY/RECISATION→content_filter); reasoning = parts with `thought:true` + `includeThoughts`.
+  SAFETY/RECITATION→content_filter); reasoning = parts with `thought:true` + `includeThoughts`.
 - **Canonical**: multi-part content (images/audio) is **out of scope for v0** and documented as a
   limitation — `Content` is plain text; if a provider returns multi-part, text parts concatenate.
 
@@ -257,3 +257,13 @@ TDD: every milestone lands RED tests first, then implementation (house conventio
 6. No static fallback metadata: unknown context window stays unknown (0) + optional consumer override.
 7. v0.x until odek migration lands; then v1.0.
 8. Stdlib only — SSE parsing, JSON, HTTP pooling hand-rolled, exactly like odek today.
+
+## 11. Implementation status (2026-09-04, pre-v0.1.0)
+
+Shipped on `feat/multi-provider-sdk` ahead of v0.1.0:
+
+- **Hardening passes** — three sequential adversarial reviews (API contract vs docs, concurrency/streaming bug hunt, wire-fidelity + registry) with every finding personally verified, reproduced RED-first, and fixed. Highlights: SSE parser goroutine-leak fix (abort-safe `done` protocol), real 1 MiB SSE line cap (was effectively 64 KiB), no-retry-after-partial-output branch in `callStream`, premature-close detection (no silent empty successes), buffered 429 preserving `*RateLimitError` under deadline pressure, narrowed `streamRejected` classifier, Anthropic `after_id` pagination, `max_completion_tokens` routing for o-series/gpt-5, Gemini usage-only-chunk guard and functionResponse name resolution, nested OpenAI error-envelope parsing, `RateLimitError.Unwrap`, learn-once state hoisted to `Provider` (shared across all ChatClients), wiring-time validation for overridden built-ins, in-band role validation at the SDK boundary.
+- **Extended-thinking round-trip** — `ThinkingSignature` added to `Message`/`ChatResult`; Anthropic thinking blocks are captured (buffered + `signature_delta`) and replayed first-block-with-signature, unblocking extended-thinking tool loops.
+- **Canonical vocabulary** — unmapped provider finish reasons map to `""` on all three formats.
+- **Coverage** — 81% → 97.7% of statements, including the previously zero-coverage `CallStream` failure-orchestration paths; race detector and golangci-lint clean.
+- **Deferred (known, intentional)** — `ReasoningContent` is serialized request-side only for Anthropic (signature-gated); DeepSeek/GLM/Gemini reasoning stays advisory. The 2.3% coverage residual is unreachable defensive code (documented in the review record).

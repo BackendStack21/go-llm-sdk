@@ -46,6 +46,10 @@ type RateLimitError struct {
 	RetryAfter time.Duration
 }
 
+// Unwrap exposes the embedded APIError so errors.As(err, *APIError)
+// reaches Status/Retryable without a type switch.
+func (e *RateLimitError) Unwrap() error { return &e.APIError }
+
 func (e *RateLimitError) Error() string {
 	s := fmt.Sprintf("llm: %s: rate limited after %d attempts", e.Provider, e.Attempts)
 	if e.RetryAfter > 0 {

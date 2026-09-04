@@ -250,3 +250,18 @@ func TestListModelsGemini_PaginationAndLimits(t *testing.T) {
 		t.Errorf("capabilities = %v", m0.Capabilities)
 	}
 }
+
+// Regression: a trailing stream chunk without usageMetadata must not wipe
+// usage accumulated from earlier chunks.
+func TestMapGeminiStreamEventUsageNotWiped(t *testing.T) {
+	acc := newStreamAccum()
+	if _, _, err := mapGeminiStreamEvent([]byte(`{"candidates":[{"content":{"parts":[{"text":"a"}]}}],"usageMetadata":{"promptTokenCount":10,"candidatesTokenCount":5}}`), acc); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := mapGeminiStreamEvent([]byte(`{"candidates":[{"finishReason":"STOP","content":{"parts":[{"text":"b"}]}}]}`), acc); err != nil {
+		t.Fatal(err)
+	}
+	if acc.usage.PromptTokens != 10 || acc.usage.CompletionTokens != 5 {
+		t.Fatalf("usage wiped by trailing chunk: %+v, want {10 5 0}", acc.usage)
+	}
+}

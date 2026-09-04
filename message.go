@@ -47,15 +47,21 @@ type ToolCall struct {
 // Message is one canonical chat message. For RoleTool messages, ToolCallID
 // and ToolName identify the call being answered and Content carries the
 // tool result. ReasoningContent is provider-reported thinking text
-// (deepseek-reasoner, anthropic thinking, gemini thoughts); it is echoed
-// back to providers only where they accept it and is otherwise advisory.
+// (deepseek-reasoner, anthropic thinking, gemini thoughts). It is consumer
+// metadata; the SDK replays it back only where a provider requires it for
+// conversation continuity — Anthropic, and only when ThinkingSignature is
+// also set (extended-thinking tool loops mandate the signed thinking block
+// as the first block of the replayed assistant turn).
 type Message struct {
 	Role             Role
 	Content          string
 	ReasoningContent string
-	ToolCalls        []ToolCall
-	ToolCallID       string
-	ToolName         string
+	// ThinkingSignature authenticates ReasoningContent for providers that
+	// require thinking to be replayed verbatim (Anthropic signature).
+	ThinkingSignature string
+	ToolCalls         []ToolCall
+	ToolCallID        string
+	ToolName          string
 }
 
 // SystemBlock is one system-prompt segment. On Anthropic each block maps to
@@ -102,9 +108,13 @@ type ChatRequest struct {
 type ChatResult struct {
 	Content          string
 	ReasoningContent string
-	ToolCalls        []ToolCall
-	FinishReason     string
-	Usage            Usage
+	// ThinkingSignature authenticates ReasoningContent (Anthropic extended
+	// thinking). Consumers must carry it back on the next assistant Message
+	// for tool loops to stay valid.
+	ThinkingSignature string
+	ToolCalls         []ToolCall
+	FinishReason      string
+	Usage             Usage
 }
 
 // DeltaKind discriminates streamed fragments.

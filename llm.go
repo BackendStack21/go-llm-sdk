@@ -3,6 +3,7 @@ package llm
 import (
 	"context"
 	"net/http"
+	"strings"
 	"sync"
 	"time"
 )
@@ -90,9 +91,9 @@ func FromEnv() Option { return WithEnv(lookupEnv) }
 // custom provider (requires WithFormat and WithBaseURL, plus auth).
 func WithProvider(id string, popts ...ProviderOption) Option {
 	return func(s *SDK) {
-		existing, exists := s.providers[id]
+		existing := s.providers[id]
 		cfg := ProviderConfig{ID: id}
-		if exists {
+		if existing != nil {
 			cfg = existing.cfg
 		}
 		for _, po := range popts {
@@ -101,11 +102,10 @@ func WithProvider(id string, popts ...ProviderOption) Option {
 			}
 		}
 		s.put(cfg)
-		if !exists {
-			// Custom entry: validate before it can poison requests.
-			if p, ok := s.get(id); ok {
-				p.invalid = validateProviderConfig(p.cfg) != nil
-			}
+		// Validate every entry — custom or overridden built-in — so config
+		// typos fail at wiring time instead of per request.
+		if p, ok := s.get(id); ok {
+			p.invalid = validateProviderConfig(p.cfg) != nil
 		}
 	}
 }
@@ -195,13 +195,14 @@ func (s *SDK) Chat(providerID, model string) (*ChatClient, error) {
 		return nil, err
 	}
 	if !p.Authenticated() {
-		return nil, &ConfigError{Msg: providerID + " has no API key (set " + providerID + "_API_KEY or use WithAPIKey)"}
+		return nil, &ConfigError{Msg: providerID + " has no API key (set " + strings.ToUpper(providerID) + "_API_KEY or use WithAPIKey)"}
 	}
 	if p.invalid {
 		return nil, &ConfigError{Msg: providerID + " has an invalid configuration"}
 	}
+	p.chatLearnOnce.Do(func() { p.chatLearn = &learnOnce{} })
 	return &ChatClient{
-		pc:     newProviderClient(p.cfg, newBufferedHTTP(p.sdk.rt, p.sdk.timeout), newStreamHTTP(p.sdk.rt)),
+		pc:     newProviderClientWithLearn(p.cfg, newBufferedHTTP(p.sdk.rt, p.sdk.timeout), newStreamHTTP(p.sdk.rt), p.chatLearn),
 		model:  model,
 		parent: p,
 	}, nil
@@ -217,6 +218,11 @@ type Provider struct {
 
 	clientOnce sync.Once
 	listClient *providerClient
+
+	// Learn-once fallback state shared by every Chat() client of this
+	// provider: a constraint one client learns, all of them honor.
+	chatLearnOnce sync.Once
+	chatLearn     *learnOnce
 
 	mu       sync.Mutex
 	cached   []Model
@@ -303,7 +309,7 @@ func (c *ChatClient) SetRequestTimeout(d time.Duration) {
 	if d <= 0 {
 		return
 	}
-	c.pc.http = newBufferedHTTP(c.pc.http.Transport, d)
+	c.pc.bufPtr.Store(newBufferedHTTP(c.pc.buffered().Transport, d))
 }
 
 // ProviderID returns the bound provider's id.

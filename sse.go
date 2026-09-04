@@ -32,12 +32,14 @@ type sseItem struct {
 	err  error
 }
 
-// parseSSEStream reads SSE frames from r and emits items on ch. It closes ch
-// when done. A data event is every accumulated "data:" line set terminated
-// by a blank line; comment lines (':') and retry fields count as keepalive
-// activity. Runs in its own goroutine; terminates when r errors (e.g. the
-// caller closes the response body).
-func parseSSEStream(r io.Reader, ch chan<- sseItem) {
+// parseSSEStream reads SSE frames from r and emits items on ch. It closes
+// ch when done. A data event is every accumulated "data:" line set
+// terminated by a blank line; comment lines (':') and retry fields count as
+// keepalive activity. Runs in its own goroutine; terminates when r errors
+// (e.g. the caller closes the response body) or the consumer closes done —
+// a pump that exits early (abort, cancel, timeout) must never strand this
+// goroutine on a channel send.
+func parseSSEStream(r io.Reader, ch chan<- sseItem, done <-chan struct{}) {
 	defer close(ch)
 	br := bufio.NewReaderSize(r, 64*1024)
 	var data []byte
@@ -52,7 +54,7 @@ func parseSSEStream(r io.Reader, ch chan<- sseItem) {
 			case hasSSEPrefix(line, "data:"):
 				payload := trimSSEPayload(line[5:])
 				if len(data)+len(payload) > sseMaxEventSize {
-					ch <- sseItem{kind: sseErr, err: errSSEOversized}
+					sendSSE(ch, done, sseItem{kind: sseErr, err: errSSEOversized})
 					return
 				}
 				if len(data) > 0 {
@@ -63,46 +65,75 @@ func parseSSEStream(r io.Reader, ch chan<- sseItem) {
 		}
 		if err != nil {
 			if err == io.EOF && len(data) == 0 {
-				ch <- sseItem{kind: sseEnd}
+				sendSSE(ch, done, sseItem{kind: sseEnd})
 				return
 			}
 			if err == io.EOF {
 				// Trailing event without blank line: deliver it.
-				ch <- sseItem{kind: sseData, data: data}
-				ch <- sseItem{kind: sseEnd}
+				if sendSSE(ch, done, sseItem{kind: sseData, data: data}) {
+					sendSSE(ch, done, sseItem{kind: sseEnd})
+				}
 				return
 			}
-			ch <- sseItem{kind: sseErr, err: err}
+			sendSSE(ch, done, sseItem{kind: sseErr, err: err})
 			return
 		}
 		if len(line) == 0 {
 			// Blank line: event boundary.
 			if len(data) > 0 {
-				ch <- sseItem{kind: sseData, data: data}
+				if !sendSSE(ch, done, sseItem{kind: sseData, data: data}) {
+					return
+				}
 				data = nil
+				sawActivity = false
 			} else if sawActivity {
-				ch <- sseItem{kind: sseKeepalive}
+				if !sendSSE(ch, done, sseItem{kind: sseKeepalive}) {
+					return
+				}
 				sawActivity = false
 			}
 		}
 	}
 }
 
+// sendSSE delivers one item unless the consumer abandoned the stream
+// (done closed); reports whether delivery succeeded.
+func sendSSE(ch chan<- sseItem, done <-chan struct{}, it sseItem) bool {
+	select {
+	case ch <- it:
+		return true
+	case <-done:
+		return false
+	}
+}
+
 // readSSELine reads one line including the trailing newline; returns the
-// line without it (also strips a leading \r for CRLF frames).
+// line without it (also strips a trailing \r\n for CRLF frames). Lines
+// longer than the bufio buffer are accumulated across ReadSlice calls,
+// bounded by sseMaxLineSize.
 func readSSELine(br *bufio.Reader) ([]byte, error) {
-	line, err := br.ReadSlice('\n')
-	if len(line) > sseMaxLineSize {
-		return nil, errSSEOversized
-	}
-	l := len(line)
-	if l > 0 && line[l-1] == '\n' {
-		l--
-		if l > 0 && line[l-1] == '\r' {
-			l--
+	var buf []byte
+	for {
+		frag, err := br.ReadSlice('\n')
+		if len(buf)+len(frag) > sseMaxLineSize {
+			return nil, errSSEOversized
 		}
+		buf = append(buf, frag...)
+		if err == bufio.ErrBufferFull {
+			continue // line spans the buffer boundary; keep accumulating
+		}
+		if err != nil {
+			return buf, err // EOF or read error; trailing line lacks '\n'
+		}
+		l := len(buf)
+		if l > 0 && buf[l-1] == '\n' {
+			l--
+			if l > 0 && buf[l-1] == '\r' {
+				l--
+			}
+		}
+		return buf[:l], nil
 	}
-	return line[:l], err
 }
 
 func hasSSEPrefix(line []byte, prefix string) bool {
@@ -129,11 +160,15 @@ var errSSEOversized = &sseError{"frame exceeds size limit"}
 // (nil error) on EOF without a trailing partial event.
 func pumpSSE(ctx context.Context, r io.ReadCloser, idle time.Duration, handle func(data []byte) error) error {
 	ch := make(chan sseItem, 8)
-	go parseSSEStream(r, ch)
+	done := make(chan struct{})
+	defer close(done) // always release the parser, even on abort/timeout
+	go parseSSEStream(r, ch, done)
 
 	var timer *time.Timer
 	var timeout <-chan time.Time
 	if idle > 0 {
+		// No drain-before-Reset dance is needed: since Go 1.23 a Timer's
+		// channel never delivers stale values after Reset (go.mod: 1.25).
 		timer = time.NewTimer(idle)
 		defer timer.Stop()
 		timeout = timer.C
