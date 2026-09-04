@@ -10,12 +10,12 @@ import (
 )
 
 func TestRetryableStatus(t *testing.T) {
-	for _, s := range []int{408, 429, 500, 502, 503, 504, 529} {
+	for _, s := range []int{408, 429, 500, 502, 503, 504, 520, 521, 522, 523, 524, 529} {
 		if !retryableStatus(s) {
 			t.Errorf("retryableStatus(%d) = false, want true", s)
 		}
 	}
-	for _, s := range []int{400, 401, 403, 404, 422, 200} {
+	for _, s := range []int{400, 401, 403, 404, 422, 200, 525, 530} {
 		if retryableStatus(s) {
 			t.Errorf("retryableStatus(%d) = true, want false", s)
 		}
@@ -56,6 +56,20 @@ func TestParseRetryAfter_Garbage(t *testing.T) {
 	}
 	if d := parseRetryAfter("", time.Now()); d != 0 {
 		t.Fatalf("parseRetryAfter(\"\") = %v, want 0", d)
+	}
+}
+
+func TestParseRetryAfter_CappedAt120s(t *testing.T) {
+	now := time.Now()
+	if d := parseRetryAfter("100000", now); d != maxRetryAfter {
+		t.Fatalf("parseRetryAfter(\"100000\") = %v, want cap %v", d, maxRetryAfter)
+	}
+	if d := parseRetryAfter("120", now); d != 120*time.Second {
+		t.Fatalf("parseRetryAfter(\"120\") = %v, want 120s (exactly the cap)", d)
+	}
+	future := now.UTC().Add(time.Hour).Format(http.TimeFormat)
+	if d := parseRetryAfter(future, now); d != maxRetryAfter {
+		t.Fatalf("parseRetryAfter(HTTP-date +1h) = %v, want cap %v", d, maxRetryAfter)
 	}
 }
 

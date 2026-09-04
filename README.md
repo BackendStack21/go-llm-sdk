@@ -84,10 +84,10 @@ Requests and results are provider-neutral. Unknown message roles are rejected at
 ```go
 type ChatRequest struct {
     Model          string         // optional; ChatClient's model wins when both set
-    Messages       []Message      // RoleUser | RoleAssistant | RoleSystem | RoleTool
+    Messages       []Message      // RoleUser | RoleAssistant | RoleSystem | RoleTool; Message.Cache → Anthropic user-block cache_control
     System         []SystemBlock  // {Text, Cache} — Cache marks Anthropic prompt-cache blocks
     Tools          []ToolDef      // {Name, Description, Parameters json.RawMessage}
-    Thinking       string         // "", "enabled", "disabled", "low", "medium", "high"
+    Thinking       string         // "", "enabled", "disabled", "low", "medium", "high", "max"
     ThinkingBudget int            // explicit token budget where the provider supports it
     MaxTokens      int            // routed to max_completion_tokens on o-series/gpt-5
     Temperature    float64        // 0 = provider default; negative = explicit 0
@@ -95,11 +95,11 @@ type ChatRequest struct {
 
 type ChatResult struct {
     Content           string
-    ReasoningContent  string      // provider thinking text (advisory)
+    ReasoningContent  string      // provider thinking text; replayed as reasoning_content on OpenAI-format assistant turns
     ThinkingSignature string      // Anthropic: replay via Message.ThinkingSignature
     ToolCalls         []ToolCall  // {ID, Name, Arguments}
     FinishReason      string      // stop | length | tool_calls | content_filter | ""
-    Usage             Usage       // {PromptTokens, CompletionTokens, ReasoningTokens}
+    Usage             Usage       // PromptTokens is uncached-only; cache volumes in CacheRead/Creation/CachedTokens
 }
 ```
 
@@ -109,7 +109,7 @@ Finish reasons are canonical: anything a provider reports outside the vocabulary
 
 `CallStream` enforces four guarantees, each covered by regression tests:
 
-1. **Idle watchdog** — a stream silent longer than `streamIdleTimeout` (120s default) fails with `ErrIdleTimeout`. Keepalive comments reset it.
+1. **Idle watchdog** — a stream silent longer than `StreamIdleTimeout()` (120s default; override with `SetStreamIdleTimeout`, positive values only) fails with `ErrIdleTimeout`. Keepalive comments reset it.
 2. **Hard wall-clock deadline** — the whole stream is bounded by the per-request timeout (`WithRequestTimeout`, default 120s; per-client via `SetRequestTimeout`).
 3. **Retries never duplicate output** — retries happen only before the first emitted delta. A failure after partial output returns the partial `*ChatResult` plus a wrapped error and is never retried.
 4. **No silent empty successes** — a provider that closes the stream before its completion signal (before `[DONE]` / `message_stop`) yields a retryable error, not an empty result. Gemini, whose streams legitimately end at EOF, is exempt.
@@ -143,7 +143,7 @@ On Gemini, a tool result's `ToolName` may be omitted — the SDK recovers the fu
 ## Extended thinking
 
 - **Anthropic** — `thinking` blocks are parsed in both buffered and streaming modes. `ChatResult.ThinkingSignature` carries the provider signature; for tool loops, replay it on the assistant message (`Message.ReasoningContent` + `Message.ThinkingSignature`) — the SDK re-serializes it as the first block, as Anthropic's API requires. Omitting it makes extended-thinking tool loops fail mid-conversation.
-- **DeepSeek / GLM** — reasoning streams as `DeltaReasoning` fragments and lands in `ReasoningContent` (advisory; not replayed).
+- **DeepSeek / GLM** — reasoning streams as `DeltaReasoning` fragments and lands in `ReasoningContent`. Assistant-turn replay echoes it as `reasoning_content` (required for DeepSeek/GLM tool loops). GLM maps thinking `medium` → `reasoning_effort` `high` (no medium level) and `max` → `max`.
 - **Gemini** — `thought: true` parts map to reasoning deltas; `thinkingConfig` is derived from `Thinking`/`ThinkingBudget`.
 
 ## Learn-once fallbacks
@@ -159,10 +159,11 @@ When a provider rejects a request pattern, the SDK learns the constraint **once 
 
 ## Retry policy
 
-8 attempts, exponential backoff capped at 30s with ±20% jitter, `Retry-After` (seconds or HTTP-date) honored, context cancellation honored between and during attempts. Persistent 429s surface as `*llm.RateLimitError{Attempts, RetryAfter}` — including when the retry sleep is cut short by a deadline, so the caller never loses the retry signal. `RateLimitError` unwraps to `*APIError` for `errors.As` access to `Status`/`Retryable`.
+8 attempts, exponential backoff capped at 30s with ±20% jitter, `Retry-After` (seconds or HTTP-date) honored and capped at 120s, context cancellation honored between and during attempts. Retryable statuses include 408/429/5xx plus Cloudflare 520–524 and Anthropic 529. Persistent 429s surface as `*llm.RateLimitError{Attempts, RetryAfter}` — including when the retry sleep is cut short by a deadline, so the caller never loses the retry signal. A 429 whose body is billing exhaustion (`insufficient_quota`, `exceeded your current quota`, `insufficient balance`, `no resource package`) is not retryable and fails on the first attempt. `RateLimitError` unwraps to `*APIError` for `errors.As` access to `Status`/`Retryable`.
 
 ## Timeouts & cancellation
 
+- The pooled transport honors `HTTP_PROXY` / `HTTPS_PROXY` / `NO_PROXY` via `http.ProxyFromEnvironment`.
 - Buffered calls: per-request timeout on the HTTP client (`WithRequestTimeout`, per-client `SetRequestTimeout` — race-safe, swap is atomic).
 - Streaming: the same timeout becomes the hard wall-clock deadline via context; per-attempt SSE reads are additionally bounded by the idle watchdog.
 - Every wait (backoff, Retry-After, stream reads) selects on the caller's context — cancellation propagates everywhere, and a cancelled call never misreports as "retry exhausted".

@@ -28,10 +28,11 @@ type oaToolCall struct {
 }
 
 type oaMessage struct {
-	Role       string       `json:"role"`
-	Content    *string      `json:"content"` // nil keeps JSON null for tool calls
-	ToolCalls  []oaToolCall `json:"tool_calls,omitempty"`
-	ToolCallID string       `json:"tool_call_id,omitempty"`
+	Role             string       `json:"role"`
+	Content          *string      `json:"content"` // nil keeps JSON null for tool calls
+	ReasoningContent string       `json:"reasoning_content,omitempty"`
+	ToolCalls        []oaToolCall `json:"tool_calls,omitempty"`
+	ToolCallID       string       `json:"tool_call_id,omitempty"`
 }
 
 type oaToolDef struct {
@@ -77,23 +78,23 @@ func buildOpenAIRequest(cfg ProviderConfig, req *ChatRequest, model string, stre
 		out.MaxTokens = req.MaxTokens
 	}
 
-	// System prompt: canonical blocks (+ any in-band system messages)
-	// concatenate into a leading system message.
-	var sys strings.Builder
+	// One OpenAI system message per SystemBlock and per in-band system
+	// role. Concatenating would collapse prompt-tiering (stable base +
+	// volatile memory) and bust prefix cache on every memory refresh.
+	msgs := make([]oaMessage, 0, len(req.Messages)+len(req.System)+1)
+	appendSystem := func(text string) {
+		if t := strings.TrimRight(text, "\n"); t != "" {
+			s := t
+			msgs = append(msgs, oaMessage{Role: "system", Content: &s})
+		}
+	}
 	for _, b := range req.System {
-		sys.WriteString(b.Text)
-		sys.WriteString("\n")
+		appendSystem(b.Text)
 	}
 	for _, m := range req.Messages {
 		if m.Role == RoleSystem {
-			sys.WriteString(m.Content)
-			sys.WriteString("\n")
+			appendSystem(m.Content)
 		}
-	}
-	msgs := make([]oaMessage, 0, len(req.Messages)+1)
-	if sys.Len() > 0 {
-		s := strings.TrimRight(sys.String(), "\n")
-		msgs = append(msgs, oaMessage{Role: "system", Content: &s})
 	}
 	for _, m := range req.Messages {
 		switch m.Role {
@@ -107,6 +108,7 @@ func buildOpenAIRequest(cfg ProviderConfig, req *ChatRequest, model string, stre
 			om := oaMessage{Role: "assistant"}
 			c := m.Content
 			om.Content = &c
+			om.ReasoningContent = m.ReasoningContent
 			for _, tc := range m.ToolCalls {
 				om.ToolCalls = append(om.ToolCalls, oaToolCall{
 					ID:   tc.ID,
@@ -161,10 +163,15 @@ func buildOpenAIRequest(cfg ProviderConfig, req *ChatRequest, model string, stre
 			} else {
 				out.Thinking = &oaThinking{Type: "disabled"}
 			}
-		case "low", "medium", "high":
+		case "low", "medium", "high", "max":
 			out.Thinking = &oaThinking{Type: "enabled"}
 			if q.ReasoningEffort {
-				out.ReasoningEffort = req.Thinking
+				// GLM has no "medium" effort level; odek's medium maps to high.
+				if req.Thinking == "medium" {
+					out.ReasoningEffort = "high"
+				} else {
+					out.ReasoningEffort = req.Thinking
+				}
 			}
 		}
 	case q.ReasoningEffort:
@@ -220,10 +227,62 @@ type oaUsageDetails struct {
 	ReasoningTokens int `json:"reasoning_tokens"`
 }
 
+type oaPromptDetails struct {
+	CachedTokens int `json:"cached_tokens"`
+}
+
 type oaRespUsage struct {
-	PromptTokens            int            `json:"prompt_tokens"`
-	CompletionTokens        int            `json:"completion_tokens"`
-	CompletionTokensDetails oaUsageDetails `json:"completion_tokens_details"`
+	PromptTokens            int              `json:"prompt_tokens"`
+	CompletionTokens        int              `json:"completion_tokens"`
+	CompletionTokensDetails oaUsageDetails   `json:"completion_tokens_details"`
+	CacheCreationTokens     int              `json:"cache_creation_input_tokens"`
+	CacheReadTokens         int              `json:"cache_read_input_tokens"`
+	PromptTokensDetails     *oaPromptDetails `json:"prompt_tokens_details"`
+	PromptCacheHitTokens    int              `json:"prompt_cache_hit_tokens"`
+	PromptCacheMissTokens   int              `json:"prompt_cache_miss_tokens"`
+}
+
+// usageFromOpenAI maps a chat-completions usage object onto canonical
+// Usage with odek applyUsage exclusive normalization: OpenAI
+// cached_tokens and DeepSeek hit/miss are subsets of prompt_tokens and
+// are subtracted so PromptTokens is uncached-only; Anthropic-named
+// cache fields are exclusive and are not subtracted. Guards keep
+// hostile payloads from driving PromptTokens negative.
+func usageFromOpenAI(u *oaRespUsage) Usage {
+	if u == nil {
+		return Usage{}
+	}
+	out := Usage{
+		PromptTokens:        u.PromptTokens,
+		CompletionTokens:    u.CompletionTokens,
+		ReasoningTokens:     u.CompletionTokensDetails.ReasoningTokens,
+		CacheCreationTokens: u.CacheCreationTokens,
+		CacheReadTokens:     u.CacheReadTokens,
+	}
+	if u.PromptTokensDetails != nil {
+		out.CachedTokens = u.PromptTokensDetails.CachedTokens
+		out.CacheReported = true
+	}
+	if u.CacheCreationTokens > 0 || u.CacheReadTokens > 0 {
+		out.CacheReported = true
+	}
+	// DeepSeek native fields: a hit is prompt content read from cache; a
+	// miss is newly processed content that DeepSeek then caches for
+	// future requests, i.e. a cache write.
+	if u.PromptCacheHitTokens > 0 || u.PromptCacheMissTokens > 0 {
+		out.CacheReadTokens += u.PromptCacheHitTokens
+		out.CacheCreationTokens += u.PromptCacheMissTokens
+		out.CacheReported = true
+	}
+	if u.PromptTokensDetails != nil && u.PromptTokensDetails.CachedTokens > 0 &&
+		u.PromptTokensDetails.CachedTokens <= out.PromptTokens {
+		out.PromptTokens -= u.PromptTokensDetails.CachedTokens
+		out.CacheReadTokens += u.PromptTokensDetails.CachedTokens
+	}
+	if total := u.PromptCacheHitTokens + u.PromptCacheMissTokens; total > 0 && total <= out.PromptTokens {
+		out.PromptTokens -= total
+	}
+	return out
 }
 
 type oaResponse struct {
@@ -283,11 +342,7 @@ func parseOpenAIResponse(body []byte) (*ChatResult, error) {
 		})
 	}
 	if r.Usage != nil {
-		res.Usage = Usage{
-			PromptTokens:     r.Usage.PromptTokens,
-			CompletionTokens: r.Usage.CompletionTokens,
-			ReasoningTokens:  r.Usage.CompletionTokensDetails.ReasoningTokens,
-		}
+		res.Usage = usageFromOpenAI(r.Usage)
 	}
 	return res, nil
 }
@@ -327,11 +382,7 @@ func mapOpenAIStreamEvent(data []byte, acc *streamAccum) (deltas []Delta, done b
 		return nil, false, fmt.Errorf("llm: parse stream chunk: %w", err)
 	}
 	if c.Usage != nil {
-		acc.usage = Usage{
-			PromptTokens:     c.Usage.PromptTokens,
-			CompletionTokens: c.Usage.CompletionTokens,
-			ReasoningTokens:  c.Usage.CompletionTokensDetails.ReasoningTokens,
-		}
+		acc.usage = usageFromOpenAI(c.Usage)
 	}
 	for _, ch := range c.Choices {
 		d := ch.Delta

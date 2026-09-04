@@ -80,8 +80,22 @@ const (
 
 // streamIdleTimeout bounds the silence between SSE events. Thinking models
 // can legitimately spend minutes before their first event, so the default
-// is generous. Package var so tests can shorten it.
+// is generous. Package var so tests can shorten it; operators override
+// via SetStreamIdleTimeout.
 var streamIdleTimeout = 120 * time.Second
+
+// SetStreamIdleTimeout overrides the SSE idle watchdog. Call at startup,
+// before the first request; non-positive values are ignored.
+func SetStreamIdleTimeout(d time.Duration) {
+	if d > 0 {
+		streamIdleTimeout = d
+	}
+}
+
+// StreamIdleTimeout reports the active idle watchdog (introspection/tests).
+func StreamIdleTimeout() time.Duration {
+	return streamIdleTimeout
+}
 
 // errStreamStop is the internal sentinel for a clean stream end.
 var errStreamStop = errors.New("llm: stream complete")
@@ -315,7 +329,8 @@ func billingExhausted(e *APIError) bool {
 	m := strings.ToLower(e.Message)
 	return strings.Contains(m, "insufficient balance") ||
 		strings.Contains(m, "insufficient_quota") ||
-		strings.Contains(m, "no resource package")
+		strings.Contains(m, "no resource package") ||
+		strings.Contains(m, "exceeded your current quota")
 }
 
 // retryDelay picks Retry-After when present, else exponential backoff.

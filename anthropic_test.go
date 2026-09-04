@@ -87,6 +87,37 @@ func TestBuildAnthropicRequest_Golden(t *testing.T) {
 	}
 }
 
+func TestBuildAnthropicRequest_UserCacheMarker(t *testing.T) {
+	req := &ChatRequest{Messages: []Message{
+		{Role: RoleUser, Content: "cached turn", Cache: true},
+		{Role: RoleUser, Content: "plain turn"},
+	}}
+	body, err := buildAnthropicRequest(req, "claude", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var m map[string]any
+	if err := json.Unmarshal(body, &m); err != nil {
+		t.Fatalf("decode: %v\n%s", err, body)
+	}
+	msgs := m["messages"].([]any)
+	if len(msgs) != 2 {
+		t.Fatalf("messages = %d, want 2", len(msgs))
+	}
+	cached := msgs[0].(map[string]any)["content"].([]any)[0].(map[string]any)
+	if cached["text"] != "cached turn" {
+		t.Errorf("cached text = %v", cached["text"])
+	}
+	cc, ok := cached["cache_control"].(map[string]any)
+	if !ok || cc["type"] != "ephemeral" {
+		t.Errorf("cached user block cache_control = %v, want {type:ephemeral}", cached["cache_control"])
+	}
+	plain := msgs[1].(map[string]any)["content"].([]any)[0].(map[string]any)
+	if _, ok := plain["cache_control"]; ok {
+		t.Errorf("plain user block must omit cache_control, got %v", plain["cache_control"])
+	}
+}
+
 func TestBuildAnthropicRequest_EmptyAssistantPlaceholder(t *testing.T) {
 	req := &ChatRequest{Messages: []Message{
 		{Role: RoleUser, Content: "q"},

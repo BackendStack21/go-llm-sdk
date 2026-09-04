@@ -16,10 +16,16 @@ const (
 	maxRetries        = 7
 	maxRetryBackoff   = 30 * time.Second
 	retryJitterFactor = 0.2
+	// maxRetryAfter caps how long a server's Retry-After is honored. A
+	// pathological or hostile value (e.g. "Retry-After: 86400") must not
+	// wedge a call for hours; context cancellation can still break the
+	// wait sooner.
+	maxRetryAfter = 120 * time.Second
 )
 
 // retryableStatus reports whether an HTTP status should be retried.
-// 529 is Anthropic's "overloaded" status.
+// 529 is Anthropic's "overloaded" status. 520–524 are Cloudflare-origin
+// incidents (CF-fronted providers emit these during origin hiccups).
 func retryableStatus(code int) bool {
 	switch code {
 	case http.StatusRequestTimeout, http.StatusTooManyRequests,
@@ -27,27 +33,33 @@ func retryableStatus(code int) bool {
 		http.StatusServiceUnavailable, http.StatusGatewayTimeout, 529:
 		return true
 	}
-	return false
+	return code >= 520 && code <= 524
 }
 
 // parseRetryAfter parses a Retry-After header value: either delay-seconds
-// or an HTTP-date. Returns 0 when unparseable.
+// or an HTTP-date. Returns 0 when unparseable. The result is capped at
+// maxRetryAfter.
 func parseRetryAfter(v string, now time.Time) time.Duration {
 	if v == "" {
 		return 0
 	}
+	var d time.Duration
 	if secs, err := strconv.Atoi(v); err == nil {
 		if secs < 0 {
 			return 0
 		}
-		return time.Duration(secs) * time.Second
-	}
-	if t, err := http.ParseTime(v); err == nil {
-		if d := t.Sub(now); d > 0 {
-			return d
+		d = time.Duration(secs) * time.Second
+	} else if t, err := http.ParseTime(v); err == nil {
+		if delta := t.Sub(now); delta > 0 {
+			d = delta
 		}
+	} else {
+		return 0
 	}
-	return 0
+	if d > maxRetryAfter {
+		d = maxRetryAfter
+	}
+	return d
 }
 
 // backoffUnit is the exponential base; a package var so tests can shrink
