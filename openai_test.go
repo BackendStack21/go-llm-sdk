@@ -159,6 +159,74 @@ func TestBuildOpenAIRequest_ThinkingVariants(t *testing.T) {
 	}
 }
 
+// GLM has no "medium" effort level and accepts "max". Mapping applies only
+// when both ThinkingObject and ReasoningEffort are set.
+func TestBuildOpenAIRequest_GLMThinkingMediumAndMax(t *testing.T) {
+	zai := ProviderConfig{ID: "zai", Format: FormatOpenAI, Quirks: Quirks{ThinkingObject: true, ReasoningEffort: true, ForceThinking: []string{"glm-5.3"}}}
+	base := sampleRequest()
+
+	r := *base
+	r.Thinking = "medium"
+	oa := buildOpenAIRequest(zai, &r, "glm-5.3", false, true)
+	body, err := json.Marshal(oa)
+	if err != nil {
+		t.Fatal(err)
+	}
+	m := openaiReqMap(t, body)
+	if m["reasoning_effort"] != "high" {
+		t.Errorf("thinking medium → reasoning_effort %v, want high (GLM has no medium)", m["reasoning_effort"])
+	}
+	th, _ := m["thinking"].(map[string]any)
+	if th == nil || th["type"] != "enabled" {
+		t.Errorf("thinking medium → thinking %v, want {type:enabled}", m["thinking"])
+	}
+
+	r = *base
+	r.Thinking = "max"
+	oa = buildOpenAIRequest(zai, &r, "glm-5.3", false, true)
+	body, err = json.Marshal(oa)
+	if err != nil {
+		t.Fatal(err)
+	}
+	m = openaiReqMap(t, body)
+	if m["reasoning_effort"] != "max" {
+		t.Errorf("thinking max → reasoning_effort %v, want max", m["reasoning_effort"])
+	}
+	th, _ = m["thinking"].(map[string]any)
+	if th == nil || th["type"] != "enabled" {
+		t.Errorf("thinking max → thinking %v, want {type:enabled}", m["thinking"])
+	}
+}
+
+func TestBuildOpenAIRequest_ReasoningContentReplay(t *testing.T) {
+	cfg := ProviderConfig{ID: "deepseek", Format: FormatOpenAI, Quirks: Quirks{ThinkingObject: true}}
+	req := &ChatRequest{Messages: []Message{
+		{Role: RoleUser, Content: "q"},
+		{Role: RoleAssistant, Content: "a", ReasoningContent: "internal thoughts"},
+		{Role: RoleUser, Content: "again"},
+	}}
+	oa := buildOpenAIRequest(cfg, req, "deepseek-reasoner", false, false)
+	body, err := json.Marshal(oa)
+	if err != nil {
+		t.Fatal(err)
+	}
+	m := openaiReqMap(t, body)
+	msgs := m["messages"].([]any)
+	if len(msgs) != 3 {
+		t.Fatalf("messages = %d, want 3", len(msgs))
+	}
+	asst := msgs[1].(map[string]any)
+	if asst["role"] != "assistant" {
+		t.Errorf("role = %v, want assistant", asst["role"])
+	}
+	if asst["reasoning_content"] != "internal thoughts" {
+		t.Errorf("reasoning_content = %v, want %q (DeepSeek/GLM tool loops require echo)", asst["reasoning_content"], "internal thoughts")
+	}
+	if asst["content"] != "a" {
+		t.Errorf("content = %v, want a", asst["content"])
+	}
+}
+
 func TestBuildOpenAIRequest_ToolMessages(t *testing.T) {
 	cfg := ProviderConfig{ID: "kimi", Format: FormatOpenAI}
 	req := &ChatRequest{Messages: []Message{

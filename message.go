@@ -47,11 +47,12 @@ type ToolCall struct {
 // Message is one canonical chat message. For RoleTool messages, ToolCallID
 // and ToolName identify the call being answered and Content carries the
 // tool result. ReasoningContent is provider-reported thinking text
-// (deepseek-reasoner, anthropic thinking, gemini thoughts). It is consumer
-// metadata; the SDK replays it back only where a provider requires it for
-// conversation continuity — Anthropic, and only when ThinkingSignature is
-// also set (extended-thinking tool loops mandate the signed thinking block
-// as the first block of the replayed assistant turn).
+// (deepseek-reasoner, anthropic thinking, gemini thoughts). The SDK
+// replays it where a provider requires conversation continuity:
+// OpenAI-format assistant messages echo it as reasoning_content
+// (DeepSeek/GLM tool loops), and Anthropic re-serializes a signed
+// thinking block as the first content block when ThinkingSignature is
+// also set.
 type Message struct {
 	Role             Role
 	Content          string
@@ -62,6 +63,10 @@ type Message struct {
 	ToolCalls         []ToolCall
 	ToolCallID        string
 	ToolName          string
+	// Cache marks this user message for Anthropic prompt caching
+	// (cache_control ephemeral on the text block). Ignored on other
+	// formats and on non-user roles.
+	Cache bool
 }
 
 // SystemBlock is one system-prompt segment. On Anthropic each block maps to
@@ -82,15 +87,24 @@ type ToolDef struct {
 }
 
 // Usage reports token accounting. Fields the provider does not report stay 0.
+// PromptTokens is exclusive (uncached-only) after provider-specific
+// normalization: OpenAI cached_tokens and DeepSeek hit/miss are subsets of
+// prompt_tokens and are subtracted; Anthropic reports cache volumes
+// exclusively and is left alone. Cache volumes live in the cache fields so
+// budget enforcement can sum without double-counting.
 type Usage struct {
-	PromptTokens     int
-	CompletionTokens int
-	ReasoningTokens  int
+	PromptTokens        int
+	CompletionTokens    int
+	ReasoningTokens     int
+	CacheReadTokens     int
+	CacheCreationTokens int
+	CachedTokens        int
+	CacheReported       bool
 }
 
 // ChatRequest is the canonical request. Model is filled from the ChatClient
 // when empty. Thinking accepts "", "enabled", "disabled", "low", "medium",
-// "high" and is translated per provider format. Temperature: 0 means use
+// "high", "max" and is translated per provider format. Temperature: 0 means use
 // the provider default (field omitted); use a negative value to explicitly
 // send 0.
 type ChatRequest struct {

@@ -205,8 +205,8 @@ func TestCallBuffered429DeadlineKeepsRateLimitError(t *testing.T) {
 	if rl.Attempts != 1 {
 		t.Errorf("Attempts = %d, want 1", rl.Attempts)
 	}
-	if rl.RetryAfter != 3600*time.Second {
-		t.Errorf("RetryAfter = %v, want 1h", rl.RetryAfter)
+	if rl.RetryAfter != maxRetryAfter {
+		t.Errorf("RetryAfter = %v, want cap %v (header was 3600s)", rl.RetryAfter, maxRetryAfter)
 	}
 	if rl.Status != http.StatusTooManyRequests {
 		t.Errorf("Status = %d, want 429", rl.Status)

@@ -21,6 +21,7 @@ const (
 // calls reuse TCP+TLS connections instead of handshaking every request.
 func newPooledTransport() *http.Transport {
 	return &http.Transport{
+		Proxy:               http.ProxyFromEnvironment,
 		MaxIdleConns:        defaultMaxIdleConns,
 		MaxIdleConnsPerHost: defaultMaxIdlePerHost,
 		IdleConnTimeout:     defaultIdleTimeout,

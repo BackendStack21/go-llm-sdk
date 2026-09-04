@@ -28,6 +28,8 @@ type anSysBlock struct {
 type anBlock struct {
 	Type string `json:"type"` // "text" | "tool_use" | "tool_result"
 	Text string `json:"text,omitempty"`
+	// CacheControl is set on user text blocks when Message.Cache is true.
+	CacheControl *anCacheControl `json:"cache_control,omitempty"`
 	// thinking (replayed assistant turns; must be the FIRST block and
 	// carry the provider signature)
 	Thinking  string `json:"thinking,omitempty"`
@@ -151,9 +153,13 @@ func buildAnthropicRequest(req *ChatRequest, model string, stream bool) ([]byte,
 		case RoleSystem:
 			out.System = append(out.System, anSysBlock{Type: "text", Text: m.Content})
 		case RoleUser:
+			blk := anBlock{Type: "text", Text: m.Content}
+			if m.Cache {
+				blk.CacheControl = &anCacheControl{Type: "ephemeral"}
+			}
 			out.Messages = append(out.Messages, anMessage{
 				Role:    "user",
-				Content: []anBlock{{Type: "text", Text: m.Content}},
+				Content: []anBlock{blk},
 			})
 		case RoleAssistant:
 			var blocks []anBlock
@@ -213,13 +219,33 @@ type anRespBlock struct {
 	Input     json.RawMessage `json:"input"`
 }
 
+type anUsage struct {
+	InputTokens         int `json:"input_tokens"`
+	OutputTokens        int `json:"output_tokens"`
+	CacheCreationTokens int `json:"cache_creation_input_tokens"`
+	CacheReadTokens     int `json:"cache_read_input_tokens"`
+}
+
 type anResponse struct {
 	Content    []anRespBlock `json:"content"`
 	StopReason string        `json:"stop_reason"`
-	Usage      struct {
-		InputTokens  int `json:"input_tokens"`
-		OutputTokens int `json:"output_tokens"`
-	} `json:"usage"`
+	Usage      anUsage       `json:"usage"`
+}
+
+// usageFromAnthropic maps Messages API usage onto canonical Usage.
+// Anthropic reports cache volumes exclusively — input_tokens is already
+// uncached-only — so PromptTokens is left alone.
+func usageFromAnthropic(u anUsage) Usage {
+	out := Usage{
+		PromptTokens:        u.InputTokens,
+		CompletionTokens:    u.OutputTokens,
+		CacheCreationTokens: u.CacheCreationTokens,
+		CacheReadTokens:     u.CacheReadTokens,
+	}
+	if u.CacheCreationTokens > 0 || u.CacheReadTokens > 0 {
+		out.CacheReported = true
+	}
+	return out
 }
 
 // mapAnthropicStopReason maps stop_reason to canonical values.
@@ -275,10 +301,7 @@ func parseAnthropicResponse(body []byte) (*ChatResult, error) {
 			res.ThinkingSignature = b.Signature
 		}
 	}
-	res.Usage = Usage{
-		PromptTokens:     r.Usage.InputTokens,
-		CompletionTokens: r.Usage.OutputTokens,
-	}
+	res.Usage = usageFromAnthropic(r.Usage)
 	return res, nil
 }
 
@@ -288,9 +311,7 @@ type anStreamEvent struct {
 	Type string `json:"type"`
 	// message_start
 	Message struct {
-		Usage struct {
-			InputTokens int `json:"input_tokens"`
-		} `json:"usage"`
+		Usage anUsage `json:"usage"`
 	} `json:"message"`
 	// content_block_start / content_block_stop
 	Index        int         `json:"index"`
@@ -326,7 +347,7 @@ func mapAnthropicStreamEvent(data []byte, acc *streamAccum) ([]Delta, bool, erro
 	var deltas []Delta
 	switch ev.Type {
 	case "message_start":
-		acc.usage.PromptTokens = ev.Message.Usage.InputTokens
+		acc.usage = usageFromAnthropic(ev.Message.Usage)
 	case "content_block_start":
 		if ev.ContentBlock.Type == "tool_use" {
 			c := acc.call(ev.Index)

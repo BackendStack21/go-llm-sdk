@@ -48,7 +48,7 @@ The canonical type system is OpenAI-shaped; `gemini.go`/`anthropic.go` translate
 ## Testing conventions
 
 - **RED-first TDD**: failing test first, then the fix. Table-driven tests; `httptest` servers for hermetic coverage; `newTestClient` helper pins `backoffUnit` to 1ms — restore package vars in `t.Cleanup`.
-- Two timing knobs are package vars for tests: `backoffUnit`, `streamIdleTimeout`.
+- Two timing knobs are package vars for tests: `backoffUnit`, `streamIdleTimeout`. Operators override the idle watchdog via `SetStreamIdleTimeout` (positive values only).
 - The e2e suite (`e2e_test.go`) is behind a `e2e` build tag and hits **live APIs**. It must never lose that tag. Keys come from env or a gitignored `.env`; contents are never logged; tests skip when a key is absent. Adding a provider = one `e2eTarget` entry; models overridable via `<ID>_E2E_MODEL`.
 - Live-provider behavior (e.g. DeepSeek eliding `reasoning_content`) is **not an SDK contract** — probe softly, assert only what the SDK guarantees (call success, parsing, canonical finish). Model answer correctness is never an assertion.
 - Timer hygiene: since Go 1.23 no drain-before-`Reset` is needed for `time.Timer`. Note: on some dev machines `time.After` + select-default spin loops have hung — prefer deadline loops in tests.

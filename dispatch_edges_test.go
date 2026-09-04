@@ -1003,6 +1003,31 @@ func TestListModelsGeminiMidPageError(t *testing.T) {
 	}
 }
 
+func TestBillingExhausted_Markers(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		status  int
+		message string
+		want    bool
+	}{
+		{"z.ai insufficient balance", 429, "Insufficient balance or no resource package. Please recharge.", true},
+		{"openai insufficient_quota code", 429, "insufficient_quota", true},
+		{"openai quota message", 429, "You exceeded your current quota, please check your plan and billing details.", true},
+		{"deepseek balance", 429, "Insufficient Balance", true},
+		{"plain rate limit", 429, "rate limit exceeded, retry later", false},
+		{"billing text on non-429", 500, "Insufficient balance", false},
+		{"nil error", 429, "", false},
+	} {
+		var e *APIError
+		if tc.name != "nil error" {
+			e = &APIError{Status: tc.status, Message: tc.message}
+		}
+		if got := billingExhausted(e); got != tc.want {
+			t.Errorf("%s: billingExhausted = %v, want %v", tc.name, got, tc.want)
+		}
+	}
+}
+
 // ── billing exhaustion: 429 that is really a permanent billing failure ───
 
 // Billing/resource exhaustion signalled as 429 is permanent — the SDK
