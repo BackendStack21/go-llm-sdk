@@ -78,23 +78,23 @@ func buildOpenAIRequest(cfg ProviderConfig, req *ChatRequest, model string, stre
 		out.MaxTokens = req.MaxTokens
 	}
 
-	// System prompt: canonical blocks (+ any in-band system messages)
-	// concatenate into a leading system message.
-	var sys strings.Builder
+	// One OpenAI system message per SystemBlock and per in-band system
+	// role. Concatenating would collapse prompt-tiering (stable base +
+	// volatile memory) and bust prefix cache on every memory refresh.
+	msgs := make([]oaMessage, 0, len(req.Messages)+len(req.System)+1)
+	appendSystem := func(text string) {
+		if t := strings.TrimRight(text, "\n"); t != "" {
+			s := t
+			msgs = append(msgs, oaMessage{Role: "system", Content: &s})
+		}
+	}
 	for _, b := range req.System {
-		sys.WriteString(b.Text)
-		sys.WriteString("\n")
+		appendSystem(b.Text)
 	}
 	for _, m := range req.Messages {
 		if m.Role == RoleSystem {
-			sys.WriteString(m.Content)
-			sys.WriteString("\n")
+			appendSystem(m.Content)
 		}
-	}
-	msgs := make([]oaMessage, 0, len(req.Messages)+1)
-	if sys.Len() > 0 {
-		s := strings.TrimRight(sys.String(), "\n")
-		msgs = append(msgs, oaMessage{Role: "system", Content: &s})
 	}
 	for _, m := range req.Messages {
 		switch m.Role {

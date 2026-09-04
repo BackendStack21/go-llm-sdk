@@ -813,8 +813,8 @@ func TestBuildOpenAIRequestSystemAndToolRoles(t *testing.T) {
 		t.Fatal(err)
 	}
 	s := string(b)
-	if !strings.Contains(s, `"role":"system","content":"sys\nband"`) {
-		t.Errorf("system fold missing: %s", s)
+	if !strings.Contains(s, `"role":"system","content":"sys"`) || !strings.Contains(s, `"role":"system","content":"band"`) {
+		t.Errorf("separate system messages missing: %s", s)
 	}
 	if !strings.Contains(s, `"role":"tool","content":"r","tool_call_id":"t1"`) {
 		t.Errorf("tool role missing: %s", s)

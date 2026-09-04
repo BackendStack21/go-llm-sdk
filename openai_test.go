@@ -78,6 +78,38 @@ func TestBuildOpenAIRequest_Golden(t *testing.T) {
 	}
 }
 
+func TestBuildOpenAIRequest_SeparateSystemMessages(t *testing.T) {
+	cfg := ProviderConfig{ID: "openai", Format: FormatOpenAI}
+	req := &ChatRequest{
+		System: []SystemBlock{{Text: "stable-base"}, {Text: "volatile-memory"}},
+		Messages: []Message{
+			{Role: RoleSystem, Content: "skill-block"},
+			{Role: RoleUser, Content: "Hi"},
+		},
+	}
+	oa := buildOpenAIRequest(cfg, req, "gpt-4o", false, false)
+	body, err := json.Marshal(oa)
+	if err != nil {
+		t.Fatal(err)
+	}
+	m := openaiReqMap(t, body)
+	msgs := m["messages"].([]any)
+	if len(msgs) != 4 {
+		t.Fatalf("messages len = %d, want 4 (3 system + user)", len(msgs))
+	}
+	want := []string{"stable-base", "volatile-memory", "skill-block", "Hi"}
+	for i, w := range want {
+		got := msgs[i].(map[string]any)
+		role := "system"
+		if i == 3 {
+			role = "user"
+		}
+		if got["role"] != role || got["content"] != w {
+			t.Errorf("messages[%d] = %v, want role=%s content=%q", i, got, role, w)
+		}
+	}
+}
+
 func TestBuildOpenAIRequest_TemperatureForbiddenModels(t *testing.T) {
 	cfg := ProviderConfig{ID: "openai", Format: FormatOpenAI, Quirks: Quirks{ReasoningEffort: true}}
 	req := sampleRequest()
