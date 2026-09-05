@@ -66,6 +66,8 @@ type anRequest struct {
 	System      []anSysBlock `json:"system,omitempty"`
 	Tools       []anTool     `json:"tools,omitempty"`
 	Temperature *float64     `json:"temperature,omitempty"`
+	TopP        *float64     `json:"top_p,omitempty"`
+	Stop        []string     `json:"stop_sequences,omitempty"`
 	Stream      bool         `json:"stream,omitempty"`
 	Thinking    *anThinking  `json:"thinking,omitempty"`
 }
@@ -104,6 +106,7 @@ func buildAnthropicRequest(req *ChatRequest, model string, stream bool) ([]byte,
 	out := anRequest{
 		Model:     model,
 		MaxTokens: req.MaxTokens,
+		Stop:      req.Stop,
 		Stream:    stream,
 	}
 
@@ -123,6 +126,13 @@ func buildAnthropicRequest(req *ChatRequest, model string, stream bool) ([]byte,
 			t = 0
 		}
 		out.Temperature = &t
+	}
+	if req.TopP != 0 {
+		p := req.TopP
+		if p < 0 {
+			p = 0
+		}
+		out.TopP = &p
 	}
 	if out.MaxTokens <= 0 {
 		out.MaxTokens = anthropicDefaultMaxTokens

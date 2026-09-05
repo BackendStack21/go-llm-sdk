@@ -104,9 +104,9 @@ type Usage struct {
 
 // ChatRequest is the canonical request. Model is filled from the ChatClient
 // when empty. Thinking accepts "", "enabled", "disabled", "low", "medium",
-// "high", "max" and is translated per provider format. Temperature: 0 means use
-// the provider default (field omitted); use a negative value to explicitly
-// send 0.
+// "high", "max" and is translated per provider format. Temperature and TopP:
+// 0 means use the provider default (field omitted); use a negative value to
+// explicitly send 0. Stop maps to each provider's stop-sequence field.
 type ChatRequest struct {
 	Model          string
 	Messages       []Message
@@ -116,6 +116,8 @@ type ChatRequest struct {
 	ThinkingBudget int
 	MaxTokens      int
 	Temperature    float64
+	TopP           float64
+	Stop           []string
 }
 
 // ChatResult is the canonical response for both buffered and streaming calls.

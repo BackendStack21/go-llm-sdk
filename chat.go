@@ -127,6 +127,9 @@ func (pc *providerClient) requestTimeout() time.Duration {
 // buildChatRequest dispatches format-specific serialization. stream=false
 // yields the buffered request; stream=true the SSE request.
 func (pc *providerClient) buildChatRequest(req *ChatRequest, model string, stream bool) ([]byte, string, error) {
+	if req == nil {
+		return nil, "", &ConfigError{Msg: "chat request is nil"}
+	}
 	// Reject unknown roles loudly: OpenAI would silently send them as user
 	// messages and Anthropic/Gemini would silently drop them.
 	for i, m := range req.Messages {

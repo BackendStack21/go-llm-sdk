@@ -57,6 +57,8 @@ type oaRequest struct {
 	MaxTokens           int              `json:"max_tokens,omitempty"`
 	MaxCompletionTokens int              `json:"max_completion_tokens,omitempty"`
 	Temperature         *float64         `json:"temperature,omitempty"`
+	TopP                *float64         `json:"top_p,omitempty"`
+	Stop                []string         `json:"stop,omitempty"`
 	Stream              bool             `json:"stream,omitempty"`
 	StreamOptions       *oaStreamOptions `json:"stream_options,omitempty"`
 	ReasoningEffort     string           `json:"reasoning_effort,omitempty"`
@@ -68,6 +70,7 @@ func buildOpenAIRequest(cfg ProviderConfig, req *ChatRequest, model string, stre
 	q := cfg.Quirks
 	out := oaRequest{
 		Model:  model,
+		Stop:   req.Stop,
 		Stream: stream,
 	}
 	// OpenAI o-series/gpt-5 models reject max_tokens in favor of
@@ -140,6 +143,13 @@ func buildOpenAIRequest(cfg ProviderConfig, req *ChatRequest, model string, stre
 			t = 0
 		}
 		out.Temperature = &t
+	}
+	if req.TopP != 0 && !modelForbidsTemperature(model) {
+		p := req.TopP
+		if p < 0 {
+			p = 0
+		}
+		out.TopP = &p
 	}
 
 	if stream && includeStreamOptions {

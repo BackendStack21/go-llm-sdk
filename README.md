@@ -10,6 +10,7 @@ Multi-provider Go SDK for LLM inference endpoints — **OpenAI, Google Gemini, D
 - **Multiple authenticated endpoints at once** — auto-discovered from `<PROVIDER>_API_KEY` environment variables (aliases supported).
 - **Dynamic model discovery** — `ListModels` returns what the account can actually access. No static model tables.
 - **One canonical API** — OpenAI-shaped requests and responses; Anthropic and Gemini wire formats are translated for you.
+- **Portable generation controls** — token limits, temperature, top-p, stop sequences, thinking, and tools map to each provider's native fields.
 - **Production streaming** — SSE with an idle watchdog and a hard wall-clock deadline, abort-with-partial-result, retries that never duplicate partial output, premature-close detection, and learn-once fallbacks for providers that reject `stream_options`, streaming, or `reasoning_effort`+tools.
 - **Predictable under load** — goroutine-leak-free streaming, race-clean shared state, and a canonical-only error vocabulary (API keys never leak into error text).
 
@@ -114,6 +115,8 @@ type ChatRequest struct {
 	ThinkingBudget int            // explicit token budget where the provider supports it
 	MaxTokens      int            // routed to max_completion_tokens on o-series/gpt-5
 	Temperature    float64        // 0 = provider default; negative = explicit 0
+	TopP           float64        // 0 = provider default; negative = explicit 0
+	Stop           []string       // provider-native stop / stop_sequences / stopSequences
 }
 
 type ChatResult struct {

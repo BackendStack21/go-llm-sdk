@@ -54,6 +54,8 @@ type gmThinkCfg struct {
 type gmGenCfg struct {
 	MaxOutputTokens int         `json:"maxOutputTokens,omitempty"`
 	Temperature     *float64    `json:"temperature,omitempty"`
+	TopP            *float64    `json:"topP,omitempty"`
+	StopSequences   []string    `json:"stopSequences,omitempty"`
 	ThinkingConfig  *gmThinkCfg `json:"thinkingConfig,omitempty"`
 }
 
@@ -191,7 +193,10 @@ func buildGeminiRequest(req *ChatRequest, model string, stream bool) ([]byte, er
 		out.Tools = []gmToolGroup{g}
 	}
 
-	cfg := gmGenCfg{MaxOutputTokens: req.MaxTokens}
+	cfg := gmGenCfg{
+		MaxOutputTokens: req.MaxTokens,
+		StopSequences:   req.Stop,
+	}
 	if req.Temperature != 0 {
 		t := req.Temperature
 		if t < 0 {
@@ -199,10 +204,18 @@ func buildGeminiRequest(req *ChatRequest, model string, stream bool) ([]byte, er
 		}
 		cfg.Temperature = &t
 	}
+	if req.TopP != 0 {
+		p := req.TopP
+		if p < 0 {
+			p = 0
+		}
+		cfg.TopP = &p
+	}
 	if tc := geminiThinkingConfig(req.Thinking, req.ThinkingBudget); tc != nil {
 		cfg.ThinkingConfig = tc
 	}
-	if cfg.MaxOutputTokens != 0 || cfg.Temperature != nil || cfg.ThinkingConfig != nil {
+	if cfg.MaxOutputTokens != 0 || cfg.Temperature != nil || cfg.TopP != nil ||
+		len(cfg.StopSequences) > 0 || cfg.ThinkingConfig != nil {
 		out.GenerationConfig = &cfg
 	}
 	return json.Marshal(out)
