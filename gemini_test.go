@@ -103,6 +103,7 @@ func TestBuildGeminiRequest_ThinkingVariants(t *testing.T) {
 		{"disabled", 0, false},
 		{"enabled", -1, false},
 		{"high", 24576, false},
+		{"max", 24576, false},
 		{"", 0, true},
 	}
 	for _, c := range cases {
@@ -126,6 +127,24 @@ func TestBuildGeminiRequest_ThinkingVariants(t *testing.T) {
 		if tc["thinkingBudget"].(float64) != float64(c.budget) {
 			t.Errorf("thinking=%q budget = %v, want %d", c.thinking, tc["thinkingBudget"], c.budget)
 		}
+	}
+}
+
+func TestBuildGeminiRequest_ThinkingBudgetOverridesPreset(t *testing.T) {
+	req := &ChatRequest{
+		Messages:       []Message{{Role: RoleUser, Content: "x"}},
+		Thinking:       "low",
+		ThinkingBudget: 4096,
+	}
+	body, err := buildGeminiRequest(req, "gemini-2.5-pro", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := decodeObject(t, body)
+	cfg := got["generationConfig"].(map[string]any)
+	thinking := cfg["thinkingConfig"].(map[string]any)
+	if thinking["thinkingBudget"] != float64(4096) {
+		t.Errorf("thinkingBudget = %v, want explicit 4096", thinking["thinkingBudget"])
 	}
 }
 
@@ -213,6 +232,7 @@ func TestMapGeminiStreamEvent_Chunks(t *testing.T) {
 
 func TestListModelsGemini_PaginationAndLimits(t *testing.T) {
 	var calls int
+	const pageToken = "p+/=&"
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		calls++
 		if r.Header.Get("x-goog-api-key") != "k" {
@@ -220,8 +240,11 @@ func TestListModelsGemini_PaginationAndLimits(t *testing.T) {
 			return
 		}
 		if r.URL.Query().Get("pageToken") == "" {
-			fmt.Fprint(w, `{"models":[{"name":"models/gemini-2.5-pro","displayName":"Gemini 2.5 Pro","inputTokenLimit":1048576,"outputTokenLimit":65536,"supportedGenerationMethods":["generateContent","embedContent"]}],"nextPageToken":"p2"}`)
+			fmt.Fprintf(w, `{"models":[{"name":"models/gemini-2.5-pro","displayName":"Gemini 2.5 Pro","inputTokenLimit":1048576,"outputTokenLimit":65536,"supportedGenerationMethods":["generateContent","embedContent"]}],"nextPageToken":%q}`, pageToken)
 			return
+		}
+		if got := r.URL.Query().Get("pageToken"); got != pageToken {
+			t.Errorf("pageToken = %q, want %q", got, pageToken)
 		}
 		fmt.Fprint(w, `{"models":[{"name":"models/gemini-2.5-flash","inputTokenLimit":1048576,"outputTokenLimit":65536}]}`)
 	}))
