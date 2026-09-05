@@ -10,6 +10,7 @@ Multi-provider Go SDK for LLM inference endpoints — **OpenAI, Google Gemini, D
 - **Multiple authenticated endpoints at once** — auto-discovered from `<PROVIDER>_API_KEY` environment variables (aliases supported).
 - **Dynamic model discovery** — `ListModels` returns what the account can actually access. No static model tables.
 - **One canonical API** — OpenAI-shaped requests and responses; Anthropic and Gemini wire formats are translated for you.
+- **Portable generation controls** — token limits, temperature, top-p, stop sequences, thinking, and tools map to each provider's native fields.
 - **Production streaming** — SSE with an idle watchdog and a hard wall-clock deadline, abort-with-partial-result, retries that never duplicate partial output, premature-close detection, and learn-once fallbacks for providers that reject `stream_options`, streaming, or `reasoning_effort`+tools.
 - **Predictable under load** — goroutine-leak-free streaming, race-clean shared state, and a canonical-only error vocabulary (API keys never leak into error text).
 
@@ -114,6 +115,8 @@ type ChatRequest struct {
 	ThinkingBudget int            // explicit token budget where the provider supports it
 	MaxTokens      int            // routed to max_completion_tokens on o-series/gpt-5
 	Temperature    float64        // 0 = provider default; negative = explicit 0
+	TopP           float64        // 0 = provider default; negative = explicit 0
+	Stop           []string       // provider-native stop / stop_sequences / stopSequences
 }
 
 type ChatResult struct {
@@ -165,9 +168,11 @@ On Gemini, a tool result's `ToolName` may be omitted — the SDK recovers the fu
 
 ## Extended thinking
 
-- **Anthropic** — `thinking` blocks are parsed in both buffered and streaming modes. `ChatResult.ThinkingSignature` carries the provider signature; for tool loops, replay it on the assistant message (`Message.ReasoningContent` + `Message.ThinkingSignature`) — the SDK re-serializes it as the first block, as Anthropic's API requires. Omitting it makes extended-thinking tool loops fail mid-conversation.
+- **Anthropic** — `thinking` blocks are parsed in both buffered and streaming modes. `ChatResult.ThinkingSignature` carries the provider signature; for tool loops, replay it on the assistant message (`Message.ReasoningContent` + `Message.ThinkingSignature`) — the SDK re-serializes it as the first block, as Anthropic's API requires. Unsigned thinking replay is rejected locally with `ConfigError`.
 - **DeepSeek / GLM** — reasoning streams as `DeltaReasoning` fragments and lands in `ReasoningContent`. Assistant-turn replay echoes it as `reasoning_content` (required for DeepSeek/GLM tool loops). GLM maps thinking `medium` → `reasoning_effort` `high` (no medium level) and `max` → `max`.
 - **Gemini** — `thought: true` parts map to reasoning deltas; `thinkingConfig` is derived from `Thinking` / `ThinkingBudget`.
+
+`ThinkingBudget`, when positive, overrides the selected non-disabled thinking preset (Anthropic enforces its 1024-token minimum). Canonical `max` selects the highest portable preset: OpenAI `high`, Gemini 24576, Anthropic 16384; GLM retains its native `max`.
 
 ## Learn-once fallbacks
 

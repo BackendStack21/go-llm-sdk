@@ -140,7 +140,7 @@ func TestBuildOpenAIRequest_ThinkingVariants(t *testing.T) {
 		thinking string
 		wantEff  string
 	}{
-		{"enabled", "medium"}, {"low", "low"}, {"medium", "medium"}, {"high", "high"}, {"disabled", ""}, {"", ""},
+		{"enabled", "medium"}, {"low", "low"}, {"medium", "medium"}, {"high", "high"}, {"max", "high"}, {"disabled", ""}, {"", ""},
 	}
 	for _, c := range cases {
 		r := *base

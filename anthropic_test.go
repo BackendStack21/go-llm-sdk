@@ -136,7 +136,7 @@ func TestBuildAnthropicRequest_EmptyAssistantPlaceholder(t *testing.T) {
 }
 
 func TestBuildAnthropicRequest_ThinkingLevels(t *testing.T) {
-	cases := map[string]int{"low": 1024, "medium": 8192, "high": 16384}
+	cases := map[string]int{"low": 1024, "medium": 8192, "high": 16384, "max": 16384}
 	for level, want := range cases {
 		req := &ChatRequest{Messages: []Message{{Role: RoleUser, Content: "x"}}, Thinking: level}
 		body, _ := buildAnthropicRequest(req, "claude", false)
@@ -154,6 +154,23 @@ func TestBuildAnthropicRequest_ThinkingLevels(t *testing.T) {
 	json.Unmarshal(body, &m)
 	if _, ok := m["thinking"]; ok {
 		t.Error("disabled thinking must omit the field")
+	}
+}
+
+func TestBuildAnthropicRequest_ThinkingBudgetOverridesPreset(t *testing.T) {
+	req := &ChatRequest{
+		Messages:       []Message{{Role: RoleUser, Content: "x"}},
+		Thinking:       "low",
+		ThinkingBudget: 4096,
+	}
+	body, err := buildAnthropicRequest(req, "claude", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := decodeObject(t, body)
+	thinking := got["thinking"].(map[string]any)
+	if thinking["budget_tokens"] != float64(4096) {
+		t.Errorf("budget_tokens = %v, want explicit 4096", thinking["budget_tokens"])
 	}
 }
 
@@ -249,6 +266,7 @@ func TestMapAnthropicStreamEvent_Error(t *testing.T) {
 
 func TestListModelsAnthropic_Pagination(t *testing.T) {
 	var paths []string
+	const pageToken = "claude+/=&"
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		paths = append(paths, r.URL.RequestURI())
 		if r.Header.Get("x-api-key") != "k" || r.Header.Get("anthropic-version") != "2023-06-01" {
@@ -256,8 +274,11 @@ func TestListModelsAnthropic_Pagination(t *testing.T) {
 			return
 		}
 		if r.URL.Query().Get("after_id") == "" {
-			fmt.Fprint(w, `{"data":[{"id":"claude-a","display_name":"Claude A","created_at":"2026-01-02T15:04:05Z"}],"has_more":true,"last_id":"claude-a"}`)
+			fmt.Fprintf(w, `{"data":[{"id":"claude-a","display_name":"Claude A","created_at":"2026-01-02T15:04:05Z"}],"has_more":true,"last_id":%q}`, pageToken)
 			return
+		}
+		if got := r.URL.Query().Get("after_id"); got != pageToken {
+			t.Errorf("after_id = %q, want %q", got, pageToken)
 		}
 		fmt.Fprint(w, `{"data":[{"id":"claude-b"}],"has_more":false}`)
 	}))
@@ -275,7 +296,7 @@ func TestListModelsAnthropic_Pagination(t *testing.T) {
 	if models[0].CreatedAt.IsZero() {
 		t.Errorf("CreatedAt = %v, want parsed RFC3339", models[0].CreatedAt)
 	}
-	if len(paths) != 2 || paths[1] != "/v1/models?limit=100&after_id=claude-a" {
+	if len(paths) != 2 {
 		t.Errorf("requests = %v, want after_id follow-up", paths)
 	}
 }

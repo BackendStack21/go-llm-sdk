@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	neturl "net/url"
 	"strings"
 )
 
@@ -54,6 +55,8 @@ type gmThinkCfg struct {
 type gmGenCfg struct {
 	MaxOutputTokens int         `json:"maxOutputTokens,omitempty"`
 	Temperature     *float64    `json:"temperature,omitempty"`
+	TopP            *float64    `json:"topP,omitempty"`
+	StopSequences   []string    `json:"stopSequences,omitempty"`
 	ThinkingConfig  *gmThinkCfg `json:"thinkingConfig,omitempty"`
 }
 
@@ -67,24 +70,25 @@ type gmRequest struct {
 // geminiThinkingConfig maps canonical thinking to thinkingConfig.
 // Budgets: low 1024, medium 8192, high 24576; -1 = dynamic (provider-decided).
 func geminiThinkingConfig(level string, explicit int) *gmThinkCfg {
+	var budget int
 	switch level {
 	case "enabled":
-		b := -1
-		if explicit > 0 {
-			b = explicit
-		}
-		return &gmThinkCfg{ThinkingBudget: b, IncludeThoughts: true}
+		budget = -1
 	case "disabled":
 		return &gmThinkCfg{ThinkingBudget: 0}
 	case "low":
-		return &gmThinkCfg{ThinkingBudget: 1024, IncludeThoughts: true}
+		budget = 1024
 	case "medium":
-		return &gmThinkCfg{ThinkingBudget: 8192, IncludeThoughts: true}
-	case "high":
-		return &gmThinkCfg{ThinkingBudget: 24576, IncludeThoughts: true}
+		budget = 8192
+	case "high", "max":
+		budget = 24576
 	default: // ""
 		return nil
 	}
+	if explicit > 0 {
+		budget = explicit
+	}
+	return &gmThinkCfg{ThinkingBudget: budget, IncludeThoughts: true}
 }
 
 // wrapToolResponse ensures functionResponse.response is a JSON object:
@@ -191,7 +195,10 @@ func buildGeminiRequest(req *ChatRequest, model string, stream bool) ([]byte, er
 		out.Tools = []gmToolGroup{g}
 	}
 
-	cfg := gmGenCfg{MaxOutputTokens: req.MaxTokens}
+	cfg := gmGenCfg{
+		MaxOutputTokens: req.MaxTokens,
+		StopSequences:   req.Stop,
+	}
 	if req.Temperature != 0 {
 		t := req.Temperature
 		if t < 0 {
@@ -199,10 +206,18 @@ func buildGeminiRequest(req *ChatRequest, model string, stream bool) ([]byte, er
 		}
 		cfg.Temperature = &t
 	}
+	if req.TopP != 0 {
+		p := req.TopP
+		if p < 0 {
+			p = 0
+		}
+		cfg.TopP = &p
+	}
 	if tc := geminiThinkingConfig(req.Thinking, req.ThinkingBudget); tc != nil {
 		cfg.ThinkingConfig = tc
 	}
-	if cfg.MaxOutputTokens != 0 || cfg.Temperature != nil || cfg.ThinkingConfig != nil {
+	if cfg.MaxOutputTokens != 0 || cfg.Temperature != nil || cfg.TopP != nil ||
+		len(cfg.StopSequences) > 0 || cfg.ThinkingConfig != nil {
 		out.GenerationConfig = &cfg
 	}
 	return json.Marshal(out)
@@ -368,7 +383,7 @@ func listModelsGemini(ctx context.Context, pc *providerClient) ([]Model, error) 
 	for page := 0; page < 10; page++ {
 		url := pc.base + "/v1beta/models?pageSize=100"
 		if pageToken != "" {
-			url += "&pageToken=" + pageToken
+			url += "&pageToken=" + neturl.QueryEscape(pageToken)
 		}
 		data, _, err := pc.get(ctx, url)
 		if err != nil {

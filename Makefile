@@ -12,10 +12,10 @@ lint:
 	golangci-lint run ./...
 
 test:
-	$(GO) test ./... -count=1
+	$(GO) test ./... -count=1 -timeout 120s
 
 test-race:
-	$(GO) test ./... -race -count=1
+	$(GO) test ./... -race -count=1 -timeout 120s
 
 quality: fmt vet test
 

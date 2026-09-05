@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	neturl "net/url"
 	"strings"
 	"time"
 )
@@ -66,6 +67,8 @@ type anRequest struct {
 	System      []anSysBlock `json:"system,omitempty"`
 	Tools       []anTool     `json:"tools,omitempty"`
 	Temperature *float64     `json:"temperature,omitempty"`
+	TopP        *float64     `json:"top_p,omitempty"`
+	Stop        []string     `json:"stop_sequences,omitempty"`
 	Stream      bool         `json:"stream,omitempty"`
 	Thinking    *anThinking  `json:"thinking,omitempty"`
 }
@@ -75,21 +78,23 @@ const anthropicDefaultMaxTokens = 8192
 // anthropicThinkingBudget maps canonical thinking levels to budgets.
 // Anthropic requires budget_tokens >= 1024.
 func anthropicThinkingBudget(level string, explicit int) (int, bool) {
+	var budget int
 	switch level {
 	case "enabled":
-		if explicit > 0 {
-			return maxInt(explicit, 1024), true
-		}
-		return 5000, true
+		budget = 5000
 	case "low":
-		return 1024, true
+		budget = 1024
 	case "medium":
-		return 8192, true
-	case "high":
-		return 16384, true
+		budget = 8192
+	case "high", "max":
+		budget = 16384
 	default: // "", "disabled"
 		return 0, false
 	}
+	if explicit > 0 {
+		budget = maxInt(explicit, 1024)
+	}
+	return budget, true
 }
 
 func maxInt(a, b int) int {
@@ -104,6 +109,7 @@ func buildAnthropicRequest(req *ChatRequest, model string, stream bool) ([]byte,
 	out := anRequest{
 		Model:     model,
 		MaxTokens: req.MaxTokens,
+		Stop:      req.Stop,
 		Stream:    stream,
 	}
 
@@ -123,6 +129,13 @@ func buildAnthropicRequest(req *ChatRequest, model string, stream bool) ([]byte,
 			t = 0
 		}
 		out.Temperature = &t
+	}
+	if req.TopP != 0 {
+		p := req.TopP
+		if p < 0 {
+			p = 0
+		}
+		out.TopP = &p
 	}
 	if out.MaxTokens <= 0 {
 		out.MaxTokens = anthropicDefaultMaxTokens
@@ -162,6 +175,9 @@ func buildAnthropicRequest(req *ChatRequest, model string, stream bool) ([]byte,
 				Content: []anBlock{blk},
 			})
 		case RoleAssistant:
+			if m.ReasoningContent != "" && m.ThinkingSignature == "" {
+				return nil, &ConfigError{Msg: fmt.Sprintf("message %d: Anthropic thinking replay requires ThinkingSignature", i)}
+			}
 			var blocks []anBlock
 			if m.ReasoningContent != "" && m.ThinkingSignature != "" {
 				// Anthropic requires a replayed thinking block to be the
@@ -420,7 +436,7 @@ func listModelsAnthropic(ctx context.Context, pc *providerClient) ([]Model, erro
 	for page := 0; page < 10; page++ {
 		url := pc.base + "/v1/models?limit=100"
 		if pageID != "" {
-			url += "&after_id=" + pageID
+			url += "&after_id=" + neturl.QueryEscape(pageID)
 		}
 		data, _, err := pc.get(ctx, url)
 		if err != nil {

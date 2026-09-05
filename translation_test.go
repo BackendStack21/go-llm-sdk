@@ -77,6 +77,22 @@ func TestAnthropicThinkingRoundTripBuffered(t *testing.T) {
 	}
 }
 
+func TestAnthropicThinkingReplayRequiresSignature(t *testing.T) {
+	req := &ChatRequest{Messages: []Message{
+		{Role: RoleUser, Content: "q"},
+		{
+			Role:             RoleAssistant,
+			ReasoningContent: "unsigned thinking",
+			ToolCalls:        []ToolCall{{ID: "tu_1", Name: "f", Arguments: `{}`}},
+		},
+	}}
+	_, err := buildAnthropicRequest(req, "claude", false)
+	var cfgErr *ConfigError
+	if !errors.As(err, &cfgErr) || !strings.Contains(err.Error(), "ThinkingSignature") {
+		t.Fatalf("error = %v, want ConfigError naming ThinkingSignature", err)
+	}
+}
+
 // Streaming: signature_delta must be captured into the result's
 // ThinkingSignature, mirroring the buffered path.
 func TestAnthropicStreamSignatureCapture(t *testing.T) {
