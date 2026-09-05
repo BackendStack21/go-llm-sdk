@@ -31,7 +31,6 @@ func newPooledTransport() *http.Transport {
 		DialContext: (&net.Dialer{
 			Timeout:   defaultDialTimeout,
 			KeepAlive: defaultKeepAlive,
-			DualStack: true,
 		}).DialContext,
 		ForceAttemptHTTP2: true,
 	}
