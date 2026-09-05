@@ -168,9 +168,11 @@ On Gemini, a tool result's `ToolName` may be omitted — the SDK recovers the fu
 
 ## Extended thinking
 
-- **Anthropic** — `thinking` blocks are parsed in both buffered and streaming modes. `ChatResult.ThinkingSignature` carries the provider signature; for tool loops, replay it on the assistant message (`Message.ReasoningContent` + `Message.ThinkingSignature`) — the SDK re-serializes it as the first block, as Anthropic's API requires. Omitting it makes extended-thinking tool loops fail mid-conversation.
+- **Anthropic** — `thinking` blocks are parsed in both buffered and streaming modes. `ChatResult.ThinkingSignature` carries the provider signature; for tool loops, replay it on the assistant message (`Message.ReasoningContent` + `Message.ThinkingSignature`) — the SDK re-serializes it as the first block, as Anthropic's API requires. Unsigned thinking replay is rejected locally with `ConfigError`.
 - **DeepSeek / GLM** — reasoning streams as `DeltaReasoning` fragments and lands in `ReasoningContent`. Assistant-turn replay echoes it as `reasoning_content` (required for DeepSeek/GLM tool loops). GLM maps thinking `medium` → `reasoning_effort` `high` (no medium level) and `max` → `max`.
 - **Gemini** — `thought: true` parts map to reasoning deltas; `thinkingConfig` is derived from `Thinking` / `ThinkingBudget`.
+
+`ThinkingBudget`, when positive, overrides the selected non-disabled thinking preset (Anthropic enforces its 1024-token minimum). Canonical `max` selects the highest portable preset: OpenAI `high`, Gemini 24576, Anthropic 16384; GLM retains its native `max`.
 
 ## Learn-once fallbacks
 

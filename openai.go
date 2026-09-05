@@ -190,6 +190,10 @@ func buildOpenAIRequest(cfg ProviderConfig, req *ChatRequest, model string, stre
 			out.ReasoningEffort = "medium"
 		case "low", "medium", "high":
 			out.ReasoningEffort = req.Thinking
+		case "max":
+			// "max" is the canonical highest level. OpenAI's portable
+			// reasoning_effort vocabulary tops out at "high".
+			out.ReasoningEffort = "high"
 			// "disabled" and "" → omit (provider default)
 		}
 	default:

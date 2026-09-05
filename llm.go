@@ -289,10 +289,9 @@ func (p *Provider) ListModels(ctx context.Context, opts ...ListOption) ([]Model,
 
 // ── ChatClient ───────────────────────────────────────────────────────────
 
-// ChatClient runs chat completions against one provider+model pair. Each
-// client carries its own learn-once fallbacks and request timeout; it is
-// safe for concurrent use but SetRequestTimeout must be called before the
-// first request.
+// ChatClient runs chat completions against one provider+model pair.
+// Learn-once fallbacks are shared by every client from the same Provider;
+// request timeouts are per client. It is safe for concurrent use.
 type ChatClient struct {
 	pc     *providerClient
 	model  string
