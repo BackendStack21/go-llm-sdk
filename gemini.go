@@ -190,7 +190,9 @@ func buildGeminiRequest(req *ChatRequest, model string, stream bool) ([]byte, er
 	if len(req.Tools) > 0 {
 		g := gmToolGroup{}
 		for _, t := range req.Tools {
-			g.FunctionDeclarations = append(g.FunctionDeclarations, gmFnDecl(t))
+			g.FunctionDeclarations = append(g.FunctionDeclarations, gmFnDecl{
+				Name: t.Name, Description: t.Description, Parameters: t.Parameters,
+			})
 		}
 		out.Tools = []gmToolGroup{g}
 	}

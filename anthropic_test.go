@@ -87,6 +87,36 @@ func TestBuildAnthropicRequest_Golden(t *testing.T) {
 	}
 }
 
+func TestBuildAnthropicRequest_ToolCacheMarker(t *testing.T) {
+	req := &ChatRequest{
+		Tools: []ToolDef{
+			{Name: "a", Parameters: json.RawMessage(`{"type":"object"}`)},
+			{Name: "b", Parameters: json.RawMessage(`{"type":"object"}`), Cache: true},
+		},
+	}
+	body, err := buildAnthropicRequest(req, "claude", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var m map[string]any
+	if err := json.Unmarshal(body, &m); err != nil {
+		t.Fatalf("decode: %v\n%s", err, body)
+	}
+	tools := m["tools"].([]any)
+	if len(tools) != 2 {
+		t.Fatalf("tools = %d, want 2", len(tools))
+	}
+	first := tools[0].(map[string]any)
+	if _, ok := first["cache_control"]; ok {
+		t.Errorf("first tool must omit cache_control, got %v", first["cache_control"])
+	}
+	last := tools[1].(map[string]any)
+	cc, ok := last["cache_control"].(map[string]any)
+	if !ok || cc["type"] != "ephemeral" {
+		t.Errorf("last tool cache_control = %v, want {type:ephemeral}", last["cache_control"])
+	}
+}
+
 func TestBuildAnthropicRequest_UserCacheMarker(t *testing.T) {
 	req := &ChatRequest{Messages: []Message{
 		{Role: RoleUser, Content: "cached turn", Cache: true},

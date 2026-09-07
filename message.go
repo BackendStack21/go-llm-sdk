@@ -84,6 +84,10 @@ type ToolDef struct {
 	Name        string
 	Description string
 	Parameters  json.RawMessage
+	// Cache marks this tool for Anthropic prompt caching. Set it on the
+	// last tool so the catalog is a stable prefix independent of later
+	// system rows. OpenAI-format serializers ignore it.
+	Cache bool
 }
 
 // Usage reports token accounting. Fields the provider does not report stay 0.

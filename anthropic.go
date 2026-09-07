@@ -50,9 +50,10 @@ type anMessage struct {
 }
 
 type anTool struct {
-	Name        string          `json:"name"`
-	Description string          `json:"description,omitempty"`
-	InputSchema json.RawMessage `json:"input_schema,omitempty"`
+	Name         string          `json:"name"`
+	Description  string          `json:"description,omitempty"`
+	InputSchema  json.RawMessage `json:"input_schema,omitempty"`
+	CacheControl *anCacheControl `json:"cache_control,omitempty"`
 }
 
 type anThinking struct {
@@ -148,11 +149,15 @@ func buildAnthropicRequest(req *ChatRequest, model string, stream bool) ([]byte,
 		if len(schema) == 0 {
 			schema = json.RawMessage(`{"type":"object"}`)
 		}
-		out.Tools = append(out.Tools, anTool{
+		tool := anTool{
 			Name:        t.Name,
 			Description: t.Description,
 			InputSchema: schema,
-		})
+		}
+		if t.Cache {
+			tool.CacheControl = &anCacheControl{Type: "ephemeral"}
+		}
+		out.Tools = append(out.Tools, tool)
 	}
 
 	// Messages. Hard edges:

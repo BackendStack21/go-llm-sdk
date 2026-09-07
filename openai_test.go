@@ -78,6 +78,26 @@ func TestBuildOpenAIRequest_Golden(t *testing.T) {
 	}
 }
 
+func TestBuildOpenAIRequest_ToolCacheNotSerialized(t *testing.T) {
+	cfg := ProviderConfig{ID: "openai", Format: FormatOpenAI}
+	req := &ChatRequest{
+		Messages: []Message{{Role: RoleUser, Content: "Hi"}},
+		Tools: []ToolDef{{
+			Name:       "echo",
+			Parameters: json.RawMessage(`{"type":"object"}`),
+			Cache:      true,
+		}},
+	}
+	oa := buildOpenAIRequest(cfg, req, "gpt-4o", false, true)
+	body, err := json.Marshal(oa)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(body), "cache_control") {
+		t.Errorf("OpenAI-format tools must not carry cache_control: %s", body)
+	}
+}
+
 func TestBuildOpenAIRequest_SeparateSystemMessages(t *testing.T) {
 	cfg := ProviderConfig{ID: "openai", Format: FormatOpenAI}
 	req := &ChatRequest{

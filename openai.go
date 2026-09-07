@@ -131,7 +131,7 @@ func buildOpenAIRequest(cfg ProviderConfig, req *ChatRequest, model string, stre
 	out.Messages = msgs
 
 	for _, t := range req.Tools {
-		fn, _ := json.Marshal(oaToolFn(t))
+		fn, _ := json.Marshal(oaToolFn{Name: t.Name, Description: t.Description, Parameters: t.Parameters})
 		out.Tools = append(out.Tools, oaToolDef{Type: "function", Function: fn})
 	}
 
