@@ -26,8 +26,9 @@ import (
 //   - Consumer abort (delta handler error) returns the partial result
 //     alongside *StreamAbortedError.
 //   - Learn-once fallbacks: drop stream_options (field level), fall back to
-//     the buffered path (provider rejects streaming), pin reasoning_effort
-//     "none" (provider rejects effort combined with tools).
+//     the buffered path (provider rejects streaming), POST /responses
+//     (GPT-5.6+ rejects effort+tools on Chat Completions), pin
+//     reasoning_effort "none" (legacy gateways that reject effort+tools).
 //
 // learnOnce holds the learn-once fallback flags. They live on the Provider
 // (shared across every ChatClient minted from it) so a constraint the
@@ -35,6 +36,7 @@ import (
 type learnOnce struct {
 	dropStreamOptions atomic.Bool
 	forceBuffered     atomic.Bool
+	forceResponses    atomic.Bool
 	forceNoneEffort   atomic.Bool
 }
 
@@ -156,6 +158,10 @@ func (pc *providerClient) buildChatRequest(req *ChatRequest, model string, strea
 		}
 		return body, fmt.Sprintf("%s/v1beta/models/%s:generateContent", pc.base, model), err
 	default: // FormatOpenAI
+		if useResponsesAPI(pc.learn, pc.cfg.Format, model, req) {
+			body, err := json.Marshal(buildResponsesRequest(req, model, stream))
+			return body, pc.base + "/responses", err
+		}
 		oa := buildOpenAIRequest(pc.cfg, req, model, stream, !pc.learn.dropStreamOptions.Load())
 		if pc.learn.forceNoneEffort.Load() && len(req.Tools) > 0 {
 			oa = reasoningEffortNonePatched(oa)
@@ -292,7 +298,21 @@ func reasoningEffortRejected(err error) bool {
 	if !errors.As(err, &e) || e.Status != http.StatusBadRequest {
 		return false
 	}
+	if responsesRequired(err) {
+		return false
+	}
 	return strings.Contains(e.Message, "reasoning_effort")
+}
+
+// responsesRequired reports a 400 that names /v1/responses as the way to
+// keep function tools together with reasoning (GPT-5.6+ Chat Completions).
+func responsesRequired(err error) bool {
+	var e *APIError
+	if !errors.As(err, &e) || e.Status != http.StatusBadRequest {
+		return false
+	}
+	m := strings.ToLower(e.Message)
+	return strings.Contains(m, "/v1/responses")
 }
 
 // streamOptionsRejected classifies a 400 naming stream_options.
@@ -388,6 +408,17 @@ func (pc *providerClient) call(ctx context.Context, req *ChatRequest, model stri
 					}
 					continue
 				case apiErr.Status == http.StatusBadRequest && len(req.Tools) > 0 &&
+					!pc.learn.forceResponses.Load() && responsesRequired(apiErr):
+					// GPT-5.6+ (and some 5.4/5.5 payloads) reject
+					// effort+tools on Chat Completions; retry on /responses
+					// so reasoning stays on.
+					pc.learn.forceResponses.Store(true)
+					lastErr = apiErr
+					if attempt < maxRetries {
+						continue
+					}
+					return nil, apiErr
+				case apiErr.Status == http.StatusBadRequest && len(req.Tools) > 0 &&
 					!pc.learn.forceNoneEffort.Load() && reasoningEffortRejected(apiErr):
 					// Learn the constraint once; retry immediately with
 					// effort pinned to "none".
@@ -417,7 +448,7 @@ func (pc *providerClient) call(ctx context.Context, req *ChatRequest, model stri
 			}
 			return nil, fmt.Errorf("llm: retry exhausted (%d attempts): %w", maxRetries+1, err)
 		}
-		return pc.parseResponse(data)
+		return pc.parseResponse(data, url)
 	}
 	if rateErr != nil {
 		return nil, &RateLimitError{APIError: *rateErr, Attempts: maxRetries + 1, RetryAfter: rateRA}
@@ -426,13 +457,16 @@ func (pc *providerClient) call(ctx context.Context, req *ChatRequest, model stri
 }
 
 // parseResponse dispatches format-specific buffered parsing.
-func (pc *providerClient) parseResponse(data []byte) (*ChatResult, error) {
+func (pc *providerClient) parseResponse(data []byte, url string) (*ChatResult, error) {
 	switch pc.cfg.Format {
 	case FormatAnthropic:
 		return parseAnthropicResponse(data)
 	case FormatGemini:
 		return parseGeminiResponse(data)
 	default:
+		if isResponsesURL(url) {
+			return parseResponsesAPI(data)
+		}
 		return parseOpenAIResponse(data)
 	}
 }
@@ -482,8 +516,12 @@ func (pc *providerClient) callStream(ctx context.Context, req *ChatRequest, mode
 		if err != nil {
 			return nil, err
 		}
+		attemptMapper := mapper
+		if isResponsesURL(url) {
+			attemptMapper = mapResponsesStreamEvent
+		}
 
-		out := pc.attemptStream(deadlineCtx, url, body, mapper, onDelta, len(req.Tools) > 0)
+		out := pc.attemptStream(deadlineCtx, url, body, attemptMapper, onDelta, len(req.Tools) > 0)
 		switch {
 		case out.success():
 			return out.result, nil
@@ -580,6 +618,9 @@ func (pc *providerClient) attemptStream(ctx context.Context, url string, body []
 		switch {
 		case streamOptionsRejected(e):
 			pc.learn.dropStreamOptions.Store(true)
+			return streamOutcome{learnRetry: true, apiErr: e}
+		case learnEffort && !pc.learn.forceResponses.Load() && responsesRequired(e):
+			pc.learn.forceResponses.Store(true)
 			return streamOutcome{learnRetry: true, apiErr: e}
 		case learnEffort && !pc.learn.forceNoneEffort.Load() && reasoningEffortRejected(e):
 			pc.learn.forceNoneEffort.Store(true)

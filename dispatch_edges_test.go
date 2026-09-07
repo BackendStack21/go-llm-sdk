@@ -145,6 +145,10 @@ func TestReasoningEffortRejectedShape(t *testing.T) {
 	if !reasoningEffortRejected(&APIError{Status: 400, Message: "reasoning_effort unsupported"}) {
 		t.Error("400 + reasoning_effort must classify")
 	}
+	gpt56 := "Function tools with reasoning_effort are not supported for gpt-5.6-luna in /v1/chat/completions. To use function tools, use /v1/responses or set reasoning_effort to 'none'."
+	if reasoningEffortRejected(&APIError{Status: 400, Message: gpt56}) {
+		t.Error("gpt-5.6 responses-required 400 must not pin effort none")
+	}
 }
 
 func TestReasoningEffortNonePatchedClearsThinking(t *testing.T) {

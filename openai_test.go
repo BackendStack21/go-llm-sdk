@@ -160,7 +160,7 @@ func TestBuildOpenAIRequest_ThinkingVariants(t *testing.T) {
 		thinking string
 		wantEff  string
 	}{
-		{"enabled", "medium"}, {"low", "low"}, {"medium", "medium"}, {"high", "high"}, {"max", "high"}, {"disabled", ""}, {"", ""},
+		{"enabled", "medium"}, {"low", "low"}, {"medium", "medium"}, {"high", "high"}, {"max", "high"}, {"disabled", "none"}, {"", ""},
 	}
 	for _, c := range cases {
 		r := *base
@@ -173,12 +173,19 @@ func TestBuildOpenAIRequest_ThinkingVariants(t *testing.T) {
 			t.Errorf("openai must never send thinking object, got %+v", oa.Thinking)
 		}
 	}
+	// Non-5.6 OpenAI: disabled still omits the field (provider default).
+	r := *base
+	r.Thinking = "disabled"
+	oa := buildOpenAIRequest(openai, &r, "gpt-4o", false, true)
+	if oa.ReasoningEffort != "" {
+		t.Errorf("gpt-4o disabled → effort %q, want omit", oa.ReasoningEffort)
+	}
 
 	// DeepSeek: thinking object, no effort.
 	deepseek := ProviderConfig{ID: "deepseek", Format: FormatOpenAI, Quirks: Quirks{ThinkingObject: true}}
-	r := *base
+	r = *base
 	r.Thinking = "enabled"
-	oa := buildOpenAIRequest(deepseek, &r, "deepseek-v4-pro", false, true)
+	oa = buildOpenAIRequest(deepseek, &r, "deepseek-v4-pro", false, true)
 	if oa.Thinking == nil || oa.Thinking.Type != "enabled" {
 		t.Errorf("deepseek thinking = %+v, want {type:enabled}", oa.Thinking)
 	}

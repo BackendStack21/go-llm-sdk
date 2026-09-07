@@ -58,7 +58,8 @@ type Message struct {
 	Content          string
 	ReasoningContent string
 	// ThinkingSignature authenticates ReasoningContent for providers that
-	// require thinking to be replayed verbatim (Anthropic signature).
+	// require thinking to be replayed verbatim (Anthropic signature, OpenAI
+	// Responses encrypted_content).
 	ThinkingSignature string
 	ToolCalls         []ToolCall
 	ToolCallID        string
