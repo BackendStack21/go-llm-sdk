@@ -11,13 +11,13 @@ Multi-provider Go SDK for LLM inference endpoints — **OpenAI, Google Gemini, D
 - **Dynamic model discovery** — `ListModels` returns what the account can actually access. No static model tables.
 - **One canonical API** — OpenAI-shaped requests and responses; Anthropic and Gemini wire formats are translated for you.
 - **Portable generation controls** — token limits, temperature, top-p, stop sequences, thinking, and tools map to each provider's native fields.
-- **Production streaming** — SSE with an idle watchdog and a hard wall-clock deadline, abort-with-partial-result, retries that never duplicate partial output, premature-close detection, and learn-once fallbacks for providers that reject `stream_options`, streaming, or `reasoning_effort`+tools.
+- **Production streaming** — SSE with an idle watchdog and a hard wall-clock deadline, abort-with-partial-result, retries that never duplicate partial output, premature-close detection, and learn-once fallbacks for providers that reject `stream_options`, streaming, or `reasoning_effort`+tools (GPT-5.6+ retries on `/v1/responses` so reasoning stays on).
 - **Predictable under load** — goroutine-leak-free streaming, race-clean shared state, and a canonical-only error vocabulary (API keys never leak into error text).
 
 ## Install
 
 ```bash
-go get github.com/BackendStack21/go-llm-sdk@v0.2.2
+go get github.com/BackendStack21/go-llm-sdk@v0.3.2
 ```
 
 Requires Go 1.25+. No dependencies beyond the standard library.
@@ -168,6 +168,7 @@ On Gemini, a tool result's `ToolName` may be omitted — the SDK recovers the fu
 
 ## Extended thinking
 
+- **OpenAI GPT-5.6+** — function tools plus reasoning cannot ride Chat Completions (`reasoning_effort` 400s). Those calls go to `POST /v1/responses` with `reasoning.effort` and `reasoning.summary=auto`; summaries land in `ReasoningContent` and encrypted reasoning replays via `ThinkingSignature`. `Thinking: disabled` stays on Chat Completions with `reasoning_effort: none`. Other OpenAI models keep `reasoning_effort` on Chat Completions.
 - **Anthropic** — `thinking` blocks are parsed in both buffered and streaming modes. `ChatResult.ThinkingSignature` carries the provider signature; for tool loops, replay it on the assistant message (`Message.ReasoningContent` + `Message.ThinkingSignature`) — the SDK re-serializes it as the first block, as Anthropic's API requires. Unsigned thinking replay is rejected locally with `ConfigError`.
 - **DeepSeek / GLM** — reasoning streams as `DeltaReasoning` fragments and lands in `ReasoningContent`. Assistant-turn replay echoes it as `reasoning_content` (required for DeepSeek/GLM tool loops). GLM maps thinking `medium` → `reasoning_effort` `high` (no medium level) and `max` → `max`.
 - **Gemini** — `thought: true` parts map to reasoning deltas; `thinkingConfig` is derived from `Thinking` / `ThinkingBudget`.
@@ -181,7 +182,8 @@ When a provider rejects a request pattern, the SDK learns the constraint **once 
 | Trigger (provider 400) | Learned fallback |
 |---|---|
 | Rejects `stream_options` | omit `stream_options` from streaming requests |
-| Rejects `reasoning_effort` + tools | pin `reasoning_effort: "none"` |
+| Names `/v1/responses` as the tools+reasoning path | retry on `POST /responses` (keeps reasoning on) |
+| Rejects `reasoning_effort` + tools (legacy) | pin `reasoning_effort: "none"` |
 | Rejects streaming itself | downgrade to buffered calls permanently |
 | Answers a streamed request with a non-SSE body | downgrade to buffered calls permanently |
 
@@ -248,7 +250,7 @@ See [AGENTS.md](AGENTS.md) for the architecture map, invariants, testing convent
 
 ## Status
 
-v0.2.2 — API may shift until the odek integration lands, then v1.0.
+v0.3.2 — API may shift until v1.0.
 
 ## License
 

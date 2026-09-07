@@ -194,7 +194,14 @@ func buildOpenAIRequest(cfg ProviderConfig, req *ChatRequest, model string, stre
 			// "max" is the canonical highest level. OpenAI's portable
 			// reasoning_effort vocabulary tops out at "high".
 			out.ReasoningEffort = "high"
-			// "disabled" and "" → omit (provider default)
+		case "disabled":
+			// GPT-5.6 defaults to medium when the field is omitted, which
+			// 400s when function tools are present. Pin none so "disabled"
+			// is actually off on Chat Completions.
+			if chatCompletionsRejectsReasoningWithTools(model) {
+				out.ReasoningEffort = "none"
+			}
+			// "" → omit (provider default)
 		}
 	default:
 		// Provider accepts neither field (Kimi, plain gateways).
