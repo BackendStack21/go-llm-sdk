@@ -113,11 +113,18 @@ func buildOpenAIRequest(cfg ProviderConfig, req *ChatRequest, model string, stre
 			om := oaMessage{Role: "assistant"}
 			c := m.Content
 			om.Content = &c
-			// DeepSeek (and GLM) thinking mode requires the reasoning_content
-			// key on every replayed assistant turn once the request carries
-			// tools — including turns where the provider returned no reasoning
-			// of its own. Omitting the key there is a 400 that poisons every
-			// later request in the tool loop, so the empty echo is deliberate.
+			// DeepSeek thinking mode requires the reasoning_content key on every
+			// replayed assistant turn once the request carries tools — including
+			// turns where the provider returned no reasoning of its own. Omitting
+			// the key there is a 400 that poisons every later request in the tool
+			// loop, so the empty echo is deliberate.
+			//
+			// Scope: this follows the quirk, so it applies to every assistant turn
+			// of a tool-bearing request on a flagged provider — not only to the
+			// turn that triggered it, and not to zai/GLM, where no documentation
+			// confirms the same requirement. Whether DeepSeek accepts a
+			// present-but-empty value is measured by TestE2EDeepSeekEmptyReasoningEcho,
+			// not assumed here.
 			if m.ReasoningContent != "" || (q.EchoReasoningWithTools && len(req.Tools) > 0) {
 				rc := m.ReasoningContent
 				om.ReasoningContent = &rc

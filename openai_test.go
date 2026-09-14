@@ -357,6 +357,43 @@ func TestBuildOpenAIRequest_NoReasoningKeyWithoutTools(t *testing.T) {
 	}
 }
 
+// The echo follows the tools, not the thinking knob: a tool-bearing DeepSeek
+// request echoes the key whether thinking is enabled, disabled or unset, and
+// on every assistant turn — not only the one that triggered the fix. Pinning
+// it here makes the wider blast radius a decision rather than a side effect.
+func TestBuildOpenAIRequest_EchoFollowsToolsNotThinking(t *testing.T) {
+	cfg := ProviderConfig{
+		ID:     "deepseek",
+		Format: FormatOpenAI,
+		Quirks: Quirks{ThinkingObject: true, EchoReasoningWithTools: true},
+	}
+	// Two assistant turns: one with reasoning, one elided (empty).
+	msgs := []Message{
+		{Role: RoleUser, Content: "weather?"},
+		{Role: RoleAssistant, Content: "Checking.", ReasoningContent: "need the forecast",
+			ToolCalls: []ToolCall{{ID: "c1", Name: "f", Arguments: "{}"}}},
+		{Role: RoleTool, ToolCallID: "c1", ToolName: "f", Content: "{}"},
+		{Role: RoleAssistant, Content: "", ToolCalls: []ToolCall{{ID: "c2", Name: "f", Arguments: "{}"}}},
+		{Role: RoleTool, ToolCallID: "c2", ToolName: "f", Content: "{}"},
+	}
+	for _, thinking := range []string{"", "disabled", "enabled", "high"} {
+		req := &ChatRequest{Messages: msgs, Tools: []ToolDef{{Name: "f"}}, Thinking: thinking}
+		oa := buildOpenAIRequest(cfg, req, "deepseek-chat", false, false)
+		body, err := json.Marshal(oa)
+		if err != nil {
+			t.Fatal(err)
+		}
+		m := openaiReqMap(t, body)
+		got := m["messages"].([]any)
+		for _, idx := range []int{1, 3} {
+			asst := got[idx].(map[string]any)
+			if _, present := asst["reasoning_content"]; !present {
+				t.Errorf("thinking %q: assistant msg %d is missing reasoning_content (must follow tools, not the thinking setting)", thinking, idx)
+			}
+		}
+	}
+}
+
 // A provider without the echo quirk keeps today's wire shape exactly: no key
 // when there is no reasoning to replay.
 func TestBuildOpenAIRequest_NoEchoWithoutQuirk(t *testing.T) {

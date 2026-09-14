@@ -38,7 +38,19 @@ func TestBuiltinProviders_RegistryFacts(t *testing.T) {
 		t.Error("openai quirks: want ReasoningEffort only")
 	}
 	if !byID["deepseek"].Quirks.ThinkingObject || byID["deepseek"].Quirks.ReasoningEffort {
-		t.Error("deepseek quirks: want ThinkingObject only")
+		t.Error("deepseek quirks: want ThinkingObject, no ReasoningEffort")
+	}
+	// EchoReasoningWithTools is the flag that keeps a DeepSeek tool loop alive
+	// (dropping it means the 400 recurs on every later request), so it is pinned
+	// explicitly here and off everywhere else: every other test hand-builds its
+	// own ProviderConfig, so only this assertion can see the registry.
+	if !byID["deepseek"].Quirks.EchoReasoningWithTools {
+		t.Error("deepseek quirks: want EchoReasoningWithTools (tool loops 400 without it)")
+	}
+	for _, id := range []string{"openai", "gemini", "zai", "kimi", "anthropic"} {
+		if byID[id].Quirks.EchoReasoningWithTools {
+			t.Errorf("%s quirks: EchoReasoningWithTools must stay off — no provider documentation confirms the requirement (zai/GLM included)", id)
+		}
 	}
 	zq := byID["zai"].Quirks
 	if !zq.ThinkingObject || !zq.ReasoningEffort || len(zq.ForceThinking) != 1 || zq.ForceThinking[0] != "glm-5.3" {
