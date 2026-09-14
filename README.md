@@ -121,7 +121,7 @@ type ChatRequest struct {
 
 type ChatResult struct {
 	Content           string
-	ReasoningContent  string      // provider thinking text; replayed as reasoning_content on OpenAI-format assistant turns
+	ReasoningContent  string      // provider thinking text; replay rules per provider in "Extended thinking"
 	ThinkingSignature string      // Anthropic: replay via Message.ThinkingSignature
 	ToolCalls         []ToolCall  // {ID, Name, Arguments}
 	FinishReason      string      // stop | length | tool_calls | content_filter | ""
@@ -170,7 +170,8 @@ On Gemini, a tool result's `ToolName` may be omitted — the SDK recovers the fu
 
 - **OpenAI GPT-5.6+** — function tools plus reasoning cannot ride Chat Completions (`reasoning_effort` 400s). Those calls go to `POST /v1/responses` with `reasoning.effort` and `reasoning.summary=auto`; summaries land in `ReasoningContent` and encrypted reasoning replays via `ThinkingSignature`. `Thinking: disabled` stays on Chat Completions with `reasoning_effort: none`. Other OpenAI models keep `reasoning_effort` on Chat Completions.
 - **Anthropic** — `thinking` blocks are parsed in both buffered and streaming modes. `ChatResult.ThinkingSignature` carries the provider signature; for tool loops, replay it on the assistant message (`Message.ReasoningContent` + `Message.ThinkingSignature`) — the SDK re-serializes it as the first block, as Anthropic's API requires. Unsigned thinking replay is rejected locally with `ConfigError`.
-- **DeepSeek / GLM** — reasoning streams as `DeltaReasoning` fragments and lands in `ReasoningContent`. Assistant-turn replay echoes it as `reasoning_content` (required for DeepSeek/GLM tool loops). GLM maps thinking `medium` → `reasoning_effort` `high` (no medium level) and `max` → `max`.
+- **DeepSeek** — reasoning streams as `DeltaReasoning` fragments and lands in `ReasoningContent`. Assistant-turn replay echoes it as `reasoning_content`, which DeepSeek requires for tool loops. On a chat-completions request that carries tools, the key is echoed for **every** assistant turn, even where the provider returned no reasoning for that turn (empty value instead of a dropped key) — including turns that made no tool call themselves: DeepSeek documents that a tool-bearing request whose assistant turns omit `reasoning_content` returns 400 for *every* later request in the loop, so one elided turn would otherwise poison the rest of the session. Whether DeepSeek accepts a present-but-empty value is measured against the live API by `TestE2EDeepSeekEmptyReasoningEcho` (tag-gated), not assumed by the suite.
+- **zai / GLM** — same reasoning field shape and `DeltaReasoning` streaming; GLM maps thinking `medium` → `reasoning_effort` `high` (no medium level) and `max` → `max`. GLM does **not** get the empty echo: no z.ai documentation confirms the same replay requirement, so `Quirks.EchoReasoningWithTools` is off and `zai` bodies are byte-identical to the pre-fix shape. A custom provider registered under its own id inherits **no** quirks — set `WithQuirks` explicitly if it needs the echo.
 - **Gemini** — `thought: true` parts map to reasoning deltas; `thinkingConfig` is derived from `Thinking` / `ThinkingBudget`.
 
 `ThinkingBudget`, when positive, overrides the selected non-disabled thinking preset (Anthropic enforces its 1024-token minimum). Canonical `max` selects the highest portable preset: OpenAI `high`, Gemini 24576, Anthropic 16384; GLM retains its native `max`.

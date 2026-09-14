@@ -3,6 +3,7 @@ package llm
 import (
 	"context"
 	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -279,10 +280,226 @@ func TestBuildOpenAIRequest_ReasoningContentReplay(t *testing.T) {
 		t.Errorf("role = %v, want assistant", asst["role"])
 	}
 	if asst["reasoning_content"] != "internal thoughts" {
-		t.Errorf("reasoning_content = %v, want %q (DeepSeek/GLM tool loops require echo)", asst["reasoning_content"], "internal thoughts")
+		t.Errorf("reasoning_content = %v, want %q (DeepSeek tool loops require echo)", asst["reasoning_content"], "internal thoughts")
 	}
 	if asst["content"] != "a" {
 		t.Errorf("content = %v, want a", asst["content"])
+	}
+}
+
+// DeepSeek thinking mode with tools: the reasoning_content key must survive on
+// every replayed assistant turn — including turns where the provider returned
+// no reasoning of its own (documented elision; see e2e_test.go). DeepSeek's
+// documented contract: "for requests carrying the tools parameter, the
+// reasoning_content must be fully passed back to the API in all subsequent
+// requests — even for turns where the model did not perform a tool call. If
+// your code does not correctly pass back reasoning_content, the API will
+// return a 400 error." An omitted key is a hard 400 on every later request of
+// the loop, not just the offending turn.
+func TestBuildOpenAIRequest_EchoesEmptyReasoningWithTools(t *testing.T) {
+	cfg := ProviderConfig{
+		ID:     "deepseek",
+		Format: FormatOpenAI,
+		Quirks: Quirks{ThinkingObject: true, EchoReasoningWithTools: true},
+	}
+	req := &ChatRequest{
+		Messages: []Message{
+			{Role: RoleUser, Content: "weather?"},
+			// Tool-call turn for which the provider elided reasoning.
+			{Role: RoleAssistant, Content: "", ToolCalls: []ToolCall{
+				{ID: "call_1", Name: "get_weather", Arguments: `{"city":"Berlin"}`},
+			}},
+			{Role: RoleTool, ToolCallID: "call_1", ToolName: "get_weather", Content: `{"temp":20}`},
+		},
+		Tools:    []ToolDef{{Name: "get_weather"}},
+		Thinking: "enabled",
+	}
+	oa := buildOpenAIRequest(cfg, req, "deepseek-chat", false, false)
+	body, err := json.Marshal(oa)
+	if err != nil {
+		t.Fatal(err)
+	}
+	m := openaiReqMap(t, body)
+	asst := m["messages"].([]any)[1].(map[string]any)
+	v, present := asst["reasoning_content"]
+	if !present {
+		t.Fatal("reasoning_content key absent on a tool-call assistant turn: DeepSeek returns 400 for every later request in the loop")
+	}
+	if v != "" {
+		t.Errorf("reasoning_content = %v, want empty string", v)
+	}
+}
+
+// Without tools the key must stay absent when there is nothing to echo:
+// DeepSeek ignores the field there, and OpenAI-compatible providers that do
+// not know it must never see it.
+func TestBuildOpenAIRequest_NoReasoningKeyWithoutTools(t *testing.T) {
+	cfg := ProviderConfig{
+		ID:     "deepseek",
+		Format: FormatOpenAI,
+		Quirks: Quirks{ThinkingObject: true, EchoReasoningWithTools: true},
+	}
+	req := &ChatRequest{
+		Messages: []Message{
+			{Role: RoleUser, Content: "q"},
+			{Role: RoleAssistant, Content: "a"},
+		},
+		Thinking: "enabled",
+	}
+	oa := buildOpenAIRequest(cfg, req, "deepseek-chat", false, false)
+	body, err := json.Marshal(oa)
+	if err != nil {
+		t.Fatal(err)
+	}
+	m := openaiReqMap(t, body)
+	asst := m["messages"].([]any)[1].(map[string]any)
+	if _, present := asst["reasoning_content"]; present {
+		t.Errorf("reasoning_content must not be sent without tools: %v", asst["reasoning_content"])
+	}
+}
+
+// The echo follows the tools, not the thinking knob: a tool-bearing DeepSeek
+// request echoes the key whether thinking is enabled, disabled or unset, and
+// on every assistant turn — not only the one that triggered the fix. Pinning
+// it here makes the wider blast radius a decision rather than a side effect.
+func TestBuildOpenAIRequest_EchoFollowsToolsNotThinking(t *testing.T) {
+	cfg := ProviderConfig{
+		ID:     "deepseek",
+		Format: FormatOpenAI,
+		Quirks: Quirks{ThinkingObject: true, EchoReasoningWithTools: true},
+	}
+	// Two assistant turns: one with reasoning, one elided (empty).
+	msgs := []Message{
+		{Role: RoleUser, Content: "weather?"},
+		{Role: RoleAssistant, Content: "Checking.", ReasoningContent: "need the forecast",
+			ToolCalls: []ToolCall{{ID: "c1", Name: "f", Arguments: "{}"}}},
+		{Role: RoleTool, ToolCallID: "c1", ToolName: "f", Content: "{}"},
+		{Role: RoleAssistant, Content: "", ToolCalls: []ToolCall{{ID: "c2", Name: "f", Arguments: "{}"}}},
+		{Role: RoleTool, ToolCallID: "c2", ToolName: "f", Content: "{}"},
+	}
+	for _, thinking := range []string{"", "disabled", "enabled", "high"} {
+		req := &ChatRequest{Messages: msgs, Tools: []ToolDef{{Name: "f"}}, Thinking: thinking}
+		oa := buildOpenAIRequest(cfg, req, "deepseek-chat", false, false)
+		body, err := json.Marshal(oa)
+		if err != nil {
+			t.Fatal(err)
+		}
+		m := openaiReqMap(t, body)
+		got := m["messages"].([]any)
+		for _, idx := range []int{1, 3} {
+			asst := got[idx].(map[string]any)
+			if _, present := asst["reasoning_content"]; !present {
+				t.Errorf("thinking %q: assistant msg %d is missing reasoning_content (must follow tools, not the thinking setting)", thinking, idx)
+			}
+		}
+	}
+}
+
+// Registry -> wire composition: the built-in deepseek entry must actually put
+// the empty echo on the outbound body. Every other wire test hand-builds its own
+// ProviderConfig, so without this one the registry flag and the serializer are
+// only ever tested apart, and a flag that stops reaching the wire ships silently.
+func TestChatClient_DeepSeekRegistryEchoReachesWire(t *testing.T) {
+	var bodies [][]byte
+	srv := captureJSON(t, &bodies)
+	defer srv.Close()
+	t.Setenv("DEEPSEEK_API_KEY", "k")
+	sdk := New(FromEnv(), WithProvider("deepseek", WithBaseURL(srv.URL)))
+	cc, err := sdk.Chat("deepseek", "deepseek-chat")
+	if err != nil {
+		t.Fatalf("Chat: %v", err)
+	}
+	if _, err := cc.Call(context.Background(), emptyEchoProbeRequest()); err != nil {
+		t.Fatalf("Call: %v", err)
+	}
+	if len(bodies) != 1 {
+		t.Fatalf("requests = %d, want 1", len(bodies))
+	}
+	if !strings.Contains(string(bodies[0]), `"reasoning_content":""`) {
+		t.Errorf("registry deepseek must echo an empty reasoning_content; body: %s", bodies[0])
+	}
+}
+
+// WithQuirks REPLACES the quirks struct rather than merging into it, so
+// re-registering the built-in deepseek id with explicit quirks silently drops
+// the echo flag. Pinned observably (and documented in README) so the behaviour
+// is a decision: making WithQuirks merge must be a deliberate change that fails
+// here first.
+func TestWithProvider_QuirksReplaceDropsEcho(t *testing.T) {
+	var bodies [][]byte
+	srv := captureJSON(t, &bodies)
+	defer srv.Close()
+	t.Setenv("DEEPSEEK_API_KEY", "k")
+	sdk := New(FromEnv(),
+		WithProvider("deepseek", WithBaseURL(srv.URL), WithQuirks(Quirks{ThinkingObject: true})))
+	cc, err := sdk.Chat("deepseek", "deepseek-chat")
+	if err != nil {
+		t.Fatalf("Chat: %v", err)
+	}
+	if _, err := cc.Call(context.Background(), emptyEchoProbeRequest()); err != nil {
+		t.Fatalf("Call: %v", err)
+	}
+	if len(bodies) != 1 {
+		t.Fatalf("requests = %d, want 1", len(bodies))
+	}
+	if strings.Contains(string(bodies[0]), `"reasoning_content"`) {
+		t.Errorf("WithQuirks(Quirks{ThinkingObject}) must lose the echo (replaces, not merges); body: %s", bodies[0])
+	}
+}
+
+// captureJSON is an httptest server that records request bodies and answers a
+// minimal valid chat completion.
+func captureJSON(t *testing.T, bodies *[][]byte) *httptest.Server {
+	t.Helper()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		b, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Errorf("read request body: %v", err)
+		}
+		*bodies = append(*bodies, b)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"choices":[{"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}],"usage":{}}`)
+	}))
+
+	return srv
+}
+
+// emptyEchoProbeRequest is a minimal tool-bearing request whose assistant turn
+// carries no reasoning: the state the echo exists for.
+func emptyEchoProbeRequest() *ChatRequest {
+	return &ChatRequest{
+		Tools: []ToolDef{{Name: "f"}},
+		Messages: []Message{
+			{Role: RoleUser, Content: "q"},
+			{Role: RoleAssistant, Content: "", ToolCalls: []ToolCall{{ID: "c1", Name: "f", Arguments: "{}"}}},
+			{Role: RoleTool, ToolCallID: "c1", ToolName: "f", Content: "{}"},
+		},
+	}
+}
+
+// A provider without the echo quirk keeps today's wire shape exactly: no key
+// when there is no reasoning to replay.
+func TestBuildOpenAIRequest_NoEchoWithoutQuirk(t *testing.T) {
+	cfg := ProviderConfig{ID: "kimi", Format: FormatOpenAI}
+	req := &ChatRequest{
+		Messages: []Message{
+			{Role: RoleUser, Content: "weather?"},
+			{Role: RoleAssistant, Content: "", ToolCalls: []ToolCall{
+				{ID: "call_1", Name: "get_weather", Arguments: `{"city":"Berlin"}`},
+			}},
+			{Role: RoleTool, ToolCallID: "call_1", ToolName: "get_weather", Content: `{"temp":20}`},
+		},
+		Tools: []ToolDef{{Name: "get_weather"}},
+	}
+	oa := buildOpenAIRequest(cfg, req, "kimi-k2", false, false)
+	body, err := json.Marshal(oa)
+	if err != nil {
+		t.Fatal(err)
+	}
+	m := openaiReqMap(t, body)
+	asst := m["messages"].([]any)[1].(map[string]any)
+	if _, present := asst["reasoning_content"]; present {
+		t.Errorf("unexpected reasoning_content for a non-echo provider: %v", asst["reasoning_content"])
 	}
 }
 

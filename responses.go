@@ -196,6 +196,10 @@ func buildResponsesInput(req *ChatRequest) (instructions string, input []any) {
 		case RoleUser:
 			input = append(input, rsEasyMessage{Role: "user", Content: m.Content})
 		case RoleAssistant:
+			// Asymmetry with the chat-completions builder: this format replays
+			// reasoning as an encrypted reasoning item gated on
+			// ThinkingSignature, so Quirks.EchoReasoningWithTools has nothing to
+			// act on here and no reasoning_content key exists to echo.
 			if m.ThinkingSignature != "" {
 				sum := make([]rsSummaryText, 0)
 				if m.ReasoningContent != "" {

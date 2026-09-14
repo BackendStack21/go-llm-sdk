@@ -28,9 +28,11 @@ type oaToolCall struct {
 }
 
 type oaMessage struct {
-	Role             string       `json:"role"`
+	Role string `json:"role"`
+	// Content and ReasoningContent are pointers so the key can be present and
+	// empty: nil omits it, a pointer to "" keeps it on the wire.
 	Content          *string      `json:"content"` // nil keeps JSON null for tool calls
-	ReasoningContent string       `json:"reasoning_content,omitempty"`
+	ReasoningContent *string      `json:"reasoning_content,omitempty"`
 	ToolCalls        []oaToolCall `json:"tool_calls,omitempty"`
 	ToolCallID       string       `json:"tool_call_id,omitempty"`
 }
@@ -111,7 +113,24 @@ func buildOpenAIRequest(cfg ProviderConfig, req *ChatRequest, model string, stre
 			om := oaMessage{Role: "assistant"}
 			c := m.Content
 			om.Content = &c
-			om.ReasoningContent = m.ReasoningContent
+			// DeepSeek thinking mode requires the reasoning_content key on every
+			// replayed assistant turn once the request carries tools — including
+			// turns where the provider returned no reasoning of its own. Omitting
+			// the key there is a 400 that poisons every later request in the tool
+			// loop, so the empty echo is deliberate.
+			//
+			// Scope: this follows the quirk, so it applies to every assistant turn
+			// of a chat-completions request that carries tools on a flagged
+			// provider — including turns that made no tool call themselves, and
+			// not to zai/GLM, where no documentation confirms the same requirement.
+			// (A request diverted to /responses never reaches this builder: that
+			// format replays reasoning as an encrypted item instead.) Whether
+			// DeepSeek accepts a present-but-empty value is measured by
+			// TestE2EDeepSeekEmptyReasoningEcho, not assumed here.
+			if m.ReasoningContent != "" || (q.EchoReasoningWithTools && len(req.Tools) > 0) {
+				rc := m.ReasoningContent
+				om.ReasoningContent = &rc
+			}
 			for _, tc := range m.ToolCalls {
 				om.ToolCalls = append(om.ToolCalls, oaToolCall{
 					ID:   tc.ID,
