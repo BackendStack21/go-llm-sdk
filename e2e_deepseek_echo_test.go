@@ -17,14 +17,24 @@ package llm
 // wrong layer and the caller must preserve real reasoning instead — the SDK
 // cannot recover reasoning a caller discarded.
 //
-// Nothing is asserted: outcomes are reported with t.Logf so the probe is a
-// measurement, never a flake. Run it deliberately, with credentials:
+// Outcomes are reported with t.Logf, never asserted, so a provider hiccup is
+// reported as INCONCLUSIVE rather than dressed up as a contract violation:
+// only a 400 whose body names reasoning_content counts as REJECTED. The probe
+// covers thinking enabled, disabled and unset, because the shipped echo does
+// not depend on the thinking setting and the widest new wire state is the
+// non-thinking one (an odek tool loop on a DeepSeek entry trims old reasoning
+// and therefore sends empty values with or without thinking mode).
 //
-//	go test -tags e2e -run TestE2EDeepSeekEmptyReasoningEcho -timeout 5m -v .
+// Run deliberately, with credentials:
+//
+//	go test -tags e2e -run TestE2EDeepSeekEmptyReasoningEcho -timeout 10m -v .
 
 import (
 	"context"
 	"encoding/json"
+	"errors"
+	"fmt"
+	"strings"
 	"testing"
 	"time"
 )
@@ -60,9 +70,17 @@ func probeMessages() []Message {
 	}
 }
 
-// probeEcho posts probeMessages with the echo quirk forced on or off and
-// reports whether DeepSeek accepted the request.
-func probeEcho(t *testing.T, echo bool, key, model string) error {
+// probeOutcome is one measurement: whether a shape was accepted, or why the
+// question could not be answered.
+type probeOutcome struct {
+	accepted     bool
+	inconclusive bool
+	detail       string
+}
+
+// probeEcho posts probeMessages with the echo quirk forced on or off for one
+// thinking setting and classifies the result.
+func probeEcho(t *testing.T, echo bool, thinking, key, model string) probeOutcome {
 	t.Helper()
 	sdk := New(WithProvider("deepseek",
 		WithFormat(FormatOpenAI),
@@ -74,47 +92,96 @@ func probeEcho(t *testing.T, echo bool, key, model string) error {
 	if err != nil {
 		t.Fatalf("Chat(deepseek, %s): %v", model, err)
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 180*time.Second)
 	defer cancel()
 	res, err := cc.Call(ctx, &ChatRequest{
-		Thinking: "enabled",
+		Thinking: thinking,
 		Tools:    []ToolDef{probeTool()},
 		Messages: probeMessages(),
 	})
-	if err != nil {
-		t.Logf("EchoReasoningWithTools=%v → REJECTED: %v", echo, err)
-		return err
+	label := fmt.Sprintf("echo=%-5v thinking=%-9q", echo, thinking)
+	if err == nil {
+		t.Logf("%s -> ACCEPTED (finish=%q, tools=%d, reasoning_chars=%d)",
+			label, res.FinishReason, len(res.ToolCalls), len(res.ReasoningContent))
+		return probeOutcome{accepted: true}
 	}
-	t.Logf("EchoReasoningWithTools=%v → ACCEPTED (finish=%q, tools=%d, reasoning_chars=%d)",
-		echo, res.FinishReason, len(res.ToolCalls), len(res.ReasoningContent))
-	return nil
+
+	// Only a 400 that names reasoning_content is a verdict about the contract.
+	// A rate limit, an outage, a timeout or a bad key must not be reported as
+	// "DeepSeek rejected this shape".
+	var apiErr *APIError
+	if !errors.As(err, &apiErr) {
+		t.Logf("%s -> INCONCLUSIVE (transport/timeout, not a contract answer): %v", label, err)
+		return probeOutcome{inconclusive: true, detail: err.Error()}
+	}
+	if apiErr.Status != 400 || !strings.Contains(apiErr.Message, "reasoning_content") {
+		t.Logf("%s -> INCONCLUSIVE (HTTP %d, not a reasoning_content rejection): %v",
+			label, apiErr.Status, apiErr.Message)
+		return probeOutcome{inconclusive: true, detail: apiErr.Message}
+	}
+	t.Logf("%s -> REJECTED: %v", label, err)
+	return probeOutcome{detail: err.Error()}
 }
 
-// TestE2EDeepSeekEmptyReasoningEcho answers questions A and B above and prints
-// which fix layer the answers imply.
+// TestE2EDeepSeekEmptyReasoningEcho answers questions A and B and prints which
+// fix layer the answers imply. It asserts nothing: it is a measurement.
 func TestE2EDeepSeekEmptyReasoningEcho(t *testing.T) {
 	tg := e2eTargets[0] // deepseek
 	key := e2eEnvKey(t, tg.keyEnv)
 	model := tg.chatModel()
 
-	emptyPresent := probeEcho(t, true, key, model) // A: key present, value ""
-	omitted := probeEcho(t, false, key, model)     // B: key absent (pre-PR shape)
+	// A: key present with an empty value. B: key absent (the pre-PR shape).
+	// Both across the thinking settings the shipped echo ignores.
+	var present, omitted []probeOutcome
+	for _, thinking := range []string{"enabled", "disabled", ""} {
+		present = append(present, probeEcho(t, true, thinking, key, model))
+		omitted = append(omitted, probeEcho(t, false, thinking, key, model))
+	}
+
+	anyIffy := func(os []probeOutcome) bool {
+		for _, o := range os {
+			if o.inconclusive {
+				return true
+			}
+		}
+		return false
+	}
+	allAccepted := func(os []probeOutcome) bool {
+		for _, o := range os {
+			if !o.accepted {
+				return false
+			}
+		}
+		return true
+	}
+	anyAccepted := func(os []probeOutcome) bool {
+		for _, o := range os {
+			if o.accepted {
+				return true
+			}
+		}
+		return false
+	}
 
 	switch {
-	case emptyPresent == nil && omitted == nil:
-		t.Log("VERDICT: DeepSeek accepts both a present-empty and an omitted key on older assistant turns. " +
-			"The echo is harmless but not load-bearing here — reproduce the reported 400 with the caller's " +
-			"real history before treating this as the fix.")
-	case emptyPresent == nil && omitted != nil:
-		t.Log("VERDICT: present-and-empty is accepted where omission is rejected — the shipped echo is the " +
-			"correct fix. Ship it.")
-	case emptyPresent != nil && omitted == nil:
+	case anyIffy(present) || anyIffy(omitted):
+		t.Log("VERDICT: INCONCLUSIVE — at least one shape hit a non-contract error (rate limit, " +
+			"outage, timeout). Re-run before drawing any conclusion; the shapes here are only " +
+			"meaningful when the API actually answered.")
+	case allAccepted(present) && allAccepted(omitted):
+		t.Log("VERDICT: DeepSeek accepts both a present-empty and an omitted key here. The echo is " +
+			"harmless but not load-bearing for this history — reproduce the reported 400 with the " +
+			"caller's real history before treating the echo as the fix.")
+	case allAccepted(present) && !anyAccepted(omitted):
+		t.Log("VERDICT: present-and-empty is accepted where omission is rejected — the shipped echo is " +
+			"the correct layer. Ship it.")
+	case !anyAccepted(present) && allAccepted(omitted):
 		t.Log("VERDICT: present-and-empty is REJECTED where omission is accepted — the echo is the WRONG " +
-			"layer. Keep the per-message rule (echo only real reasoning) and fix the caller instead: it must " +
+			"layer. Keep the per-message rule (echo only real reasoning) and fix the caller: it must " +
 			"preserve reasoning on every assistant turn of a tool loop (odek: keepRecentReasoning / " +
 			"stripOldReasoning).")
 	default:
-		t.Log("VERDICT: both shapes rejected — the violation is elsewhere in the replay shape. Capture the " +
-			"exact 400 body and the request history from the failing session.")
+		t.Log("VERDICT: mixed or all-rejected — the violation is elsewhere in the replay shape. Capture " +
+			"the exact 400 body and the request history from the failing session.")
 	}
 }

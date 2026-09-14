@@ -120,11 +120,13 @@ func buildOpenAIRequest(cfg ProviderConfig, req *ChatRequest, model string, stre
 			// loop, so the empty echo is deliberate.
 			//
 			// Scope: this follows the quirk, so it applies to every assistant turn
-			// of a tool-bearing request on a flagged provider — not only to the
-			// turn that triggered it, and not to zai/GLM, where no documentation
-			// confirms the same requirement. Whether DeepSeek accepts a
-			// present-but-empty value is measured by TestE2EDeepSeekEmptyReasoningEcho,
-			// not assumed here.
+			// of a chat-completions request that carries tools on a flagged
+			// provider — including turns that made no tool call themselves, and
+			// not to zai/GLM, where no documentation confirms the same requirement.
+			// (A request diverted to /responses never reaches this builder: that
+			// format replays reasoning as an encrypted item instead.) Whether
+			// DeepSeek accepts a present-but-empty value is measured by
+			// TestE2EDeepSeekEmptyReasoningEcho, not assumed here.
 			if m.ReasoningContent != "" || (q.EchoReasoningWithTools && len(req.Tools) > 0) {
 				rc := m.ReasoningContent
 				om.ReasoningContent = &rc

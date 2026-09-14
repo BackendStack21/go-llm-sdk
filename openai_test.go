@@ -3,6 +3,7 @@ package llm
 import (
 	"context"
 	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -279,7 +280,7 @@ func TestBuildOpenAIRequest_ReasoningContentReplay(t *testing.T) {
 		t.Errorf("role = %v, want assistant", asst["role"])
 	}
 	if asst["reasoning_content"] != "internal thoughts" {
-		t.Errorf("reasoning_content = %v, want %q (DeepSeek/GLM tool loops require echo)", asst["reasoning_content"], "internal thoughts")
+		t.Errorf("reasoning_content = %v, want %q (DeepSeek tool loops require echo)", asst["reasoning_content"], "internal thoughts")
 	}
 	if asst["content"] != "a" {
 		t.Errorf("content = %v, want a", asst["content"])
@@ -391,6 +392,88 @@ func TestBuildOpenAIRequest_EchoFollowsToolsNotThinking(t *testing.T) {
 				t.Errorf("thinking %q: assistant msg %d is missing reasoning_content (must follow tools, not the thinking setting)", thinking, idx)
 			}
 		}
+	}
+}
+
+// Registry -> wire composition: the built-in deepseek entry must actually put
+// the empty echo on the outbound body. Every other wire test hand-builds its own
+// ProviderConfig, so without this one the registry flag and the serializer are
+// only ever tested apart, and a flag that stops reaching the wire ships silently.
+func TestChatClient_DeepSeekRegistryEchoReachesWire(t *testing.T) {
+	var bodies [][]byte
+	srv := captureJSON(t, &bodies)
+	defer srv.Close()
+	t.Setenv("DEEPSEEK_API_KEY", "k")
+	sdk := New(FromEnv(), WithProvider("deepseek", WithBaseURL(srv.URL)))
+	cc, err := sdk.Chat("deepseek", "deepseek-chat")
+	if err != nil {
+		t.Fatalf("Chat: %v", err)
+	}
+	if _, err := cc.Call(context.Background(), emptyEchoProbeRequest()); err != nil {
+		t.Fatalf("Call: %v", err)
+	}
+	if len(bodies) != 1 {
+		t.Fatalf("requests = %d, want 1", len(bodies))
+	}
+	if !strings.Contains(string(bodies[0]), `"reasoning_content":""`) {
+		t.Errorf("registry deepseek must echo an empty reasoning_content; body: %s", bodies[0])
+	}
+}
+
+// WithQuirks REPLACES the quirks struct rather than merging into it, so
+// re-registering the built-in deepseek id with explicit quirks silently drops
+// the echo flag. Pinned observably (and documented in README) so the behaviour
+// is a decision: making WithQuirks merge must be a deliberate change that fails
+// here first.
+func TestWithProvider_QuirksReplaceDropsEcho(t *testing.T) {
+	var bodies [][]byte
+	srv := captureJSON(t, &bodies)
+	defer srv.Close()
+	t.Setenv("DEEPSEEK_API_KEY", "k")
+	sdk := New(FromEnv(),
+		WithProvider("deepseek", WithBaseURL(srv.URL), WithQuirks(Quirks{ThinkingObject: true})))
+	cc, err := sdk.Chat("deepseek", "deepseek-chat")
+	if err != nil {
+		t.Fatalf("Chat: %v", err)
+	}
+	if _, err := cc.Call(context.Background(), emptyEchoProbeRequest()); err != nil {
+		t.Fatalf("Call: %v", err)
+	}
+	if len(bodies) != 1 {
+		t.Fatalf("requests = %d, want 1", len(bodies))
+	}
+	if strings.Contains(string(bodies[0]), `"reasoning_content"`) {
+		t.Errorf("WithQuirks(Quirks{ThinkingObject}) must lose the echo (replaces, not merges); body: %s", bodies[0])
+	}
+}
+
+// captureJSON is an httptest server that records request bodies and answers a
+// minimal valid chat completion.
+func captureJSON(t *testing.T, bodies *[][]byte) *httptest.Server {
+	t.Helper()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		b, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Errorf("read request body: %v", err)
+		}
+		*bodies = append(*bodies, b)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"choices":[{"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}],"usage":{}}`)
+	}))
+
+	return srv
+}
+
+// emptyEchoProbeRequest is a minimal tool-bearing request whose assistant turn
+// carries no reasoning: the state the echo exists for.
+func emptyEchoProbeRequest() *ChatRequest {
+	return &ChatRequest{
+		Tools: []ToolDef{{Name: "f"}},
+		Messages: []Message{
+			{Role: RoleUser, Content: "q"},
+			{Role: RoleAssistant, Content: "", ToolCalls: []ToolCall{{ID: "c1", Name: "f", Arguments: "{}"}}},
+			{Role: RoleTool, ToolCallID: "c1", ToolName: "f", Content: "{}"},
+		},
 	}
 }
 
