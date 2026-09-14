@@ -25,6 +25,13 @@ type Quirks struct {
 	// ThinkingObject: provider accepts the Anthropic-style top-level
 	// "thinking" object (Anthropic, DeepSeek, Z.ai GLM).
 	ThinkingObject bool
+	// EchoReasoningWithTools: the provider requires the reasoning_content key
+	// on every replayed assistant message while the request carries tools,
+	// even for turns where it returned no reasoning itself. DeepSeek's
+	// thinking mode rejects a bare omission with 400 "The reasoning_content
+	// in the thinking mode must be passed back to the API" — which poisons
+	// every later request in the tool loop, not just the offending one.
+	EchoReasoningWithTools bool
 	// ReasoningEffort: provider accepts reasoning_effort (OpenAI, GLM-5.3+).
 	ReasoningEffort bool
 	// ForceThinking lists model-name prefixes that reject
@@ -139,7 +146,7 @@ func builtinProviders() []ProviderConfig {
 			Format:  FormatOpenAI,
 			BaseURL: "https://api.deepseek.com",
 			EnvKeys: []string{"DEEPSEEK_API_KEY"},
-			Quirks:  Quirks{ThinkingObject: true},
+			Quirks:  Quirks{ThinkingObject: true, EchoReasoningWithTools: true},
 		},
 		{
 			ID:      "zai",

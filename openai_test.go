@@ -286,6 +286,103 @@ func TestBuildOpenAIRequest_ReasoningContentReplay(t *testing.T) {
 	}
 }
 
+// DeepSeek thinking mode with tools: the reasoning_content key must survive on
+// every replayed assistant turn — including turns where the provider returned
+// no reasoning of its own (documented elision; see e2e_test.go). DeepSeek's
+// documented contract: "for requests carrying the tools parameter, the
+// reasoning_content must be fully passed back to the API in all subsequent
+// requests — even for turns where the model did not perform a tool call. If
+// your code does not correctly pass back reasoning_content, the API will
+// return a 400 error." An omitted key is a hard 400 on every later request of
+// the loop, not just the offending turn.
+func TestBuildOpenAIRequest_EchoesEmptyReasoningWithTools(t *testing.T) {
+	cfg := ProviderConfig{
+		ID:     "deepseek",
+		Format: FormatOpenAI,
+		Quirks: Quirks{ThinkingObject: true, EchoReasoningWithTools: true},
+	}
+	req := &ChatRequest{
+		Messages: []Message{
+			{Role: RoleUser, Content: "weather?"},
+			// Tool-call turn for which the provider elided reasoning.
+			{Role: RoleAssistant, Content: "", ToolCalls: []ToolCall{
+				{ID: "call_1", Name: "get_weather", Arguments: `{"city":"Berlin"}`},
+			}},
+			{Role: RoleTool, ToolCallID: "call_1", ToolName: "get_weather", Content: `{"temp":20}`},
+		},
+		Tools:    []ToolDef{{Name: "get_weather"}},
+		Thinking: "enabled",
+	}
+	oa := buildOpenAIRequest(cfg, req, "deepseek-chat", false, false)
+	body, err := json.Marshal(oa)
+	if err != nil {
+		t.Fatal(err)
+	}
+	m := openaiReqMap(t, body)
+	asst := m["messages"].([]any)[1].(map[string]any)
+	v, present := asst["reasoning_content"]
+	if !present {
+		t.Fatal("reasoning_content key absent on a tool-call assistant turn: DeepSeek returns 400 for every later request in the loop")
+	}
+	if v != "" {
+		t.Errorf("reasoning_content = %v, want empty string", v)
+	}
+}
+
+// Without tools the key must stay absent when there is nothing to echo:
+// DeepSeek ignores the field there, and OpenAI-compatible providers that do
+// not know it must never see it.
+func TestBuildOpenAIRequest_NoReasoningKeyWithoutTools(t *testing.T) {
+	cfg := ProviderConfig{
+		ID:     "deepseek",
+		Format: FormatOpenAI,
+		Quirks: Quirks{ThinkingObject: true, EchoReasoningWithTools: true},
+	}
+	req := &ChatRequest{
+		Messages: []Message{
+			{Role: RoleUser, Content: "q"},
+			{Role: RoleAssistant, Content: "a"},
+		},
+		Thinking: "enabled",
+	}
+	oa := buildOpenAIRequest(cfg, req, "deepseek-chat", false, false)
+	body, err := json.Marshal(oa)
+	if err != nil {
+		t.Fatal(err)
+	}
+	m := openaiReqMap(t, body)
+	asst := m["messages"].([]any)[1].(map[string]any)
+	if _, present := asst["reasoning_content"]; present {
+		t.Errorf("reasoning_content must not be sent without tools: %v", asst["reasoning_content"])
+	}
+}
+
+// A provider without the echo quirk keeps today's wire shape exactly: no key
+// when there is no reasoning to replay.
+func TestBuildOpenAIRequest_NoEchoWithoutQuirk(t *testing.T) {
+	cfg := ProviderConfig{ID: "kimi", Format: FormatOpenAI}
+	req := &ChatRequest{
+		Messages: []Message{
+			{Role: RoleUser, Content: "weather?"},
+			{Role: RoleAssistant, Content: "", ToolCalls: []ToolCall{
+				{ID: "call_1", Name: "get_weather", Arguments: `{"city":"Berlin"}`},
+			}},
+			{Role: RoleTool, ToolCallID: "call_1", ToolName: "get_weather", Content: `{"temp":20}`},
+		},
+		Tools: []ToolDef{{Name: "get_weather"}},
+	}
+	oa := buildOpenAIRequest(cfg, req, "kimi-k2", false, false)
+	body, err := json.Marshal(oa)
+	if err != nil {
+		t.Fatal(err)
+	}
+	m := openaiReqMap(t, body)
+	asst := m["messages"].([]any)[1].(map[string]any)
+	if _, present := asst["reasoning_content"]; present {
+		t.Errorf("unexpected reasoning_content for a non-echo provider: %v", asst["reasoning_content"])
+	}
+}
+
 func TestBuildOpenAIRequest_ToolMessages(t *testing.T) {
 	cfg := ProviderConfig{ID: "kimi", Format: FormatOpenAI}
 	req := &ChatRequest{Messages: []Message{

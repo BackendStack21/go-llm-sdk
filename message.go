@@ -50,9 +50,10 @@ type ToolCall struct {
 // (deepseek-reasoner, anthropic thinking, gemini thoughts). The SDK
 // replays it where a provider requires conversation continuity:
 // OpenAI-format assistant messages echo it as reasoning_content
-// (DeepSeek/GLM tool loops), and Anthropic re-serializes a signed
-// thinking block as the first content block when ThinkingSignature is
-// also set.
+// (DeepSeek/GLM tool loops; with tools present the key is echoed even
+// when empty, because DeepSeek rejects a missing key with 400), and
+// Anthropic re-serializes a signed thinking block as the first content
+// block when ThinkingSignature is also set.
 type Message struct {
 	Role             Role
 	Content          string
