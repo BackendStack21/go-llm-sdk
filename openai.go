@@ -1,6 +1,7 @@
 package llm
 
 import (
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"strings"
@@ -31,11 +32,52 @@ type oaMessage struct {
 	Role string `json:"role"`
 	// Content and ReasoningContent are pointers so the key can be present and
 	// empty: nil omits it, a pointer to "" keeps it on the wire.
-	Content          *string      `json:"content"` // nil keeps JSON null for tool calls
-	ReasoningContent *string      `json:"reasoning_content,omitempty"`
-	ToolCalls        []oaToolCall `json:"tool_calls,omitempty"`
-	ToolCallID       string       `json:"tool_call_id,omitempty"`
+	Content          *string         `json:"content"` // nil keeps JSON null for tool calls
+	ContentParts     []oaContentPart `json:"-"`
+	ReasoningContent *string         `json:"reasoning_content,omitempty"`
+	ToolCalls        []oaToolCall    `json:"tool_calls,omitempty"`
+	ToolCallID       string          `json:"tool_call_id,omitempty"`
 }
+
+func (m oaMessage) MarshalJSON() ([]byte, error) {
+	type alias oaMessage
+	if len(m.ContentParts) == 0 {
+		return json.Marshal(alias(m))
+	}
+	return json.Marshal(struct {
+		Role             string          `json:"role"`
+		Content          []oaContentPart `json:"content"`
+		ReasoningContent *string         `json:"reasoning_content,omitempty"`
+		ToolCalls        []oaToolCall    `json:"tool_calls,omitempty"`
+		ToolCallID       string          `json:"tool_call_id,omitempty"`
+	}{m.Role, m.ContentParts, m.ReasoningContent, m.ToolCalls, m.ToolCallID})
+}
+
+type oaImageURL struct {
+	URL string `json:"url"`
+}
+type oaContentPart struct {
+	Type     string      `json:"type"`
+	Text     string      `json:"text,omitempty"`
+	ImageURL *oaImageURL `json:"image_url,omitempty"`
+}
+
+func openAIContent(m Message) any {
+	if len(m.Parts) == 0 {
+		return m.Content
+	}
+	parts := make([]oaContentPart, 0, len(m.Parts))
+	for _, p := range m.Parts {
+		if p.Type == ContentPartImage {
+			parts = append(parts, oaContentPart{Type: "image_url", ImageURL: &oaImageURL{URL: "data:" + wireMIME(p.MIMEType) + ";base64," + base64.StdEncoding.EncodeToString(p.Image)}})
+		} else {
+			parts = append(parts, oaContentPart{Type: "text", Text: p.Text})
+		}
+	}
+	return parts
+}
+
+func openAIText(m Message) *string { return &m.Content }
 
 type oaToolDef struct {
 	Type     string          `json:"type"` // "function"
@@ -111,8 +153,11 @@ func buildOpenAIRequest(cfg ProviderConfig, req *ChatRequest, model string, stre
 			msgs = append(msgs, oaMessage{Role: "tool", Content: &c, ToolCallID: m.ToolCallID})
 		case RoleAssistant:
 			om := oaMessage{Role: "assistant"}
-			c := m.Content
-			om.Content = &c
+			if len(m.Parts) == 0 {
+				om.Content = openAIText(m)
+			} else {
+				om.ContentParts = openAIContent(m).([]oaContentPart)
+			}
 			// DeepSeek thinking mode requires the reasoning_content key on every
 			// replayed assistant turn once the request carries tools — including
 			// turns where the provider returned no reasoning of its own. Omitting
@@ -143,8 +188,13 @@ func buildOpenAIRequest(cfg ProviderConfig, req *ChatRequest, model string, stre
 			}
 			msgs = append(msgs, om)
 		default: // user
-			c := m.Content
-			msgs = append(msgs, oaMessage{Role: "user", Content: &c})
+			om := oaMessage{Role: "user"}
+			if len(m.Parts) == 0 {
+				om.Content = openAIText(m)
+			} else {
+				om.ContentParts = openAIContent(m).([]oaContentPart)
+			}
+			msgs = append(msgs, om)
 		}
 	}
 	out.Messages = msgs

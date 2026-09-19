@@ -1,6 +1,7 @@
 package llm
 
 import (
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"strings"
@@ -28,7 +29,28 @@ type rsTool struct {
 
 type rsEasyMessage struct {
 	Role    string `json:"role"`
-	Content string `json:"content"`
+	Content any    `json:"content"`
+}
+
+type rsInputContentPart struct {
+	Type     string `json:"type"`
+	Text     string `json:"text,omitempty"`
+	ImageURL string `json:"image_url,omitempty"`
+}
+
+func responsesContent(m Message) any {
+	if len(m.Parts) == 0 {
+		return m.Content
+	}
+	parts := make([]rsInputContentPart, 0, len(m.Parts))
+	for _, p := range m.Parts {
+		if p.Type == ContentPartImage {
+			parts = append(parts, rsInputContentPart{Type: "input_image", ImageURL: "data:" + wireMIME(p.MIMEType) + ";base64," + base64.StdEncoding.EncodeToString(p.Image)})
+		} else {
+			parts = append(parts, rsInputContentPart{Type: "input_text", Text: p.Text})
+		}
+	}
+	return parts
 }
 
 type rsReasoningItem struct {
@@ -194,7 +216,7 @@ func buildResponsesInput(req *ChatRequest) (instructions string, input []any) {
 		case RoleSystem:
 			continue
 		case RoleUser:
-			input = append(input, rsEasyMessage{Role: "user", Content: m.Content})
+			input = append(input, rsEasyMessage{Role: "user", Content: responsesContent(m)})
 		case RoleAssistant:
 			// Asymmetry with the chat-completions builder: this format replays
 			// reasoning as an encrypted reasoning item gated on
@@ -220,7 +242,7 @@ func buildResponsesInput(req *ChatRequest) (instructions string, input []any) {
 				})
 			}
 			if m.Content != "" {
-				input = append(input, rsEasyMessage{Role: "assistant", Content: m.Content})
+				input = append(input, rsEasyMessage{Role: "assistant", Content: responsesContent(m)})
 			}
 		case RoleTool:
 			input = append(input, rsFunctionOutputItem{

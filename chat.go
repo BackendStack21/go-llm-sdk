@@ -141,6 +141,9 @@ func (pc *providerClient) buildChatRequest(req *ChatRequest, model string, strea
 			return nil, "", &ConfigError{Msg: fmt.Sprintf("message %d: unknown role %q", i, string(m.Role))}
 		}
 	}
+	if err := validateRequestContent(req.Messages); err != nil {
+		return nil, "", err
+	}
 	if model == "" {
 		model = req.Model
 	}
