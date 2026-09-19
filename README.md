@@ -107,8 +107,12 @@ Requests and results are provider-neutral. Unknown message roles are rejected at
 
 User messages may contain ordered text and inline image parts. `Content` remains
 the backwards-compatible plain-text form; use `TextPart` and `ImagePart` when
-an image is needed. Images are sent as bounded base64 data (up to
-`MaxImageBytes`) to every supported provider format.
+an image is needed. Parts are user-role only and cannot be combined with
+`Content` on the same message; empty text parts are rejected. Accepted image
+types are png, jpeg, gif, and webp (the informal `image/jpg` alias is accepted
+and normalized to `image/jpeg` on the wire). Per-image (`MaxImageBytes`, 10 MiB)
+and per-request aggregate (`MaxRequestImageBytes`, 32 MiB) caps are enforced
+before any network I/O. All validation failures are typed `*ConfigError`.
 
 ```go
 req := &llm.ChatRequest{Messages: []llm.Message{{

@@ -185,7 +185,7 @@ func buildAnthropicRequest(req *ChatRequest, model string, stream bool) ([]byte,
 			} else {
 				for _, p := range m.Parts {
 					if p.Type == ContentPartImage {
-						blocks = append(blocks, anBlock{Type: "image", Source: &anImageSource{Type: "base64", MediaType: p.MIMEType, Data: base64.StdEncoding.EncodeToString(p.Image)}})
+						blocks = append(blocks, anBlock{Type: "image", Source: &anImageSource{Type: "base64", MediaType: wireMIME(p.MIMEType), Data: base64.StdEncoding.EncodeToString(p.Image)}})
 					} else {
 						blocks = append(blocks, anBlock{Type: "text", Text: p.Text})
 					}

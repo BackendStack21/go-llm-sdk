@@ -20,7 +20,7 @@ func validateRequestContent(messages []Message) error {
 		for _, p := range m.Parts {
 			total += len(p.Image)
 			if total > MaxRequestImageBytes {
-				return &ConfigError{Msg: fmt.Sprintf("request inline images exceed %d bytes", MaxRequestImageBytes)}
+				return &ConfigError{Msg: fmt.Sprintf("message %d: request inline images exceed %d bytes", i, MaxRequestImageBytes)}
 			}
 		}
 	}
@@ -40,6 +40,9 @@ func validateMessageContent(m Message, index int) error {
 	for j, p := range m.Parts {
 		switch p.Type {
 		case ContentPartText:
+			if p.Text == "" {
+				return &ConfigError{Msg: fmt.Sprintf("message %d part %d: text part is empty", index, j)}
+			}
 			if p.Image != nil || p.MIMEType != "" {
 				return &ConfigError{Msg: fmt.Sprintf("message %d part %d: text part has image fields", index, j)}
 			}
@@ -65,6 +68,17 @@ func validateMessageContent(m Message, index int) error {
 }
 
 var supportedImageMIME = map[string]bool{
-	"image/png": true, "image/jpeg": true, "image/jpg": true,
+	"image/png": true, "image/jpeg": true,
 	"image/gif": true, "image/webp": true,
+}
+
+// wireMIME maps an accepted MIME type to the form providers expect on the
+// wire. The informal image/jpg alias is accepted at the API boundary (some
+// callers derive MIME from file extensions) but must not reach providers:
+// Anthropic and Gemini reject it while image/jpeg is universally valid.
+func wireMIME(m string) string {
+	if m == "image/jpg" {
+		return "image/jpeg"
+	}
+	return m
 }

@@ -96,3 +96,34 @@ func TestMultimodalStreamRequestPath(t *testing.T) {
 		}
 	}
 }
+
+func TestMultimodalJPGAliasNormalizedOnWire(t *testing.T) {
+	req := &ChatRequest{Messages: []Message{{Role: RoleUser, Parts: []ContentPart{ImagePart("image/jpg", []byte{1})}}}}
+	b, err := buildAnthropicRequest(req, "claude", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(b), "image/jpg") || !strings.Contains(string(b), "image/jpeg") {
+		t.Fatalf("anthropic media_type not normalized: %s", b)
+	}
+	g, err := buildGeminiRequest(req, "gemini", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(g), "image/jpg") || !strings.Contains(string(g), "image/jpeg") {
+		t.Fatalf("gemini mime_type not normalized: %s", g)
+	}
+	o := buildOpenAIRequest(ProviderConfig{}, req, "gpt-4o", false, false)
+	raw, _ := json.Marshal(o.Messages[0])
+	if strings.Contains(string(raw), "image/jpg") || !strings.Contains(string(raw), "image/jpeg") {
+		t.Fatalf("openai data url not normalized: %s", raw)
+	}
+}
+
+func TestMultimodalEmptyTextPartRejected(t *testing.T) {
+	pc := newProviderClient(ProviderConfig{Format: FormatOpenAI, BaseURL: "http://127.0.0.1:1"}, nil, nil)
+	_, _, err := pc.buildChatRequest(&ChatRequest{Messages: []Message{{Role: RoleUser, Parts: []ContentPart{ImagePart("image/png", []byte("x")), {Type: ContentPartText}}}}}, "m", false)
+	if err == nil || !strings.Contains(err.Error(), "text part is empty") {
+		t.Fatalf("empty text part accepted: %v", err)
+	}
+}

@@ -146,7 +146,7 @@ func buildGeminiRequest(req *ChatRequest, model string, stream bool) ([]byte, er
 			} else {
 				for _, p := range m.Parts {
 					if p.Type == ContentPartImage {
-						parts = append(parts, gmPart{InlineData: &gmBlob{MIMEType: p.MIMEType, Data: base64.StdEncoding.EncodeToString(p.Image)}})
+						parts = append(parts, gmPart{InlineData: &gmBlob{MIMEType: wireMIME(p.MIMEType), Data: base64.StdEncoding.EncodeToString(p.Image)}})
 					} else {
 						parts = append(parts, gmPart{Text: p.Text})
 					}

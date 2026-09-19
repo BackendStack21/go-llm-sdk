@@ -69,7 +69,7 @@ func openAIContent(m Message) any {
 	parts := make([]oaContentPart, 0, len(m.Parts))
 	for _, p := range m.Parts {
 		if p.Type == ContentPartImage {
-			parts = append(parts, oaContentPart{Type: "image_url", ImageURL: &oaImageURL{URL: "data:" + p.MIMEType + ";base64," + base64.StdEncoding.EncodeToString(p.Image)}})
+			parts = append(parts, oaContentPart{Type: "image_url", ImageURL: &oaImageURL{URL: "data:" + wireMIME(p.MIMEType) + ";base64," + base64.StdEncoding.EncodeToString(p.Image)}})
 		} else {
 			parts = append(parts, oaContentPart{Type: "text", Text: p.Text})
 		}

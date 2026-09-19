@@ -45,7 +45,7 @@ func responsesContent(m Message) any {
 	parts := make([]rsInputContentPart, 0, len(m.Parts))
 	for _, p := range m.Parts {
 		if p.Type == ContentPartImage {
-			parts = append(parts, rsInputContentPart{Type: "input_image", ImageURL: "data:" + p.MIMEType + ";base64," + base64.StdEncoding.EncodeToString(p.Image)})
+			parts = append(parts, rsInputContentPart{Type: "input_image", ImageURL: "data:" + wireMIME(p.MIMEType) + ";base64," + base64.StdEncoding.EncodeToString(p.Image)})
 		} else {
 			parts = append(parts, rsInputContentPart{Type: "input_text", Text: p.Text})
 		}
