@@ -2,6 +2,7 @@ package llm
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	neturl "net/url"
@@ -27,8 +28,9 @@ type anSysBlock struct {
 }
 
 type anBlock struct {
-	Type string `json:"type"` // "text" | "tool_use" | "tool_result"
-	Text string `json:"text,omitempty"`
+	Type   string         `json:"type"` // "text" | "tool_use" | "tool_result"
+	Text   string         `json:"text,omitempty"`
+	Source *anImageSource `json:"source,omitempty"`
 	// CacheControl is set on user text blocks when Message.Cache is true.
 	CacheControl *anCacheControl `json:"cache_control,omitempty"`
 	// thinking (replayed assistant turns; must be the FIRST block and
@@ -42,6 +44,12 @@ type anBlock struct {
 	// tool_result (string content form)
 	ToolUseID string `json:"tool_use_id,omitempty"`
 	Result    string `json:"content,omitempty"`
+}
+
+type anImageSource struct {
+	Type      string `json:"type"`
+	MediaType string `json:"media_type"`
+	Data      string `json:"data"`
 }
 
 type anMessage struct {
@@ -171,14 +179,22 @@ func buildAnthropicRequest(req *ChatRequest, model string, stream bool) ([]byte,
 		case RoleSystem:
 			out.System = append(out.System, anSysBlock{Type: "text", Text: m.Content})
 		case RoleUser:
-			blk := anBlock{Type: "text", Text: m.Content}
-			if m.Cache {
-				blk.CacheControl = &anCacheControl{Type: "ephemeral"}
+			blocks := make([]anBlock, 0, maxInt(1, len(m.Parts)))
+			if len(m.Parts) == 0 {
+				blocks = append(blocks, anBlock{Type: "text", Text: m.Content})
+			} else {
+				for _, p := range m.Parts {
+					if p.Type == ContentPartImage {
+						blocks = append(blocks, anBlock{Type: "image", Source: &anImageSource{Type: "base64", MediaType: p.MIMEType, Data: base64.StdEncoding.EncodeToString(p.Image)}})
+					} else {
+						blocks = append(blocks, anBlock{Type: "text", Text: p.Text})
+					}
+				}
 			}
-			out.Messages = append(out.Messages, anMessage{
-				Role:    "user",
-				Content: []anBlock{blk},
-			})
+			if m.Cache && len(blocks) > 0 && blocks[0].Type == "text" {
+				blocks[0].CacheControl = &anCacheControl{Type: "ephemeral"}
+			}
+			out.Messages = append(out.Messages, anMessage{Role: "user", Content: blocks})
 		case RoleAssistant:
 			if m.ReasoningContent != "" && m.ThinkingSignature == "" {
 				return nil, &ConfigError{Msg: fmt.Sprintf("message %d: Anthropic thinking replay requires ThinkingSignature", i)}

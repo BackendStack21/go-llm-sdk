@@ -22,6 +22,35 @@ import (
 // Role enumerates canonical message roles.
 type Role string
 
+// ContentPartType identifies the payload carried by ContentPart.
+type ContentPartType string
+
+const (
+	ContentPartText  ContentPartType = "text"
+	ContentPartImage ContentPartType = "image"
+)
+
+// ContentPart is one ordered text or inline-image segment in a message.
+// Image data is raw bytes and is base64-encoded only by provider serializers.
+// A part must contain exactly one supported payload: Text, or Image with a
+// valid MIMEType. Inline images are bounded by MaxImageBytes.
+type ContentPart struct {
+	Type     ContentPartType
+	Text     string
+	Image    []byte
+	MIMEType string
+}
+
+const MaxImageBytes = 10 << 20
+
+// TextPart creates an ordered text content part.
+func TextPart(text string) ContentPart { return ContentPart{Type: ContentPartText, Text: text} }
+
+// ImagePart creates an ordered inline-image content part.
+func ImagePart(mimeType string, data []byte) ContentPart {
+	return ContentPart{Type: ContentPartImage, Image: data, MIMEType: mimeType}
+}
+
 const (
 	RoleSystem    Role = "system"
 	RoleUser      Role = "user"
@@ -55,8 +84,11 @@ type ToolCall struct {
 // Anthropic re-serializes a signed thinking block as the first content
 // block when ThinkingSignature is also set.
 type Message struct {
-	Role             Role
-	Content          string
+	Role    Role
+	Content string
+	// Parts optionally carries ordered text and inline-image content. When
+	// empty, Content retains the legacy plain-text representation.
+	Parts            []ContentPart
 	ReasoningContent string
 	// ThinkingSignature authenticates ReasoningContent for providers that
 	// require thinking to be replayed verbatim (Anthropic signature, OpenAI

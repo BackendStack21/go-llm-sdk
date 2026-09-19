@@ -105,6 +105,21 @@ sdk := llm.New(llm.WithProvider("my-gateway",
 
 Requests and results are provider-neutral. Unknown message roles are rejected at the SDK boundary (never silently dropped or reinterpreted).
 
+User messages may contain ordered text and inline image parts. `Content` remains
+the backwards-compatible plain-text form; use `TextPart` and `ImagePart` when
+an image is needed. Images are sent as bounded base64 data (up to
+`MaxImageBytes`) to every supported provider format.
+
+```go
+req := &llm.ChatRequest{Messages: []llm.Message{{
+	Role: llm.RoleUser,
+	Parts: []llm.ContentPart{
+		llm.TextPart("Describe this image:"),
+		llm.ImagePart("image/png", pngBytes),
+	},
+}}}
+```
+
 ```go
 type ChatRequest struct {
 	Model          string         // optional; ChatClient's model wins when both set

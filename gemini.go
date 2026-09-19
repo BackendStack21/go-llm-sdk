@@ -2,6 +2,7 @@ package llm
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	neturl "net/url"
@@ -27,9 +28,14 @@ type gmFnResp struct {
 
 type gmPart struct {
 	Text             string    `json:"text,omitempty"`
+	InlineData       *gmBlob   `json:"inlineData,omitempty"`
 	Thought          bool      `json:"thought,omitempty"`
 	FunctionCall     *gmFnCall `json:"functionCall,omitempty"`
 	FunctionResponse *gmFnResp `json:"functionResponse,omitempty"`
+}
+type gmBlob struct {
+	MIMEType string `json:"mimeType"`
+	Data     string `json:"data"`
 }
 
 type gmContent struct {
@@ -134,10 +140,19 @@ func buildGeminiRequest(req *ChatRequest, model string, stream bool) ([]byte, er
 		case RoleSystem:
 			// folded into systemInstruction
 		case RoleUser:
-			out.Contents = append(out.Contents, gmContent{
-				Role:  "user",
-				Parts: []gmPart{{Text: m.Content}},
-			})
+			parts := make([]gmPart, 0, maxInt(1, len(m.Parts)))
+			if len(m.Parts) == 0 {
+				parts = append(parts, gmPart{Text: m.Content})
+			} else {
+				for _, p := range m.Parts {
+					if p.Type == ContentPartImage {
+						parts = append(parts, gmPart{InlineData: &gmBlob{MIMEType: p.MIMEType, Data: base64.StdEncoding.EncodeToString(p.Image)}})
+					} else {
+						parts = append(parts, gmPart{Text: p.Text})
+					}
+				}
+			}
+			out.Contents = append(out.Contents, gmContent{Role: "user", Parts: parts})
 		case RoleAssistant:
 			for _, tc := range m.ToolCalls {
 				if tc.ID != "" {
