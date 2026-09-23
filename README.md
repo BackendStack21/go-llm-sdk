@@ -238,6 +238,24 @@ case errors.Is(err, context.DeadlineExceeded): // wall-clock budget spent
 
 API keys never appear in any error text. Provider error bodies are parsed per format (nested OpenAI envelope, Anthropic `error.type/message`, Gemini `error.status/message`) with a 512-byte raw-body fallback.
 
+## Text-to-speech
+
+`Speak` synthesizes speech via a provider's TTS endpoint. Supported wire formats: OpenAI-compatible (`POST {base}/audio/speech`, binary audio) and Gemini (`generateContent` with `AUDIO` response modality, base64 `inlineData`). Other formats return a `ConfigError`.
+
+```go
+res, err := sdk.Speak(ctx, "openai", "tts-1", llm.SpeakRequest{
+    Text:  "Hello from go-llm-sdk",
+    Voice: "alloy",           // required — no local default (never guessed)
+    Format: "mp3",            // OpenAI-compat response_format (default "mp3")
+    Speed: 1.0,               // optional, OpenAI-compat only
+})
+// res.Audio    — raw audio bytes exactly as the provider returned them
+// res.Model    — the model that produced the audio
+// res.MIMEType — the provider's Content-Type, or audio/mpeg when omitted
+```
+
+The SDK never transcodes: it returns the provider's bytes plus the MIME type the provider declared, falling back to the wire format's well-known default (`audio/mpeg` on the OpenAI path; Gemini's `inlineData.mimeType` is always present). A 2xx JSON error envelope from a gateway surfaces as a typed `*APIError` — JSON is never returned as audio. Requests carry the same retry ladder and error taxonomy as chat; empty `Text` or `Voice` fail fast with a `ConfigError`.
+
 ## Thread safety
 
 `SDK` and `Provider` are safe for concurrent use. `ChatClient` is safe for concurrent `Call`/`CallStream`; `SetRequestTimeout` is race-safe (atomic swap) but should still be called before the first request so in-flight calls use one timeout. Learn-once state is shared per provider via atomics — monotonic, converging, race-free.

@@ -402,3 +402,63 @@ func TestE2EReasonerStreaming(t *testing.T) {
 		t.Errorf("finish = %q, want stop or length", res.FinishReason)
 	}
 }
+
+// ── TTS arms ─────────────────────────────────────────────────────────────
+
+// e2eTTSModel resolves the TTS model for a provider id: <ID>_TTS_E2E_MODEL
+// beats the default (kept separate from the chat-model override).
+func e2eTTSModel(t *testing.T, id, def string) string {
+	t.Helper()
+	if v := strings.TrimSpace(os.Getenv(strings.ToUpper(id) + "_TTS_E2E_MODEL")); v != "" {
+		return v
+	}
+	return def
+}
+
+// TestE2ETTSOpenAI probes the OpenAI /audio/speech path against the live
+// OpenAI endpoint (built-in registry, key via OPENAI_API_KEY). Asserts only
+// SDK guarantees: the call succeeds and non-empty audio with a non-empty
+// MIME type comes back. The audio's decodability is never asserted.
+func TestE2ETTSOpenAI(t *testing.T) {
+	const keyEnv = "OPENAI_API_KEY"
+	key := e2eEnvKey(t, keyEnv)
+	sdk := New(WithProvider("openai", WithAPIKey(key)))
+	res, err := sdk.Speak(t.Context(), "openai", e2eTTSModel(t, "openai", "tts-1"), SpeakRequest{
+		Text:  "go-llm-sdk text to speech probe.",
+		Voice: "alloy",
+	})
+	if err != nil {
+		t.Fatalf("Speak: %v", err)
+	}
+	if len(res.Audio) == 0 {
+		t.Errorf("Speak returned empty audio")
+	}
+	if res.MIMEType == "" {
+		t.Errorf("Speak returned empty MIMEType")
+	}
+	t.Logf("audio=%d bytes mime=%q model=%q", len(res.Audio), res.MIMEType, res.Model)
+}
+
+// TestE2ETTSGemini probes the Gemini AUDIO-modality TTS path (built-in
+// registry, key via GEMINI_API_KEY). Same soft contract: non-empty audio
+// bytes + non-empty MIME type; no format assumptions beyond what the SDK
+// already guarantees.
+func TestE2ETTSGemini(t *testing.T) {
+	const keyEnv = "GEMINI_API_KEY"
+	key := e2eEnvKey(t, keyEnv)
+	sdk := New(WithProvider("gemini", WithAPIKey(key)))
+	res, err := sdk.Speak(t.Context(), "gemini", e2eTTSModel(t, "gemini", "gemini-2.5-flash-preview-tts"), SpeakRequest{
+		Text:  "go-llm-sdk text to speech probe.",
+		Voice: "Kore",
+	})
+	if err != nil {
+		t.Fatalf("Speak: %v", err)
+	}
+	if len(res.Audio) == 0 {
+		t.Errorf("Speak returned empty audio")
+	}
+	if res.MIMEType == "" {
+		t.Errorf("Speak returned empty MIMEType")
+	}
+	t.Logf("audio=%d bytes mime=%q model=%q", len(res.Audio), res.MIMEType, res.Model)
+}
