@@ -279,14 +279,13 @@ func TestSpeak_MissingContentType(t *testing.T) {
 	}
 	defer ln.Close()
 	go func() {
-		conn, err := ln.Accept()
-		if err != nil {
-			return
+		for {
+			conn, err := ln.Accept()
+			if err != nil {
+				return // listener closed: test over
+			}
+			handleConn(conn)
 		}
-		defer conn.Close()
-		body := []byte{0xff, 0xf3, 0x00, 0x01}
-		fmt.Fprintf(conn, "HTTP/1.1 200 OK\r\nContent-Length: %d\r\nConnection: close\r\n\r\n", len(body))
-		_, _ = conn.Write(body)
 	}()
 	s := newTestSDK(t, ProviderConfig{ID: "openai", Format: FormatOpenAI, APIKey: "k", BaseURL: "http://" + ln.Addr().String()}, nil)
 	res, err := s.Speak(t.Context(), "openai", "tts-1", SpeakRequest{Text: "hello", Voice: "alloy"})
@@ -296,6 +295,15 @@ func TestSpeak_MissingContentType(t *testing.T) {
 	if res.MIMEType != "audio/mpeg" {
 		t.Errorf("MIMEType = %q, want audio/mpeg (well-known fallback)", res.MIMEType)
 	}
+}
+
+// handleConn answers one HTTP request with a bare 200 response carrying
+// audio bytes and no Content-Type header.
+func handleConn(conn net.Conn) {
+	defer conn.Close()
+	body := []byte{0xff, 0xf3, 0x00, 0x01}
+	fmt.Fprintf(conn, "HTTP/1.1 200 OK\r\nContent-Length: %d\r\nConnection: close\r\n\r\n", len(body))
+	_, _ = conn.Write(body)
 }
 
 // TestSpeak_OpenAI2xxJSONRejected guards against OpenAI-compatible gateways
