@@ -41,7 +41,7 @@ type SpeakResult struct {
 
 // Speak synthesizes speech with the named provider and model. Buffered
 // only — no streaming in v1 — with the same retry ladder as chat.
-func (s *SDK) Speak(providerID, model string, req SpeakRequest) (*SpeakResult, error) {
+func (s *SDK) Speak(ctx context.Context, providerID, model string, req SpeakRequest) (*SpeakResult, error) {
 	if strings.TrimSpace(req.Text) == "" {
 		return nil, &ConfigError{Msg: "speak request requires non-empty Text"}
 	}
@@ -62,7 +62,7 @@ func (s *SDK) Speak(providerID, model string, req SpeakRequest) (*SpeakResult, e
 		return nil, &ConfigError{Msg: providerID + " has an invalid configuration"}
 	}
 	pc := newProviderClient(p.cfg, newBufferedHTTP(s.rt, s.timeout), nil)
-	return pc.speak(context.Background(), model, req)
+	return pc.speak(ctx, model, req)
 }
 
 // buildSpeakRequest dispatches format-specific serialization. The third

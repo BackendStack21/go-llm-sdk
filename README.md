@@ -243,7 +243,7 @@ API keys never appear in any error text. Provider error bodies are parsed per fo
 `Speak` synthesizes speech via a provider's TTS endpoint. Supported wire formats: OpenAI-compatible (`POST {base}/audio/speech`, binary audio) and Gemini (`generateContent` with `AUDIO` response modality, base64 `inlineData`). Other formats return a `ConfigError`.
 
 ```go
-res, err := sdk.Speak("openai", "tts-1", llm.SpeakRequest{
+res, err := sdk.Speak(ctx, "openai", "tts-1", llm.SpeakRequest{
     Text:  "Hello from go-llm-sdk",
     Voice: "alloy",           // required — no local default (never guessed)
     Format: "mp3",            // OpenAI-compat response_format (default "mp3")

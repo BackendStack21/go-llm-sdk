@@ -59,7 +59,7 @@ func TestSpeak_OpenAI(t *testing.T) {
 			defer srv.Close()
 
 			s := newTestSDK(t, ProviderConfig{ID: "openai", Format: FormatOpenAI, APIKey: "k-secret"}, srv)
-			res, err := s.Speak("openai", "tts-1", SpeakRequest{Text: "hello", Voice: "alloy"})
+			res, err := s.Speak(t.Context(), "openai", "tts-1", SpeakRequest{Text: "hello", Voice: "alloy"})
 			if err != nil {
 				t.Fatalf("Speak: %v", err)
 			}
@@ -105,7 +105,7 @@ func TestSpeak_SpeedIncluded(t *testing.T) {
 	}))
 	defer srv.Close()
 	s := newTestSDK(t, ProviderConfig{ID: "openai", Format: FormatOpenAI, APIKey: "k"}, srv)
-	if _, err := s.Speak("openai", "tts-1", SpeakRequest{Text: "hi", Voice: "echo", Speed: 1.5}); err != nil {
+	if _, err := s.Speak(t.Context(), "openai", "tts-1", SpeakRequest{Text: "hi", Voice: "echo", Speed: 1.5}); err != nil {
 		t.Fatalf("Speak: %v", err)
 	}
 	if reqBody["speed"] != 1.5 {
@@ -140,7 +140,7 @@ func TestSpeak_Gemini(t *testing.T) {
 	defer srv.Close()
 
 	s := newTestSDK(t, ProviderConfig{ID: "gemini", Format: FormatGemini, APIKey: "k"}, srv)
-	res, err := s.Speak("gemini", "gemini-tts", SpeakRequest{Text: "hello", Voice: "Kore"})
+	res, err := s.Speak(t.Context(), "gemini", "gemini-tts", SpeakRequest{Text: "hello", Voice: "Kore"})
 	if err != nil {
 		t.Fatalf("Speak: %v", err)
 	}
@@ -206,14 +206,14 @@ func TestSpeak_ConfigErrors(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			if tc.name == "unknown provider" {
-				_, err := s.Speak("nosuch-provider", "m", tc.req)
+				_, err := s.Speak(t.Context(), "nosuch-provider", "m", tc.req)
 				var ce *ConfigError
 				if !errors.As(err, &ce) {
 					t.Fatalf("err = %T (%v), want *ConfigError", err, err)
 				}
 				return
 			}
-			_, err := s.Speak(tc.cfg.ID, "m", tc.req)
+			_, err := s.Speak(t.Context(), tc.cfg.ID, "m", tc.req)
 			if err == nil {
 				t.Fatalf("expected error")
 			}
@@ -236,7 +236,7 @@ func TestSpeak_HTTP500_TypedError(t *testing.T) {
 	}))
 	defer srv.Close()
 	s := newTestSDK(t, ProviderConfig{ID: "openai", Format: FormatOpenAI, APIKey: "k"}, srv)
-	_, err := s.Speak("openai", "tts-1", SpeakRequest{Text: "hi", Voice: "alloy"})
+	_, err := s.Speak(t.Context(), "openai", "tts-1", SpeakRequest{Text: "hi", Voice: "alloy"})
 	var ae *APIError
 	if !errors.As(err, &ae) {
 		t.Fatalf("err = %T (%v), want *APIError", err, err)
@@ -260,7 +260,7 @@ func TestSpeak_RetriesThenSucceeds(t *testing.T) {
 	}))
 	defer srv.Close()
 	s := newTestSDK(t, ProviderConfig{ID: "openai", Format: FormatOpenAI, APIKey: "k"}, srv)
-	res, err := s.Speak("openai", "tts-1", SpeakRequest{Text: "hi", Voice: "alloy"})
+	res, err := s.Speak(t.Context(), "openai", "tts-1", SpeakRequest{Text: "hi", Voice: "alloy"})
 	if err != nil {
 		t.Fatalf("Speak: %v", err)
 	}
@@ -289,7 +289,7 @@ func TestSpeak_MissingContentType(t *testing.T) {
 		_, _ = conn.Write(body)
 	}()
 	s := newTestSDK(t, ProviderConfig{ID: "openai", Format: FormatOpenAI, APIKey: "k", BaseURL: "http://" + ln.Addr().String()}, nil)
-	res, err := s.Speak("openai", "tts-1", SpeakRequest{Text: "hello", Voice: "alloy"})
+	res, err := s.Speak(t.Context(), "openai", "tts-1", SpeakRequest{Text: "hello", Voice: "alloy"})
 	if err != nil {
 		t.Fatalf("Speak: %v", err)
 	}
@@ -309,7 +309,7 @@ func TestSpeak_OpenAI2xxJSONRejected(t *testing.T) {
 	}))
 	defer srv.Close()
 	s := newTestSDK(t, ProviderConfig{ID: "openai", Format: FormatOpenAI, APIKey: "k"}, srv)
-	res, err := s.Speak("openai", "tts-1", SpeakRequest{Text: "hi", Voice: "alloy"})
+	res, err := s.Speak(t.Context(), "openai", "tts-1", SpeakRequest{Text: "hi", Voice: "alloy"})
 	if err == nil {
 		t.Fatalf("expected typed error for 2xx JSON body, got result with %d bytes", len(res.Audio))
 	}
@@ -326,13 +326,13 @@ func TestSpeak_OpenAI2xxJSONRejected(t *testing.T) {
 // require a voice server-side, so an empty/blank Voice fails fast locally.
 func TestSpeak_EmptyVoiceRejected(t *testing.T) {
 	s := newTestSDK(t, ProviderConfig{ID: "openai", Format: FormatOpenAI, APIKey: "k"}, nil)
-	_, err := s.Speak("openai", "tts-1", SpeakRequest{Text: "hi", Voice: "  "})
+	_, err := s.Speak(t.Context(), "openai", "tts-1", SpeakRequest{Text: "hi", Voice: "  "})
 	var ce *ConfigError
 	if !errors.As(err, &ce) {
 		t.Fatalf("openai: err = %T (%v), want *ConfigError", err, err)
 	}
 	gs := newTestSDK(t, ProviderConfig{ID: "gemini", Format: FormatGemini, APIKey: "k"}, nil)
-	_, err = gs.Speak("gemini", "gemini-tts", SpeakRequest{Text: "hi", Voice: ""})
+	_, err = gs.Speak(t.Context(), "gemini", "gemini-tts", SpeakRequest{Text: "hi", Voice: ""})
 	if !errors.As(err, &ce) {
 		t.Fatalf("gemini: err = %T (%v), want *ConfigError", err, err)
 	}
@@ -347,7 +347,7 @@ func TestSpeak_GeminiEmptyInlineDataRejected(t *testing.T) {
 	}))
 	defer srv.Close()
 	s := newTestSDK(t, ProviderConfig{ID: "gemini", Format: FormatGemini, APIKey: "k"}, srv)
-	res, err := s.Speak("gemini", "gemini-tts", SpeakRequest{Text: "hi", Voice: "Kore"})
+	res, err := s.Speak(t.Context(), "gemini", "gemini-tts", SpeakRequest{Text: "hi", Voice: "Kore"})
 	if err == nil {
 		t.Fatalf("err = nil (res audio=%d bytes), want error for empty audio", len(res.Audio))
 	}
@@ -363,7 +363,7 @@ func TestSpeak_GeminiNoAudioPartsTypedError(t *testing.T) {
 	}))
 	defer srv.Close()
 	s := newTestSDK(t, ProviderConfig{ID: "gemini", Format: FormatGemini, APIKey: "k"}, srv)
-	_, err := s.Speak("gemini", "gemini-tts", SpeakRequest{Text: "hi", Voice: "Kore"})
+	_, err := s.Speak(t.Context(), "gemini", "gemini-tts", SpeakRequest{Text: "hi", Voice: "Kore"})
 	var ae *APIError
 	if !errors.As(err, &ae) {
 		t.Fatalf("err = %T (%v), want *APIError", err, err)

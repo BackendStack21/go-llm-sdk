@@ -423,7 +423,7 @@ func TestE2ETTSOpenAI(t *testing.T) {
 	const keyEnv = "OPENAI_API_KEY"
 	key := e2eEnvKey(t, keyEnv)
 	sdk := New(WithProvider("openai", WithAPIKey(key)))
-	res, err := sdk.Speak("openai", e2eTTSModel(t, "openai", "tts-1"), SpeakRequest{
+	res, err := sdk.Speak(t.Context(), "openai", e2eTTSModel(t, "openai", "tts-1"), SpeakRequest{
 		Text:  "go-llm-sdk text to speech probe.",
 		Voice: "alloy",
 	})
@@ -447,7 +447,7 @@ func TestE2ETTSGemini(t *testing.T) {
 	const keyEnv = "GEMINI_API_KEY"
 	key := e2eEnvKey(t, keyEnv)
 	sdk := New(WithProvider("gemini", WithAPIKey(key)))
-	res, err := sdk.Speak("gemini", e2eTTSModel(t, "gemini", "gemini-2.5-flash-preview-tts"), SpeakRequest{
+	res, err := sdk.Speak(t.Context(), "gemini", e2eTTSModel(t, "gemini", "gemini-2.5-flash-preview-tts"), SpeakRequest{
 		Text:  "go-llm-sdk text to speech probe.",
 		Voice: "Kore",
 	})
