@@ -13,10 +13,10 @@ import (
 
 // sttRecord is what a test server captures from one Transcribe request.
 type sttRecord struct {
-	path    string
-	auth    string
-	ct      string
-	body    []byte
+	path     string
+	auth     string
+	ct       string
+	body     []byte
 	boundary string
 }
 
