@@ -29,6 +29,7 @@ go test -tags e2e -run 'TestE2E' -timeout 15m -v .   # LIVE provider e2e (see be
 | `openai.go` / `gemini.go` / `anthropic.go` | Per-format request builders, response/stream mappers, model listing |
 | `responses.go` | OpenAI Responses API (`/v1/responses`) for GPT-5.6+ tools+reasoning |
 | `tts.go` | Text-to-speech: `Speak`/`SpeakRequest`/`SpeakResult` — OpenAI-compat `/audio/speech` + Gemini AUDIO modality, no transcoding |
+| `stt.go` | Speech-to-text: `Transcribe`/`TranscribeRequest`/`TranscribeResult` — OpenAI-compat `/audio/transcriptions` (multipart), 25MB input cap |
 | `sse.go` | SSE parser (abort-safe via `done` channel) + idle-watchdog pump |
 | `retry.go` | Backoff/jitter/`Retry-After`/`retrySleep` (8 attempts, cap 30s) |
 | `provider.go` | Built-in registry, quirks flags, config validation |
