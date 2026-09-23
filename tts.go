@@ -284,6 +284,9 @@ func parseGeminiSpeakResponse(data []byte) (audio []byte, mime string, err error
 		return nil, "", fmt.Errorf("llm: gemini speech response contained no audio parts")
 	}
 	inline := resp.Candidates[0].Content.Parts[0].InlineData
+	if inline.Data == "" {
+		return nil, "", fmt.Errorf("llm: gemini speech response contained no audio data")
+	}
 	audio, err = base64.StdEncoding.DecodeString(inline.Data)
 	if err != nil {
 		return nil, "", fmt.Errorf("llm: decode gemini speech audio: %w", err)

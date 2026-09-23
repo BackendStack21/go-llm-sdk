@@ -338,6 +338,21 @@ func TestSpeak_EmptyVoiceRejected(t *testing.T) {
 	}
 }
 
+// TestSpeak_GeminiEmptyInlineDataRejected asserts a Gemini 2xx part with an
+// empty inlineData payload is an error, never a silent empty-audio success.
+func TestSpeak_GeminiEmptyInlineDataRejected(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"candidates":[{"content":{"parts":[{"inlineData":{"mimeType":"audio/L16;rate=24000","data":""}}]}}]}`))
+	}))
+	defer srv.Close()
+	s := newTestSDK(t, ProviderConfig{ID: "gemini", Format: FormatGemini, APIKey: "k"}, srv)
+	res, err := s.Speak("gemini", "gemini-tts", SpeakRequest{Text: "hi", Voice: "Kore"})
+	if err == nil {
+		t.Fatalf("err = nil (res audio=%d bytes), want error for empty audio", len(res.Audio))
+	}
+}
+
 // TestSpeak_GeminiNoAudioPartsTypedError asserts a Gemini 2xx response with
 // no audio parts surfaces as a typed *APIError (HTTP 200), not a plain
 // fmt.Errorf outside the error taxonomy.
