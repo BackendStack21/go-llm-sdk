@@ -462,3 +462,37 @@ func TestE2ETTSGemini(t *testing.T) {
 	}
 	t.Logf("audio=%d bytes mime=%q model=%q", len(res.Audio), res.MIMEType, res.Model)
 }
+
+// TestE2ETranscribeOpenAI probes the OpenAI /audio/transcriptions path
+// against the live endpoint (built-in registry, key via OPENAI_API_KEY).
+// Self-contained: audio is synthesized first via Speak, then transcribed
+// (model override via OPENAI_STT_E2E_MODEL, default whisper-1). Asserts
+// only SDK guarantees: the call succeeds and non-empty text comes back.
+// Transcript accuracy is never asserted.
+func TestE2ETranscribeOpenAI(t *testing.T) {
+	const keyEnv = "OPENAI_API_KEY"
+	key := e2eEnvKey(t, keyEnv)
+	sdk := New(WithProvider("openai", WithAPIKey(key)))
+	spoken, err := sdk.Speak(t.Context(), "openai", e2eTTSModel(t, "openai", "tts-1"), SpeakRequest{
+		Text:  "go-llm-sdk speech to text probe.",
+		Voice: "alloy",
+	})
+	if err != nil {
+		t.Fatalf("Speak: %v", err)
+	}
+	sttModel := "whisper-1"
+	if v := strings.TrimSpace(os.Getenv("OPENAI_STT_E2E_MODEL")); v != "" {
+		sttModel = v
+	}
+	res, err := sdk.Transcribe(t.Context(), "openai", sttModel, TranscribeRequest{
+		Audio:    spoken.Audio,
+		Filename: "probe.mp3",
+	})
+	if err != nil {
+		t.Fatalf("Transcribe: %v", err)
+	}
+	if res.Text == "" {
+		t.Errorf("Transcribe returned empty text")
+	}
+	t.Logf("text=%q duration=%.1fs model=%q", res.Text, res.DurationSec, res.Model)
+}

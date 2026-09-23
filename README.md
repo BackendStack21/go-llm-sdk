@@ -256,6 +256,25 @@ res, err := sdk.Speak(ctx, "openai", "tts-1", llm.SpeakRequest{
 
 The SDK never transcodes: it returns the provider's bytes plus the MIME type the provider declared, falling back to the wire format's well-known default (`audio/mpeg` on the OpenAI path; Gemini's `inlineData.mimeType` is always present). A 2xx JSON error envelope from a gateway surfaces as a typed `*APIError` — JSON is never returned as audio. Requests carry the same retry ladder and error taxonomy as chat; empty `Text` or `Voice` fail fast with a `ConfigError`.
 
+## Speech-to-text
+
+`Transcribe` converts audio bytes to text via the provider's transcription endpoint. v1 supports the OpenAI-compatible wire format (`POST {base}/audio/transcriptions`, multipart/form-data); other formats return a `ConfigError`. The SDK never touches the filesystem — callers own the audio bytes.
+
+```go
+res, err := sdk.Transcribe(ctx, "openai", "whisper-1", llm.TranscribeRequest{
+    Audio:    audio,            // required, non-empty, ≤25MB
+    Filename: "probe.mp3",      // file part name (default "audio.wav")
+    MIMEType: "audio/mpeg",     // audio part content type (default application/octet-stream)
+    Language: "en",             // optional ISO-639-1 hint
+    Prompt:   "context words",  // optional conditioning text
+})
+// res.Text        — recognized text
+// res.Model       — model that produced the transcription
+// res.Language, res.DurationSec — provider-reported, zero when omitted
+```
+
+Requests carry the same retry ladder and error taxonomy as chat. Oversized audio (>25MB) and empty `Audio`/`Model` fail fast with a `ConfigError` before any network I/O. A 2xx body that is not JSON surfaces as a typed `*APIError`. Fields the provider does not report stay zero — the SDK never guesses.
+
 ## Thread safety
 
 `SDK` and `Provider` are safe for concurrent use. `ChatClient` is safe for concurrent `Call`/`CallStream`; `SetRequestTimeout` is race-safe (atomic swap) but should still be called before the first request so in-flight calls use one timeout. Learn-once state is shared per provider via atomics — monotonic, converging, race-free.
