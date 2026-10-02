@@ -205,7 +205,7 @@ When a provider rejects a request pattern, the SDK learns the constraint **once 
 | Names `/v1/responses` as the tools+reasoning path | retry on `POST /responses` (keeps reasoning on) |
 | Rejects `reasoning_effort` + tools (legacy) | pin `reasoning_effort: "none"` |
 | Rejects streaming itself | downgrade to buffered calls permanently |
-| Answers a streamed request with a non-SSE body | downgrade to buffered calls permanently |
+| Answers a streamed request with a non-SSE body | consume that JSON response directly, then use buffered calls permanently (no duplicate generation) |
 
 ## Retry policy
 

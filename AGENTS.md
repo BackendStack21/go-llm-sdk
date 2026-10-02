@@ -43,6 +43,7 @@ The canonical type system is OpenAI-shaped; `gemini.go`/`anthropic.go` translate
 1. **Canonical finish reasons** are `stop | length | tool_calls | content_filter | ""`. Unmapped provider stop reasons map to `""` on every format — provider-specific strings never leak.
 2. **API keys never appear** in error text, `String()`, or any typed error.
 3. **Streaming**: retries only before the first emitted delta; a failure after partial output returns the partial `*ChatResult` + wrapped error and is **never retried**; a premature close (no completion signal) is an error, never a silent empty success; the parser goroutine is always released (abort-safe `done` protocol).
+   A successful non-SSE response is parsed directly with the usual body cap and format mapper. It learns buffered mode for future requests, but never discards the current generation or makes a replacement request; parse/read errors remain terminal for that response.
 4. **Unknown message roles are rejected** at the SDK boundary (`ConfigError`) — never dropped or reinterpreted per format.
 5. **Unknown provider data stays unknown** (zero values) — no static guesses, no fallback model tables.
 6. **Learn-once fallback state is per-`Provider`**, monotonic, atomic, shared by every `ChatClient` — never move it back to per-client.

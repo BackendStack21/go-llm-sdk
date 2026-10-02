@@ -145,7 +145,7 @@ func TestCallDefinitiveFailureAfter429(t *testing.T) {
 }
 
 // A streamed request answered with a non-SSE body learns the buffered
-// fallback mid-stream and completes on the buffered path.
+// fallback while consuming that generation directly.
 func TestCallStreamLearnsBufferedFromNonSSEBody(t *testing.T) {
 	var n int
 	srv := httptestNewServer(func(w http.ResponseWriter, r *http.Request) {
@@ -164,8 +164,8 @@ func TestCallStreamLearnsBufferedFromNonSSEBody(t *testing.T) {
 	if res.Content != "buffered" {
 		t.Errorf("res = %q", res.Content)
 	}
-	if n != 2 {
-		t.Errorf("requests = %d, want 2 (learn, then buffered retry)", n)
+	if n != 1 {
+		t.Errorf("requests = %d, want 1 (consume the successful body)", n)
 	}
 	// The learned fallback must short-circuit the NEXT CallStream of the
 	// same client straight onto the buffered path.
@@ -175,8 +175,8 @@ func TestCallStreamLearnsBufferedFromNonSSEBody(t *testing.T) {
 	if err != nil || res2.Content != "buffered" {
 		t.Fatalf("second stream: res=%q err=%v", res2.Content, err)
 	}
-	if n != 3 {
-		t.Errorf("requests = %d, want 3 (entry fast-path, no re-learn)", n)
+	if n != 2 {
+		t.Errorf("requests = %d, want 2 (entry fast-path, no re-learn)", n)
 	}
 }
 
