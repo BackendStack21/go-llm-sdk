@@ -106,9 +106,6 @@ var errStreamStop = errors.New("llm: stream complete")
 // completion signal; retryable only before the first delta.
 var errPrematureClose = errors.New("llm: provider closed the stream before completion")
 
-// errNonSSE marks a streamed request answered with a regular body.
-var errNonSSE = errors.New("llm: provider answered a streamed request with a non-event-stream body")
-
 // consumerAbort wraps a delta-handler error through pumpSSE.
 type consumerAbort struct{ err error }
 
@@ -526,6 +523,11 @@ func (pc *providerClient) callStream(ctx context.Context, req *ChatRequest, mode
 
 		out := pc.attemptStream(deadlineCtx, url, body, attemptMapper, onDelta, len(req.Tools) > 0)
 		switch {
+		case out.bufferedResponse:
+			// A successful HTTP response already contains this generation.
+			// Return its buffered parse (including errors) without replacing
+			// it with another generation or resetting the request deadline.
+			return out.result, out.err
 		case out.success():
 			return out.result, nil
 		case out.abort != nil:
@@ -585,12 +587,13 @@ func (pc *providerClient) callStream(ctx context.Context, req *ChatRequest, mode
 // streamOutcome is one streaming attempt's result. Exactly one of the
 // terminal fields is meaningful; see the cases in callStream.
 type streamOutcome struct {
-	result     *ChatResult         // final (success) or partial (abort/fail)
-	abort      *StreamAbortedError // consumer aborted; result is partial
-	apiErr     *APIError           // provider 4xx/5xx (retryable flag inside)
-	err        error               // transport / watchdog / parse error
-	retryAfter time.Duration       // Retry-After hint when apiErr is a 429
-	learnRetry bool                // learn-once flag set; retry immediately
+	result           *ChatResult         // final (success) or partial (abort/fail)
+	abort            *StreamAbortedError // consumer aborted; result is partial
+	apiErr           *APIError           // provider 4xx/5xx (retryable flag inside)
+	err              error               // transport / watchdog / parse error
+	retryAfter       time.Duration       // Retry-After hint when apiErr is a 429
+	learnRetry       bool                // learn-once flag set; retry immediately
+	bufferedResponse bool                // successful non-SSE body consumed; never regenerate
 }
 
 func (o *streamOutcome) success() bool {
@@ -637,9 +640,18 @@ func (pc *providerClient) attemptStream(ctx context.Context, url string, body []
 	}
 
 	if ct := resp.Header.Get("Content-Type"); !strings.Contains(ct, "text/event-stream") {
-		// Provider answered a streamed request with a regular body.
+		// Learn buffered mode for later requests, but consume this generation
+		// now: discarding it would lose notes and tool calls, and bill twice.
 		pc.learn.forceBuffered.Store(true)
-		return streamOutcome{learnRetry: true, err: errNonSSE}
+		data, err := io.ReadAll(io.LimitReader(resp.Body, maxResponseSize+1))
+		if err != nil {
+			return streamOutcome{bufferedResponse: true, err: err}
+		}
+		if len(data) > maxResponseSize {
+			return streamOutcome{bufferedResponse: true, err: fmt.Errorf("llm: response exceeds %d bytes", maxResponseSize)}
+		}
+		result, err := pc.parseResponse(data, url)
+		return streamOutcome{bufferedResponse: true, result: result, err: err}
 	}
 
 	acc := newStreamAccum()
