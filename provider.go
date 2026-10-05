@@ -34,6 +34,12 @@ type Quirks struct {
 	EchoReasoningWithTools bool
 	// ReasoningEffort: provider accepts reasoning_effort (OpenAI, GLM-5.3+).
 	ReasoningEffort bool
+	// IncludeReasoning: the provider needs the explicit reasoning opt-in
+	// flag on OpenAI-format requests. OpenRouter documents the legacy
+	// `include_reasoning: true` as the equivalent of the canonical
+	// `reasoning: {}` object; without some opt-in such gateways return no
+	// reasoning at all.
+	IncludeReasoning bool
 	// ForceThinking lists model-name prefixes that reject
 	// thinking.type=disabled outright (GLM-5.3 always reasons; the
 	// documented migration is {type: enabled} + reasoning_effort "low").
