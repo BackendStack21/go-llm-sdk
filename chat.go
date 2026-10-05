@@ -412,7 +412,7 @@ func (pc *providerClient) call(ctx context.Context, req *ChatRequest, model stri
 					// GPT-5.6+ (and some 5.4/5.5 payloads) reject
 					// effort+tools on Chat Completions; retry on /responses
 					// so reasoning stays on.
-					pc.learn.forceResponses.Store(true)
+					pc.engageLearn(&pc.learn.forceResponses, LearnResponses, apiErr)
 					lastErr = apiErr
 					if attempt < maxRetries {
 						continue
@@ -422,7 +422,7 @@ func (pc *providerClient) call(ctx context.Context, req *ChatRequest, model stri
 					!pc.learn.forceNoneEffort.Load() && reasoningEffortRejected(apiErr):
 					// Learn the constraint once; retry immediately with
 					// effort pinned to "none".
-					pc.learn.forceNoneEffort.Store(true)
+					pc.engageLearn(&pc.learn.forceNoneEffort, LearnNoneEffort, apiErr)
 					lastErr = apiErr
 					if attempt < maxRetries {
 						continue
@@ -623,16 +623,16 @@ func (pc *providerClient) attemptStream(ctx context.Context, url string, body []
 		e := pc.httpError(resp.StatusCode, data)
 		switch {
 		case streamOptionsRejected(e):
-			pc.learn.dropStreamOptions.Store(true)
+			pc.engageLearn(&pc.learn.dropStreamOptions, LearnDropStreamOpts, e)
 			return streamOutcome{learnRetry: true, apiErr: e}
 		case learnEffort && !pc.learn.forceResponses.Load() && responsesRequired(e):
-			pc.learn.forceResponses.Store(true)
+			pc.engageLearn(&pc.learn.forceResponses, LearnResponses, e)
 			return streamOutcome{learnRetry: true, apiErr: e}
 		case learnEffort && !pc.learn.forceNoneEffort.Load() && reasoningEffortRejected(e):
-			pc.learn.forceNoneEffort.Store(true)
+			pc.engageLearn(&pc.learn.forceNoneEffort, LearnNoneEffort, e)
 			return streamOutcome{learnRetry: true, apiErr: e}
 		case streamRejected(e):
-			pc.learn.forceBuffered.Store(true)
+			pc.engageLearn(&pc.learn.forceBuffered, LearnBuffered, e)
 			return streamOutcome{learnRetry: true, apiErr: e}
 		default:
 			return streamOutcome{apiErr: e, retryAfter: ra}
@@ -642,7 +642,7 @@ func (pc *providerClient) attemptStream(ctx context.Context, url string, body []
 	if ct := resp.Header.Get("Content-Type"); !strings.Contains(ct, "text/event-stream") {
 		// Learn buffered mode for later requests, but consume this generation
 		// now: discarding it would lose notes and tool calls, and bill twice.
-		pc.learn.forceBuffered.Store(true)
+		pc.engageLearn(&pc.learn.forceBuffered, LearnBuffered, nil)
 		data, err := io.ReadAll(io.LimitReader(resp.Body, maxResponseSize+1))
 		if err != nil {
 			return streamOutcome{bufferedResponse: true, err: err}

@@ -106,6 +106,7 @@ type oaRequest struct {
 	Stream              bool             `json:"stream,omitempty"`
 	StreamOptions       *oaStreamOptions `json:"stream_options,omitempty"`
 	ReasoningEffort     string           `json:"reasoning_effort,omitempty"`
+	IncludeReasoning    *bool            `json:"include_reasoning,omitempty"`
 	Thinking            *oaThinking      `json:"thinking,omitempty"`
 }
 
@@ -275,6 +276,12 @@ func buildOpenAIRequest(cfg ProviderConfig, req *ChatRequest, model string, stre
 	default:
 		// Provider accepts neither field (Kimi, plain gateways).
 	}
+	if q.IncludeReasoning {
+		// Gateway reasoning opt-in (OpenRouter legacy form of `reasoning: {}`).
+		// Pointer so the key is absent entirely without the quirk.
+		yes := true
+		out.IncludeReasoning = &yes
+	}
 
 	return out
 }
@@ -302,10 +309,49 @@ type oaRespToolCall struct {
 }
 
 type oaRespMessage struct {
-	Role             string           `json:"role"`
-	Content          string           `json:"content"`
-	ReasoningContent string           `json:"reasoning_content"`
-	ToolCalls        []oaRespToolCall `json:"tool_calls"`
+	Role             string              `json:"role"`
+	Content          string              `json:"content"`
+	ReasoningContent string              `json:"reasoning_content"`
+	Reasoning        string              `json:"reasoning"`
+	ReasoningDetails []oaReasoningDetail `json:"reasoning_details"`
+	ToolCalls        []oaRespToolCall    `json:"tool_calls"`
+}
+
+// oaReasoningDetail is one entry of OpenRouter's reasoning_details array
+// (docs: Reasoning Details API Shape). Only text and summary carry usable
+// prose; encrypted entries are intentionally skipped.
+type oaReasoningDetail struct {
+	Type    string `json:"type"`
+	Text    string `json:"text"`
+	Summary string `json:"summary"`
+}
+
+// foldReasoning reconciles the documented OpenAI-format reasoning response
+// shapes into one string: reasoning_content (LiteLLM standardized) wins, then
+// the reasoning string alias, then the reasoning_details fold in array order
+// (reasoning.text → text, reasoning.summary → summary, encrypted skipped).
+func foldReasoning(content, reasoning string, details []oaReasoningDetail) string {
+	if content != "" {
+		return content
+	}
+	if reasoning != "" {
+		return reasoning
+	}
+	var b strings.Builder
+	for i, d := range details {
+		part := d.Text
+		if part == "" {
+			part = d.Summary
+		}
+		if part == "" {
+			continue
+		}
+		if i > 0 && b.Len() > 0 {
+			b.WriteString("\n")
+		}
+		b.WriteString(part)
+	}
+	return b.String()
 }
 
 type oaRespChoice struct {
@@ -421,7 +467,7 @@ func parseOpenAIResponse(body []byte) (*ChatResult, error) {
 	ch := r.Choices[0]
 	res := &ChatResult{
 		Content:          ch.Message.Content,
-		ReasoningContent: ch.Message.ReasoningContent,
+		ReasoningContent: foldReasoning(ch.Message.ReasoningContent, ch.Message.Reasoning, ch.Message.ReasoningDetails),
 		FinishReason:     mapOpenAIFinishReason(ch.FinishReason),
 	}
 	for _, tc := range ch.Message.ToolCalls {
@@ -440,9 +486,11 @@ func parseOpenAIResponse(body []byte) (*ChatResult, error) {
 // ── streaming ────────────────────────────────────────────────────────────
 
 type oaStreamDelta struct {
-	Content          string             `json:"content"`
-	ReasoningContent string             `json:"reasoning_content"`
-	ToolCalls        []oaStreamToolCall `json:"tool_calls"`
+	Content          string              `json:"content"`
+	ReasoningContent string              `json:"reasoning_content"`
+	Reasoning        string              `json:"reasoning"`
+	ReasoningDetails []oaReasoningDetail `json:"reasoning_details"`
+	ToolCalls        []oaStreamToolCall  `json:"tool_calls"`
 }
 
 type oaStreamToolCall struct {
@@ -476,9 +524,9 @@ func mapOpenAIStreamEvent(data []byte, acc *streamAccum) (deltas []Delta, done b
 	}
 	for _, ch := range c.Choices {
 		d := ch.Delta
-		if d.ReasoningContent != "" {
-			acc.reasoning.WriteString(d.ReasoningContent)
-			deltas = append(deltas, Delta{Kind: DeltaReasoning, Text: d.ReasoningContent})
+		if r := foldReasoning(d.ReasoningContent, d.Reasoning, d.ReasoningDetails); r != "" {
+			acc.reasoning.WriteString(r)
+			deltas = append(deltas, Delta{Kind: DeltaReasoning, Text: r})
 		}
 		if d.Content != "" {
 			acc.content.WriteString(d.Content)
