@@ -308,11 +308,30 @@ type oaRespToolCall struct {
 	} `json:"function"`
 }
 
+// oaFlexString decodes a JSON string tolerantly. Gateways in the wild send
+// the reasoning fields as non-string JSON values (e.g. OpenRouter reasoning
+// objects); a non-string value is skipped (decodes to "") instead of failing
+// the whole response parse. Null decodes to "" as well.
+type oaFlexString string
+
+func (s *oaFlexString) UnmarshalJSON(b []byte) error {
+	if len(b) > 0 && b[0] == '"' {
+		var v string
+		if err := json.Unmarshal(b, &v); err != nil {
+			return err
+		}
+		*s = oaFlexString(v)
+		return nil
+	}
+	*s = "" // null, object, array, number, bool: skipped
+	return nil
+}
+
 type oaRespMessage struct {
 	Role             string              `json:"role"`
 	Content          string              `json:"content"`
-	ReasoningContent string              `json:"reasoning_content"`
-	Reasoning        string              `json:"reasoning"`
+	ReasoningContent oaFlexString        `json:"reasoning_content"`
+	Reasoning        oaFlexString        `json:"reasoning"`
 	ReasoningDetails []oaReasoningDetail `json:"reasoning_details"`
 	ToolCalls        []oaRespToolCall    `json:"tool_calls"`
 }
@@ -338,7 +357,7 @@ func foldReasoning(content, reasoning string, details []oaReasoningDetail) strin
 		return reasoning
 	}
 	var b strings.Builder
-	for i, d := range details {
+	for _, d := range details {
 		part := d.Text
 		if part == "" {
 			part = d.Summary
@@ -346,7 +365,7 @@ func foldReasoning(content, reasoning string, details []oaReasoningDetail) strin
 		if part == "" {
 			continue
 		}
-		if i > 0 && b.Len() > 0 {
+		if b.Len() > 0 {
 			b.WriteString("\n")
 		}
 		b.WriteString(part)
@@ -467,7 +486,7 @@ func parseOpenAIResponse(body []byte) (*ChatResult, error) {
 	ch := r.Choices[0]
 	res := &ChatResult{
 		Content:          ch.Message.Content,
-		ReasoningContent: foldReasoning(ch.Message.ReasoningContent, ch.Message.Reasoning, ch.Message.ReasoningDetails),
+		ReasoningContent: foldReasoning(string(ch.Message.ReasoningContent), string(ch.Message.Reasoning), ch.Message.ReasoningDetails),
 		FinishReason:     mapOpenAIFinishReason(ch.FinishReason),
 	}
 	for _, tc := range ch.Message.ToolCalls {
@@ -487,8 +506,8 @@ func parseOpenAIResponse(body []byte) (*ChatResult, error) {
 
 type oaStreamDelta struct {
 	Content          string              `json:"content"`
-	ReasoningContent string              `json:"reasoning_content"`
-	Reasoning        string              `json:"reasoning"`
+	ReasoningContent oaFlexString        `json:"reasoning_content"`
+	Reasoning        oaFlexString        `json:"reasoning"`
 	ReasoningDetails []oaReasoningDetail `json:"reasoning_details"`
 	ToolCalls        []oaStreamToolCall  `json:"tool_calls"`
 }
@@ -524,7 +543,7 @@ func mapOpenAIStreamEvent(data []byte, acc *streamAccum) (deltas []Delta, done b
 	}
 	for _, ch := range c.Choices {
 		d := ch.Delta
-		if r := foldReasoning(d.ReasoningContent, d.Reasoning, d.ReasoningDetails); r != "" {
+		if r := foldReasoning(string(d.ReasoningContent), string(d.Reasoning), d.ReasoningDetails); r != "" {
 			acc.reasoning.WriteString(r)
 			deltas = append(deltas, Delta{Kind: DeltaReasoning, Text: r})
 		}

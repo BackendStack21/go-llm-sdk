@@ -92,6 +92,9 @@ func TestIncludeReasoningQuirkReachesStreamWire(t *testing.T) {
 	if !strings.Contains(string(bodies[0]), `"include_reasoning":true`) {
 		t.Errorf("stream body missing include_reasoning:true; body: %s", bodies[0])
 	}
+	if !strings.Contains(string(bodies[0]), `"stream":true`) {
+		t.Errorf("stream body missing stream:true (buffered-builder regression); body: %s", bodies[0])
+	}
 }
 
 // ── response side: documented reasoning shapes ────────────────────────────
@@ -157,6 +160,64 @@ func TestParseReasoningContentPrecedence(t *testing.T) {
 	}
 	if res.ReasoningContent != "standard" {
 		t.Errorf("ReasoningContent = %q, want %q", res.ReasoningContent, "standard")
+	}
+}
+
+// Gateways in the wild send `reasoning` as a non-string JSON value (object
+// or array). A tolerant decode must skip those shapes instead of failing
+// the whole request — the field is best-effort, the content is not.
+func TestParseNonStringReasoningDoesNotAbort(t *testing.T) {
+	body := `{"choices":[{"message":{"role":"assistant","content":"ok",` +
+		`"reasoning":{"effort":"high","generated_text":"ignored"},` +
+		`"reasoning_content":null},"finish_reason":"stop"}],"usage":{}}`
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(body))
+	}))
+	defer srv.Close()
+
+	cc := newTestClient(t, ProviderConfig{ID: "openai", Format: FormatOpenAI, BaseURL: srv.URL, APIKey: "k"}, srv)
+	res, err := cc.Call(context.Background(), &ChatRequest{Messages: []Message{{Role: RoleUser, Content: "hi"}}})
+	if err != nil {
+		t.Fatalf("Call: %v (non-string reasoning must not abort the request)", err)
+	}
+	if res.Content != "ok" {
+		t.Errorf("content = %q, want ok", res.Content)
+	}
+	if res.ReasoningContent != "" {
+		t.Errorf("ReasoningContent = %q, want empty (object shape skipped)", res.ReasoningContent)
+	}
+}
+
+// Same tolerance on the streaming path: an object-valued reasoning chunk
+// must be skipped, not kill the stream.
+func TestStreamNonStringReasoningDoesNotAbort(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		sse(w,
+			`{"choices":[{"delta":{"reasoning":{"effort":"high"}}}]}`,
+			`{"choices":[{"delta":{"content":"answer"}}]}`,
+			`{"choices":[{"delta":{},"finish_reason":"stop"}]}`,
+			`[DONE]`,
+		)
+	}))
+	defer srv.Close()
+
+	cc := newTestClient(t, ProviderConfig{ID: "openai", Format: FormatOpenAI, BaseURL: srv.URL, APIKey: "k"}, srv)
+	var content strings.Builder
+	res, err := cc.CallStream(context.Background(), &ChatRequest{Messages: []Message{{Role: RoleUser, Content: "hi"}}}, func(d Delta) error {
+		if d.Kind == DeltaContent {
+			content.WriteString(d.Text)
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("CallStream: %v (object reasoning chunk must be skipped)", err)
+	}
+	if content.String() != "answer" {
+		t.Errorf("content = %q, want answer", content.String())
+	}
+	if res.ReasoningContent != "" {
+		t.Errorf("ReasoningContent = %q, want empty", res.ReasoningContent)
 	}
 }
 
