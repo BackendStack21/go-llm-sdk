@@ -141,12 +141,23 @@ type ToolDef struct {
 	Cache bool
 }
 
-// Usage reports token accounting. Fields the provider does not report stay 0.
-// PromptTokens is exclusive (uncached-only) after provider-specific
-// normalization: OpenAI cached_tokens and DeepSeek hit/miss are subsets of
-// prompt_tokens and are subtracted; Anthropic reports cache volumes
-// exclusively and is left alone. Cache volumes live in the cache fields so
-// budget enforcement can sum without double-counting.
+// Usage reports token accounting with one meaning on every format. Fields
+// the provider does not report stay 0.
+//
+//   - PromptTokens is uncached input only. Inclusive provider counts
+//     (OpenAI cached_tokens, DeepSeek prompt_cache_hit_tokens, Gemini
+//     cachedContentTokenCount) are subtracted and moved to CacheReadTokens;
+//     Anthropic reports cache volumes exclusively and is left alone.
+//   - CacheReadTokens / CacheCreationTokens are cache reads and cache
+//     writes. A DeepSeek cache miss is ordinary input (billed as such), not
+//     a write, so it stays in PromptTokens.
+//   - CompletionTokens counts every generated token, reasoning included
+//     (Gemini's candidatesTokenCount excludes thoughts, so they are added);
+//     ReasoningTokens is the reasoning subset.
+//   - CachedTokens is the raw provider-reported cached count, kept for
+//     diagnostics. It is already included in CacheReadTokens — never add it.
+//
+// Sum with InputTokens and TotalTokens rather than by hand.
 type Usage struct {
 	PromptTokens        int
 	CompletionTokens    int
@@ -156,6 +167,15 @@ type Usage struct {
 	CachedTokens        int
 	CacheReported       bool
 }
+
+// InputTokens is the full input volume: uncached prompt plus cache reads
+// and writes.
+func (u Usage) InputTokens() int {
+	return u.PromptTokens + u.CacheReadTokens + u.CacheCreationTokens
+}
+
+// TotalTokens is InputTokens plus CompletionTokens.
+func (u Usage) TotalTokens() int { return u.InputTokens() + u.CompletionTokens }
 
 // ChatRequest is the canonical request. Model is filled from the ChatClient
 // when empty. Thinking accepts "", "enabled", "disabled", "low", "medium",

@@ -421,21 +421,21 @@ func usageFromOpenAI(u *oaRespUsage) Usage {
 	if u.CacheCreationTokens > 0 || u.CacheReadTokens > 0 {
 		out.CacheReported = true
 	}
-	// DeepSeek native fields: a hit is prompt content read from cache; a
-	// miss is newly processed content that DeepSeek then caches for
-	// future requests, i.e. a cache write.
-	if u.PromptCacheHitTokens > 0 || u.PromptCacheMissTokens > 0 {
-		out.CacheReadTokens += u.PromptCacheHitTokens
-		out.CacheCreationTokens += u.PromptCacheMissTokens
+	switch {
+	case u.PromptCacheHitTokens > 0 || u.PromptCacheMissTokens > 0:
+		// DeepSeek native fields (authoritative when present; DeepSeek may
+		// echo the hit count as cached_tokens too). A hit is prompt content
+		// read from cache; a miss is ordinary uncached input and stays in
+		// PromptTokens. Guarded so hostile payloads never go negative.
 		out.CacheReported = true
-	}
-	if u.PromptTokensDetails != nil && u.PromptTokensDetails.CachedTokens > 0 &&
-		u.PromptTokensDetails.CachedTokens <= out.PromptTokens {
+		if hit := u.PromptCacheHitTokens; hit <= out.PromptTokens {
+			out.PromptTokens -= hit
+			out.CacheReadTokens += hit
+		}
+	case u.PromptTokensDetails != nil && u.PromptTokensDetails.CachedTokens > 0 &&
+		u.PromptTokensDetails.CachedTokens <= out.PromptTokens:
 		out.PromptTokens -= u.PromptTokensDetails.CachedTokens
 		out.CacheReadTokens += u.PromptTokensDetails.CachedTokens
-	}
-	if total := u.PromptCacheHitTokens + u.PromptCacheMissTokens; total > 0 && total <= out.PromptTokens {
-		out.PromptTokens -= total
 	}
 	return out
 }

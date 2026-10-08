@@ -268,6 +268,9 @@ type gmUsage struct {
 	PromptTokenCount     int `json:"promptTokenCount"`
 	CandidatesTokenCount int `json:"candidatesTokenCount"`
 	ThoughtsTokenCount   int `json:"thoughtsTokenCount"`
+	// CachedContentTokenCount is a subset of PromptTokenCount; nil when the
+	// provider did not report caching.
+	CachedContentTokenCount *int `json:"cachedContentTokenCount"`
 }
 
 type gmResponse struct {
@@ -303,12 +306,25 @@ func geminiFinish(reason string, hasCalls bool) string {
 	return f
 }
 
+// mapGeminiUsage normalizes usageMetadata: cached content is a subset of
+// promptTokenCount (moved to CacheReadTokens) and candidatesTokenCount
+// excludes thoughts (added, so CompletionTokens includes reasoning as on
+// every other format).
 func mapGeminiUsage(u gmUsage) Usage {
-	return Usage{
+	out := Usage{
 		PromptTokens:     u.PromptTokenCount,
-		CompletionTokens: u.CandidatesTokenCount,
+		CompletionTokens: u.CandidatesTokenCount + u.ThoughtsTokenCount,
 		ReasoningTokens:  u.ThoughtsTokenCount,
 	}
+	if c := u.CachedContentTokenCount; c != nil {
+		out.CacheReported = true
+		out.CachedTokens = *c
+		if *c > 0 && *c <= out.PromptTokens {
+			out.PromptTokens -= *c
+			out.CacheReadTokens = *c
+		}
+	}
+	return out
 }
 
 // foldGeminiParts folds response parts into acc, emitting deltas for new

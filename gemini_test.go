@@ -225,7 +225,7 @@ func TestMapGeminiStreamEvent_Chunks(t *testing.T) {
 	if res.FinishReason != FinishToolCalls { // STOP with a function call is a tool turn
 		t.Errorf("finish = %q", res.FinishReason)
 	}
-	if res.Usage.CompletionTokens != 3 {
+	if res.Usage.CompletionTokens != 3+2 { // candidates + thoughts (last chunk wins)
 		t.Errorf("usage = %+v (last chunk wins)", res.Usage)
 	}
 }

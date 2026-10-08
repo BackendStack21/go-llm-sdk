@@ -419,9 +419,7 @@ type anStreamEvent struct {
 		PartialJSON string `json:"partial_json"`
 	} `json:"delta"`
 	// message_delta usage (top-level sibling of delta)
-	Usage struct {
-		OutputTokens int `json:"output_tokens"`
-	} `json:"usage"`
+	Usage anUsage `json:"usage"` // message_delta: cumulative counts
 	// error
 	Error *struct {
 		Type    string `json:"type"`
@@ -486,7 +484,20 @@ func mapAnthropicStreamEvent(data []byte, acc *streamAccum) ([]Delta, bool, erro
 			acc.finishReason = mapAnthropicStopReason(ev.Delta.StopReason)
 			acc.sawFinish = true
 		}
+		// message_delta usage is cumulative. Output is always present; input
+		// and cache volumes may only arrive here, so non-zero values win.
 		acc.usage.CompletionTokens = ev.Usage.OutputTokens
+		if ev.Usage.InputTokens > 0 {
+			acc.usage.PromptTokens = ev.Usage.InputTokens
+		}
+		if ev.Usage.CacheReadTokens > 0 {
+			acc.usage.CacheReadTokens = ev.Usage.CacheReadTokens
+			acc.usage.CacheReported = true
+		}
+		if ev.Usage.CacheCreationTokens > 0 {
+			acc.usage.CacheCreationTokens = ev.Usage.CacheCreationTokens
+			acc.usage.CacheReported = true
+		}
 	case "message_stop":
 		return deltas, true, nil
 	case "error":
