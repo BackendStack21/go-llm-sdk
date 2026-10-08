@@ -157,16 +157,14 @@ func TestPumpSSE_HandlerErrorStops(t *testing.T) {
 }
 
 func TestPumpSSE_IdleTimeout(t *testing.T) {
-	old := streamIdleTimeout
-	streamIdleTimeout = 30 * time.Millisecond
-	defer func() { streamIdleTimeout = old }()
+	setIdleForTest(t, 30*time.Millisecond)
 
 	// A reader that never produces events.
 	r, w := io.Pipe()
 	defer r.Close()
 	defer w.Close()
 	start := time.Now()
-	err := pumpSSE(context.Background(), r, streamIdleTimeout, func([]byte) error { return nil })
+	err := pumpSSE(context.Background(), r, StreamIdleTimeout(), func([]byte) error { return nil })
 	if err != ErrIdleTimeout {
 		t.Fatalf("err = %v, want ErrIdleTimeout", err)
 	}
@@ -176,9 +174,7 @@ func TestPumpSSE_IdleTimeout(t *testing.T) {
 }
 
 func TestPumpSSE_KeepaliveResetsIdle(t *testing.T) {
-	old := streamIdleTimeout
-	streamIdleTimeout = 60 * time.Millisecond
-	defer func() { streamIdleTimeout = old }()
+	setIdleForTest(t, 60*time.Millisecond)
 
 	r, w := io.Pipe()
 	defer r.Close()
@@ -192,7 +188,7 @@ func TestPumpSSE_KeepaliveResetsIdle(t *testing.T) {
 		w.Close()
 	}()
 	var got []string
-	if err := pumpSSE(context.Background(), r, streamIdleTimeout, func(d []byte) error {
+	if err := pumpSSE(context.Background(), r, StreamIdleTimeout(), func(d []byte) error {
 		got = append(got, string(d))
 		return nil
 	}); err != nil {

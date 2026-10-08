@@ -75,5 +75,9 @@ func (pc *providerClient) engageLearn(flag *atomic.Bool, kind LearnKind, apiErr 
 		ev.Status = apiErr.Status
 		ev.Message = apiErr.Message
 	}
+	if pc.opts.observer != nil {
+		pc.opts.observer(ev)
+		return
+	}
 	notifyLearn(ev)
 }

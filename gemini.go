@@ -422,7 +422,7 @@ type gmModelsPage struct {
 func listModelsGemini(ctx context.Context, pc *providerClient) ([]Model, error) {
 	var out []Model
 	pageToken := ""
-	for page := 0; page < 10; page++ {
+	for page := 0; page < maxModelPages; page++ {
 		url := pc.base + "/v1beta/models?pageSize=100"
 		if pageToken != "" {
 			url += "&pageToken=" + neturl.QueryEscape(pageToken)
@@ -433,7 +433,7 @@ func listModelsGemini(ctx context.Context, pc *providerClient) ([]Model, error) 
 		}
 		var p gmModelsPage
 		if err := json.Unmarshal(data, &p); err != nil {
-			return nil, fmt.Errorf("llm: parse models response: %w", err)
+			return nil, terminal(fmt.Errorf("llm: parse models response: %w", err))
 		}
 		for _, m := range p.Models {
 			out = append(out, Model{
@@ -449,5 +449,5 @@ func listModelsGemini(ctx context.Context, pc *providerClient) ([]Model, error) 
 		}
 		pageToken = p.NextPageToken
 	}
-	return out, nil
+	return nil, fmt.Errorf("%w (%d pages)", ErrModelListTruncated, maxModelPages)
 }

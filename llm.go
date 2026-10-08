@@ -2,6 +2,7 @@ package llm
 
 import (
 	"context"
+	"errors"
 	"net/http"
 	"strings"
 	"sync"
@@ -22,6 +23,21 @@ type SDK struct {
 	timeout   time.Duration
 	cacheTTL  time.Duration
 	rt        http.RoundTripper
+	retry     RetryPolicy
+	idle      time.Duration
+	observer  func(LearnEvent)
+}
+
+// clientOpts snapshots the SDK-level knobs every provider client honors.
+func (s *SDK) clientOpts() clientOpts {
+	return clientOpts{retry: s.retry, idle: s.idle, observer: s.observer}
+}
+
+// newClient builds a provider client for p with the SDK's settings.
+func (s *SDK) newClient(p *Provider, timeout time.Duration, learn *learnOnce) *providerClient {
+	pc := newProviderClientWithLearn(p.cfg, newBufferedHTTP(s.rt, timeout), newStreamHTTP(s.rt), learn)
+	pc.opts = s.clientOpts()
+	return pc
 }
 
 // Option configures an SDK at construction time.
@@ -202,7 +218,7 @@ func (s *SDK) Chat(providerID, model string) (*ChatClient, error) {
 	}
 	p.chatLearnOnce.Do(func() { p.chatLearn = &learnOnce{} })
 	return &ChatClient{
-		pc:     newProviderClientWithLearn(p.cfg, newBufferedHTTP(p.sdk.rt, p.sdk.timeout), newStreamHTTP(p.sdk.rt), p.chatLearn),
+		pc:     p.sdk.newClient(p, p.sdk.timeout, p.chatLearn),
 		model:  model,
 		parent: p,
 	}, nil
@@ -227,6 +243,7 @@ type Provider struct {
 	mu       sync.Mutex
 	cached   []Model
 	cachedAt time.Time
+	flight   *modelFlight // in-progress listing shared by concurrent callers
 }
 
 // ID returns the provider's registry id.
@@ -273,18 +290,58 @@ func (p *Provider) ListModels(ctx context.Context, opts ...ListOption) ([]Model,
 		return nil, &ConfigError{Msg: p.cfg.ID + " has no API key"}
 	}
 	p.clientOnce.Do(func() {
-		p.listClient = newProviderClient(p.cfg, newBufferedHTTP(p.sdk.rt, 30*time.Second), newStreamHTTP(p.sdk.rt))
+		p.listClient = p.sdk.newClient(p, 30*time.Second, nil)
 	})
-	models, err := p.listClient.listModels(ctx)
+	models, err := p.fetchModels(ctx)
 	if err != nil {
 		return nil, err
 	}
-	p.mu.Lock()
-	p.cached, p.cachedAt = models, time.Now()
-	p.mu.Unlock()
 	out := make([]Model, len(models))
 	copy(out, models)
 	return out, nil
+}
+
+// modelFlight is one in-progress upstream model listing that concurrent
+// callers share.
+type modelFlight struct {
+	done   chan struct{}
+	models []Model
+	err    error
+}
+
+// fetchModels fetches the listing once for all concurrent callers (a cold
+// cache never stampedes the provider) and refreshes the cache on success.
+// A follower whose leader died with the leader's own context error fetches
+// again under its own context instead of inheriting that cancellation.
+func (p *Provider) fetchModels(ctx context.Context) ([]Model, error) {
+	for {
+		p.mu.Lock()
+		if f := p.flight; f != nil {
+			p.mu.Unlock()
+			select {
+			case <-f.done:
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			}
+			if f.err != nil && (errors.Is(f.err, context.Canceled) || errors.Is(f.err, context.DeadlineExceeded)) && ctx.Err() == nil {
+				continue
+			}
+			return f.models, f.err
+		}
+		f := &modelFlight{done: make(chan struct{})}
+		p.flight = f
+		p.mu.Unlock()
+
+		f.models, f.err = p.listClient.listModels(ctx)
+		p.mu.Lock()
+		p.flight = nil
+		if f.err == nil {
+			p.cached, p.cachedAt = f.models, time.Now()
+		}
+		p.mu.Unlock()
+		close(f.done)
+		return f.models, f.err
+	}
 }
 
 // ── ChatClient ───────────────────────────────────────────────────────────
@@ -331,3 +388,25 @@ func (c *ChatClient) CallStream(ctx context.Context, req *ChatRequest, onDelta f
 	}
 	return c.pc.callStream(ctx, req, c.model, onDelta)
 }
+
+// WithRetryPolicy replaces the default retry ladder (8 attempts, 30s
+// backoff cap) for every chat, speech, transcription and embedding call
+// made through this SDK. Zero fields keep their defaults.
+func WithRetryPolicy(p RetryPolicy) Option { return func(s *SDK) { s.retry = p } }
+
+// WithStreamIdleTimeout sets the SSE idle watchdog for this SDK's streams,
+// taking precedence over the process-wide SetStreamIdleTimeout default.
+// Non-positive values are ignored.
+func WithStreamIdleTimeout(d time.Duration) Option {
+	return func(s *SDK) {
+		if d > 0 {
+			s.idle = d
+		}
+	}
+}
+
+// WithLearnObserver registers a callback fired once per learn-once fallback
+// engaged by this SDK's providers. When set it replaces the process-wide
+// SetLearnObserver callback for this SDK. It runs on the request goroutine:
+// keep it fast and never call back into the SDK from it.
+func WithLearnObserver(fn func(LearnEvent)) Option { return func(s *SDK) { s.observer = fn } }

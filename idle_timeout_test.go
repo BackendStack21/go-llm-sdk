@@ -10,7 +10,7 @@ import (
 // the watchdog by accident.
 func TestSetStreamIdleTimeout(t *testing.T) {
 	orig := StreamIdleTimeout()
-	t.Cleanup(func() { streamIdleTimeout = orig })
+	t.Cleanup(func() { SetStreamIdleTimeout(orig) })
 
 	SetStreamIdleTimeout(5 * time.Second)
 	if got := StreamIdleTimeout(); got != 5*time.Second {

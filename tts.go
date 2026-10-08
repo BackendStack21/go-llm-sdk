@@ -5,7 +5,6 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -61,7 +60,7 @@ func (s *SDK) Speak(ctx context.Context, providerID, model string, req SpeakRequ
 	if p.invalid {
 		return nil, &ConfigError{Msg: providerID + " has an invalid configuration"}
 	}
-	pc := newProviderClient(p.cfg, newBufferedHTTP(s.rt, s.timeout), nil)
+	pc := s.newClient(p, s.timeout, nil)
 	return pc.speak(ctx, model, req)
 }
 
@@ -93,8 +92,9 @@ func (pc *providerClient) buildSpeakRequest(model string, req SpeakRequest) ([]b
 	}
 }
 
-// speak runs the TTS request against one provider with retry semantics
-// identical to the buffered chat path (binary body, no SSE).
+// speak runs the TTS request against one provider with the shared retry
+// ladder and whole-call budget of the buffered chat path (binary body, no
+// SSE).
 func (pc *providerClient) speak(ctx context.Context, model string, req SpeakRequest) (*SpeakResult, error) {
 	body, url, mimeHint, err := pc.buildSpeakRequest(model, req)
 	if err != nil {
@@ -102,54 +102,13 @@ func (pc *providerClient) speak(ctx context.Context, model string, req SpeakRequ
 	}
 	gemini := pc.cfg.Format == FormatGemini
 
-	var (
-		lastErr error
-		rateErr *APIError
-		rateRA  time.Duration
-	)
-	for attempt := 0; attempt <= maxRetries; attempt++ {
-		if err := ctx.Err(); err != nil {
-			return nil, err
-		}
+	ctx, cancel := context.WithTimeout(ctx, pc.requestTimeout())
+	defer cancel()
+	var res *SpeakResult
+	err = pc.withRetry(ctx, func() (time.Duration, error) {
 		data, ctype, ra, err := pc.postAudio(ctx, url, body)
 		if err != nil {
-			var apiErr *APIError
-			if errors.As(err, &apiErr) {
-				switch {
-				case apiErr.Status == http.StatusTooManyRequests && billingExhausted(apiErr):
-					return nil, apiErr
-				case apiErr.Status == http.StatusTooManyRequests:
-					rateErr, rateRA, lastErr = apiErr, ra, apiErr
-					if attempt < maxRetries {
-						if !retrySleep(ctx, retryDelay(ra, attempt)) {
-							return nil, &RateLimitError{APIError: *rateErr, Attempts: attempt + 1, RetryAfter: rateRA}
-						}
-						continue
-					}
-				case apiErr.Retryable && attempt < maxRetries:
-					lastErr = apiErr
-					if !retrySleep(ctx, retryDelay(ra, attempt)) {
-						return nil, ctx.Err()
-					}
-					continue
-				}
-				if rateErr != nil && !apiErr.Retryable && apiErr.Status != http.StatusTooManyRequests {
-					return nil, apiErr
-				}
-				if rateErr != nil {
-					return nil, &RateLimitError{APIError: *rateErr, Attempts: attempt + 1, RetryAfter: rateRA}
-				}
-				return nil, apiErr
-			}
-			// Transport error — retryable.
-			lastErr = err
-			if attempt < maxRetries {
-				if !retrySleep(ctx, retryDelay(0, attempt)) {
-					return nil, ctx.Err()
-				}
-				continue
-			}
-			return nil, fmt.Errorf("llm: retry exhausted (%d attempts): %w", maxRetries+1, err)
+			return ra, err
 		}
 		if gemini {
 			audio, mime, perr := parseGeminiSpeakResponse(data)
@@ -157,11 +116,11 @@ func (pc *providerClient) speak(ctx context.Context, model string, req SpeakRequ
 				// 2xx with no audio parts is a provider protocol
 				// failure — surface it through the typed error
 				// taxonomy (APIError at the actual HTTP status).
-				return nil, &APIError{
+				return 0, terminal(&APIError{
 					Provider: pc.cfg.ID,
 					Status:   http.StatusOK,
 					Message:  perr.Error(),
-				}
+				})
 			}
 			data, ctype = audio, mime
 		} else if strings.HasPrefix(strings.TrimSpace(ctype), "application/json") {
@@ -169,15 +128,19 @@ func (pc *providerClient) speak(ctx context.Context, model string, req SpeakRequ
 			// JSON error envelope. Never hand JSON bytes back as
 			// audio: parse the envelope through the shared httpError
 			// path.
-			return nil, pc.httpError(http.StatusOK, data)
+			return 0, terminal(pc.httpError(http.StatusOK, data))
 		}
-		return &SpeakResult{
+		res = &SpeakResult{
 			Audio:    data,
 			Model:    model,
 			MIMEType: resolveAudioMIME(ctype, mimeHint),
-		}, nil
+		}
+		return 0, nil
+	}, nil)
+	if err != nil {
+		return nil, err
 	}
-	return nil, lastErr
+	return res, nil
 }
 
 // resolveAudioMIME prefers the provider's Content-Type; when absent it

@@ -519,7 +519,7 @@ type anModelsPage struct {
 func listModelsAnthropic(ctx context.Context, pc *providerClient) ([]Model, error) {
 	var out []Model
 	pageID := ""
-	for page := 0; page < 10; page++ {
+	for page := 0; page < maxModelPages; page++ {
 		url := pc.base + "/v1/models?limit=100"
 		if pageID != "" {
 			url += "&after_id=" + neturl.QueryEscape(pageID)
@@ -530,7 +530,7 @@ func listModelsAnthropic(ctx context.Context, pc *providerClient) ([]Model, erro
 		}
 		var p anModelsPage
 		if err := json.Unmarshal(data, &p); err != nil {
-			return nil, fmt.Errorf("llm: parse models response: %w", err)
+			return nil, terminal(fmt.Errorf("llm: parse models response: %w", err))
 		}
 		for _, m := range p.Data {
 			mm := Model{ID: m.ID, DisplayName: m.DisplayName}
@@ -544,5 +544,5 @@ func listModelsAnthropic(ctx context.Context, pc *providerClient) ([]Model, erro
 		}
 		pageID = p.LastID
 	}
-	return out, nil
+	return nil, fmt.Errorf("%w (%d pages)", ErrModelListTruncated, maxModelPages)
 }

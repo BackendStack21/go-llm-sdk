@@ -47,6 +47,23 @@ type providerClient struct {
 	streamHTTP *http.Client                // no deadline; SSE body reads
 	base       string                      // trimmed base URL
 	learn      *learnOnce                  // shared learn-once fallback state
+	opts       clientOpts                  // SDK-level knobs (retry, idle, observer)
+}
+
+// clientOpts carries SDK-level settings into a providerClient.
+type clientOpts struct {
+	retry    RetryPolicy
+	idle     time.Duration    // SSE idle watchdog; 0 = process default
+	observer func(LearnEvent) // learn-once observer; nil = process default
+}
+
+// retryDelay picks Retry-After when present, else the policy's capped
+// exponential backoff.
+func (pc *providerClient) retryDelay(ra time.Duration, attempt int) time.Duration {
+	if ra > 0 {
+		return ra
+	}
+	return backoffDelayCapped(attempt+1, pc.opts.retry.backoffCap())
 }
 
 // buffered returns the current buffered-path HTTP client.
@@ -81,23 +98,35 @@ const (
 	maxErrorBodyPreview   = 512      // bytes of error body kept in APIError
 )
 
-// streamIdleTimeout bounds the silence between SSE events. Thinking models
-// can legitimately spend minutes before their first event, so the default
-// is generous. Package var so tests can shorten it; operators override
-// via SetStreamIdleTimeout.
-var streamIdleTimeout = 120 * time.Second
+// defaultStreamIdleNs bounds the silence between SSE events, process-wide,
+// for SDKs without WithStreamIdleTimeout. Thinking models can legitimately
+// spend minutes before their first event, so the default is generous.
+// Atomic so SetStreamIdleTimeout is safe while streams are running.
+var defaultStreamIdleNs atomic.Int64
 
-// SetStreamIdleTimeout overrides the SSE idle watchdog. Call at startup,
-// before the first request; non-positive values are ignored.
+func init() { defaultStreamIdleNs.Store(int64(120 * time.Second)) }
+
+// SetStreamIdleTimeout overrides the process-wide default SSE idle
+// watchdog; non-positive values are ignored. Prefer the per-SDK
+// WithStreamIdleTimeout option, which takes precedence.
 func SetStreamIdleTimeout(d time.Duration) {
 	if d > 0 {
-		streamIdleTimeout = d
+		defaultStreamIdleNs.Store(int64(d))
 	}
 }
 
-// StreamIdleTimeout reports the active idle watchdog (introspection/tests).
+// StreamIdleTimeout reports the process-wide default idle watchdog.
 func StreamIdleTimeout() time.Duration {
-	return streamIdleTimeout
+	return time.Duration(defaultStreamIdleNs.Load())
+}
+
+// idleTimeout resolves this client's SSE idle watchdog: the SDK option when
+// set, else the process-wide default.
+func (pc *providerClient) idleTimeout() time.Duration {
+	if pc.opts.idle > 0 {
+		return pc.opts.idle
+	}
+	return StreamIdleTimeout()
 }
 
 // errStreamStop is the internal sentinel for a clean stream end.
@@ -360,104 +389,55 @@ func billingExhausted(e *APIError) bool {
 		strings.Contains(m, "exceeded your current quota")
 }
 
-// retryDelay picks Retry-After when present, else exponential backoff.
-func retryDelay(ra time.Duration, attempt int) time.Duration {
-	if ra > 0 {
-		return ra
-	}
-	return backoffDelay(attempt + 1)
-}
-
 // ── buffered chat ────────────────────────────────────────────────────────
 
-// call runs a buffered chat completion with retries.
+// call runs a buffered chat completion with retries. The request timeout
+// is the wall-clock budget of the whole call, retries included — the same
+// contract as streaming — so a failing provider can never hold a caller for
+// timeout × attempts.
 func (pc *providerClient) call(ctx context.Context, req *ChatRequest, model string) (*ChatResult, error) {
-	var (
-		lastErr error
-		rateErr *APIError // last 429
-		rateRA  time.Duration
-	)
-	for attempt := 0; attempt <= maxRetries; attempt++ {
-		if err := ctx.Err(); err != nil {
-			return nil, err
-		}
+	ctx, cancel := context.WithTimeout(ctx, pc.requestTimeout())
+	defer cancel()
+	var res *ChatResult
+	err := pc.withRetry(ctx, func() (time.Duration, error) {
 		body, url, err := pc.buildChatRequest(req, model, false)
 		if err != nil {
-			return nil, err
+			return 0, terminal(err)
 		}
 		data, ra, err := pc.post(ctx, pc.buffered(), url, body)
 		if err != nil {
-			var apiErr *APIError
-			if errors.As(err, &apiErr) {
-				switch {
-				case apiErr.Status == http.StatusTooManyRequests:
-					if billingExhausted(apiErr) {
-						// Permanent: only a recharge fixes this.
-						return nil, apiErr
-					}
-					rateErr, rateRA, lastErr = apiErr, ra, apiErr
-					if attempt < maxRetries {
-						if !retrySleep(ctx, retryDelay(ra, attempt)) {
-							// The sleep died with the context (deadline or
-							// cancel); still surface the 429 — the caller
-							// needs Status/RetryAfter to plan the retry.
-							return nil, &RateLimitError{APIError: *rateErr, Attempts: attempt + 1, RetryAfter: rateRA}
-						}
-						continue
-					}
-				case apiErr.Retryable && attempt < maxRetries:
-					lastErr = apiErr
-					if !retrySleep(ctx, retryDelay(ra, attempt)) {
-						return nil, ctx.Err()
-					}
-					continue
-				case apiErr.Status == http.StatusBadRequest && len(req.Tools) > 0 &&
-					!pc.learn.forceResponses.Load() && responsesRequired(apiErr):
-					// GPT-5.6+ (and some 5.4/5.5 payloads) reject
-					// effort+tools on Chat Completions; retry on /responses
-					// so reasoning stays on.
-					pc.engageLearn(&pc.learn.forceResponses, LearnResponses, apiErr)
-					lastErr = apiErr
-					if attempt < maxRetries {
-						continue
-					}
-					return nil, apiErr
-				case apiErr.Status == http.StatusBadRequest && len(req.Tools) > 0 &&
-					!pc.learn.forceNoneEffort.Load() && reasoningEffortRejected(apiErr):
-					// Learn the constraint once; retry immediately with
-					// effort pinned to "none".
-					pc.engageLearn(&pc.learn.forceNoneEffort, LearnNoneEffort, apiErr)
-					lastErr = apiErr
-					if attempt < maxRetries {
-						continue
-					}
-					return nil, apiErr
-				}
-				if rateErr != nil && !apiErr.Retryable && apiErr.Status != http.StatusTooManyRequests {
-					// A definitive failure after earlier 429s.
-					return nil, apiErr
-				}
-				if rateErr != nil {
-					return nil, &RateLimitError{APIError: *rateErr, Attempts: attempt + 1, RetryAfter: rateRA}
-				}
-				return nil, apiErr
-			}
-			// Transport error — retryable.
-			lastErr = err
-			if attempt < maxRetries {
-				if !retrySleep(ctx, retryDelay(0, attempt)) {
-					return nil, ctx.Err()
-				}
-				continue
-			}
-			return nil, fmt.Errorf("llm: retry exhausted (%d attempts): %w", maxRetries+1, err)
+			return ra, err
 		}
-		return pc.parseResponse(data, url)
+		res, err = pc.parseResponse(data, url)
+		return 0, terminal(err)
+	}, func(apiErr *APIError) bool {
+		return pc.learnFromChatError(req, apiErr)
+	})
+	if err != nil {
+		return nil, err
 	}
-	if rateErr != nil {
-		return nil, &RateLimitError{APIError: *rateErr, Attempts: maxRetries + 1, RetryAfter: rateRA}
+	return res, nil
+}
+
+// learnFromChatError engages the buffered path's learn-once fallbacks for
+// a 400 and reports whether the request should be retried immediately.
+func (pc *providerClient) learnFromChatError(req *ChatRequest, apiErr *APIError) bool {
+	if apiErr.Status != http.StatusBadRequest || len(req.Tools) == 0 {
+		return false
 	}
-	return nil, fmt.Errorf("llm: retry exhausted (%d attempts): %w", maxRetries+1, lastErr)
+	switch {
+	case !pc.learn.forceResponses.Load() && responsesRequired(apiErr):
+		// GPT-5.6+ (and some 5.4/5.5 payloads) reject effort+tools on Chat
+		// Completions; retry on /responses so reasoning stays on.
+		pc.engageLearn(&pc.learn.forceResponses, LearnResponses, apiErr)
+		return true
+	case !pc.learn.forceNoneEffort.Load() && reasoningEffortRejected(apiErr):
+		// Learn the constraint once; retry immediately with effort pinned
+		// to "none".
+		pc.engageLearn(&pc.learn.forceNoneEffort, LearnNoneEffort, apiErr)
+		return true
+	}
+	return false
 }
 
 // parseResponse dispatches format-specific buffered parsing.
@@ -503,12 +483,13 @@ func (pc *providerClient) callStream(ctx context.Context, req *ChatRequest, mode
 	defer cancel()
 
 	mapper := pc.mapper()
+	n := pc.opts.retry.attempts()
 	var (
 		lastErr error
 		rateErr *APIError
 		rateRA  time.Duration
 	)
-	for attempt := 0; attempt <= maxRetries; attempt++ {
+	for attempt := 0; attempt < n; attempt++ {
 		if err := deadlineCtx.Err(); err != nil {
 			break
 		}
@@ -546,7 +527,7 @@ func (pc *providerClient) callStream(ctx context.Context, req *ChatRequest, mode
 			} else if out.err != nil {
 				lastErr = out.err
 			}
-			if attempt < maxRetries {
+			if attempt < n-1 {
 				continue
 			}
 			// Learn trigger fired on the final attempt: surface the cause
@@ -557,7 +538,7 @@ func (pc *providerClient) callStream(ctx context.Context, req *ChatRequest, mode
 				rateErr, rateRA = out.apiErr, out.retryAfter
 			}
 			lastErr = out.apiErr
-			if attempt < maxRetries && retrySleep(deadlineCtx, retryDelay(out.retryAfter, attempt)) {
+			if attempt < n-1 && retrySleep(deadlineCtx, pc.retryDelay(out.retryAfter, attempt)) {
 				continue
 			}
 			if rateErr != nil {
@@ -566,9 +547,9 @@ func (pc *providerClient) callStream(ctx context.Context, req *ChatRequest, mode
 			return nil, out.apiErr
 		case out.apiErr != nil:
 			return nil, out.apiErr
-		case out.err != nil && attempt < maxRetries:
+		case out.err != nil && attempt < n-1:
 			lastErr = out.err
-			if retrySleep(deadlineCtx, retryDelay(0, attempt)) {
+			if retrySleep(deadlineCtx, pc.retryDelay(0, attempt)) {
 				continue
 			}
 			if err := deadlineCtx.Err(); err != nil {
@@ -580,10 +561,10 @@ func (pc *providerClient) callStream(ctx context.Context, req *ChatRequest, mode
 		}
 	}
 	if rateErr != nil {
-		return nil, &RateLimitError{APIError: *rateErr, Attempts: maxRetries + 1, RetryAfter: rateRA}
+		return nil, &RateLimitError{APIError: *rateErr, Attempts: n, RetryAfter: rateRA}
 	}
 	if lastErr != nil {
-		return nil, fmt.Errorf("llm: retry exhausted (%d attempts): %w", maxRetries+1, lastErr)
+		return nil, fmt.Errorf("llm: retry exhausted (%d attempts): %w", n, lastErr)
 	}
 	return nil, deadlineCtx.Err()
 }
@@ -659,7 +640,7 @@ func (pc *providerClient) attemptStream(ctx context.Context, url string, body []
 	}
 
 	acc := newStreamAccum()
-	perr := pumpSSE(ctx, resp.Body, streamIdleTimeout, func(data []byte) error {
+	perr := pumpSSE(ctx, resp.Body, pc.idleTimeout(), func(data []byte) error {
 		if string(bytes.TrimSpace(data)) == "[DONE]" {
 			return errStreamStop
 		}
@@ -748,15 +729,12 @@ type streamAccum struct {
 	usage             Usage
 	emitted           bool   // any delta delivered to the consumer
 	thinkingSignature string // legacy single signature (last block's)
-	jsonTool          string // Anthropic JSON-mode synthetic tool name ("" = off)
-	jsonBlock         int    // content-block index of the JSON-mode tool_use (-1 = none)
 }
 
 func newStreamAccum() *streamAccum {
 	return &streamAccum{
 		callIndex:     make(map[int]*toolCallAccum),
 		thinkingIndex: make(map[int]*thinkingAccum),
-		jsonBlock:     -1,
 	}
 }
 
