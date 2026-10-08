@@ -50,15 +50,9 @@ func (s *SDK) Speak(ctx context.Context, providerID, model string, req SpeakRequ
 	if strings.TrimSpace(req.Voice) == "" {
 		return nil, &ConfigError{Msg: "speak request requires a Voice (both supported wire formats require one server-side)"}
 	}
-	p, err := s.Provider(providerID)
+	p, err := s.usableProvider(providerID)
 	if err != nil {
 		return nil, err
-	}
-	if !p.Authenticated() {
-		return nil, &ConfigError{Msg: providerID + " has no API key (set " + strings.ToUpper(providerID) + "_API_KEY or use WithAPIKey)"}
-	}
-	if p.invalid {
-		return nil, &ConfigError{Msg: providerID + " has an invalid configuration"}
 	}
 	pc := s.newClient(p, s.timeout, nil)
 	return pc.speak(ctx, model, req)

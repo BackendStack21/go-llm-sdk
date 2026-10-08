@@ -43,9 +43,10 @@ type anBlock struct {
 	ID    string          `json:"id,omitempty"`
 	Name  string          `json:"name,omitempty"`
 	Input json.RawMessage `json:"input,omitempty"`
-	// tool_result (string content form)
+	// tool_result: string content, or text/image blocks
 	ToolUseID string `json:"tool_use_id,omitempty"`
-	Result    string `json:"content,omitempty"`
+	Result    any    `json:"content,omitempty"`
+	IsError   bool   `json:"is_error,omitempty"`
 }
 
 type anImageSource struct {
@@ -110,6 +111,19 @@ func anthropicThinkingBudget(level string, explicit int) (int, bool) {
 		budget = maxInt(explicit, anthropicMinThinkingBudget)
 	}
 	return budget, true
+}
+
+// anthropicPartBlocks renders ordered content parts as text/image blocks.
+func anthropicPartBlocks(parts []ContentPart) []anBlock {
+	blocks := make([]anBlock, 0, len(parts))
+	for _, p := range parts {
+		if p.Type == ContentPartImage {
+			blocks = append(blocks, anBlock{Type: "image", Source: &anImageSource{Type: "base64", MediaType: wireMIME(p.MIMEType), Data: base64.StdEncoding.EncodeToString(p.Image)}})
+		} else {
+			blocks = append(blocks, anBlock{Type: "text", Text: p.Text})
+		}
+	}
+	return blocks
 }
 
 // anthropicThinkingReplay renders the signed reasoning of a replayed
@@ -236,13 +250,7 @@ func buildAnthropicRequest(req *ChatRequest, model string, stream bool) ([]byte,
 			if len(m.Parts) == 0 {
 				blocks = append(blocks, anBlock{Type: "text", Text: m.Content})
 			} else {
-				for _, p := range m.Parts {
-					if p.Type == ContentPartImage {
-						blocks = append(blocks, anBlock{Type: "image", Source: &anImageSource{Type: "base64", MediaType: wireMIME(p.MIMEType), Data: base64.StdEncoding.EncodeToString(p.Image)}})
-					} else {
-						blocks = append(blocks, anBlock{Type: "text", Text: p.Text})
-					}
-				}
+				blocks = append(blocks, anthropicPartBlocks(m.Parts)...)
 			}
 			if m.Cache && len(blocks) > 0 && blocks[0].Type == "text" {
 				blocks[0].CacheControl = &anCacheControl{Type: "ephemeral"}
@@ -283,11 +291,13 @@ func buildAnthropicRequest(req *ChatRequest, model string, stream bool) ([]byte,
 			var results []anBlock
 			for ; i < len(req.Messages) && req.Messages[i].Role == RoleTool; i++ {
 				tm := req.Messages[i]
-				results = append(results, anBlock{
-					Type:      "tool_result",
-					ToolUseID: tm.ToolCallID,
-					Result:    tm.Content,
-				})
+				tr := anBlock{Type: "tool_result", ToolUseID: tm.ToolCallID, IsError: tm.IsError}
+				if len(tm.Parts) > 0 {
+					tr.Result = anthropicPartBlocks(tm.Parts)
+				} else if tm.Content != "" {
+					tr.Result = tm.Content
+				}
+				results = append(results, tr)
 			}
 			i-- // outer loop increment
 			out.Messages = append(out.Messages, anMessage{Role: "user", Content: results})

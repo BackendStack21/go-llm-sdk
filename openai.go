@@ -152,14 +152,29 @@ func buildOpenAIRequest(cfg ProviderConfig, req *ChatRequest, model string, stre
 			appendSystem(m.Content)
 		}
 	}
-	for _, m := range req.Messages {
+	var toolImages []ContentPart // pending images from the current run of tool results
+	for i, m := range req.Messages {
 		switch m.Role {
 		case RoleSystem:
 			// already folded into the system message
 			continue
 		case RoleTool:
-			c := m.Content
+			// Chat-completions tool messages carry text only: the text parts
+			// stay on the tool message and images ride a user message right
+			// after the run of tool results. IsError has no wire field here.
+			c := partsText(m)
 			msgs = append(msgs, oaMessage{Role: "tool", Content: &c, ToolCallID: m.ToolCallID})
+			if imgs := imageParts(m); len(imgs) > 0 {
+				toolImages = append(toolImages, TextPart("Images returned by tool call "+m.ToolCallID+":"))
+				toolImages = append(toolImages, imgs...)
+			}
+			if i+1 < len(req.Messages) && req.Messages[i+1].Role == RoleTool {
+				continue
+			}
+			if len(toolImages) > 0 {
+				msgs = append(msgs, oaMessage{Role: "user", ContentParts: openAIContent(Message{Parts: toolImages}).([]oaContentPart)})
+				toolImages = nil
+			}
 		case RoleAssistant:
 			om := oaMessage{Role: "assistant"}
 			if len(m.Parts) == 0 {

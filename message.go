@@ -114,6 +114,10 @@ type Message struct {
 	ToolCalls      []ToolCall
 	ToolCallID     string
 	ToolName       string
+	// IsError marks a RoleTool result as a failed tool execution (Anthropic
+	// tool_result is_error; Gemini functionResponse {"error": …}). OpenAI
+	// formats have no flag: describe the failure in Content.
+	IsError bool
 	// Cache marks this user message for Anthropic prompt caching
 	// (cache_control ephemeral on the text block). Ignored on other
 	// formats and on non-user roles.

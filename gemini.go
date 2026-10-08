@@ -112,6 +112,16 @@ func wrapToolResponse(content string) json.RawMessage {
 	return json.RawMessage(fmt.Sprintf(`{"result":%s}`, mustJSONString(content)))
 }
 
+// wrapToolError renders a failed tool result as {"error": …}, the Gemini
+// functionResponse convention for errors.
+func wrapToolError(content string) json.RawMessage {
+	t := strings.TrimSpace(content)
+	if strings.HasPrefix(t, "{") && json.Valid([]byte(t)) {
+		return json.RawMessage(`{"error":` + t + `}`)
+	}
+	return json.RawMessage(fmt.Sprintf(`{"error":%s}`, mustJSONString(content)))
+}
+
 func mustJSONString(s string) string {
 	b, _ := json.Marshal(s)
 	return string(b)
@@ -186,7 +196,7 @@ func buildGeminiRequest(req *ChatRequest, model string, stream bool) ([]byte, er
 		case RoleTool:
 			// Merge the run of consecutive tool messages into one user
 			// content with functionResponse parts.
-			var parts []gmPart
+			var parts, images []gmPart
 			for ; i < len(req.Messages) && req.Messages[i].Role == RoleTool; i++ {
 				tm := req.Messages[i]
 				name := tm.ToolName
@@ -199,13 +209,19 @@ func buildGeminiRequest(req *ChatRequest, model string, stream bool) ([]byte, er
 				if name == "" {
 					return nil, &ConfigError{Msg: "tool result for \"" + tm.ToolCallID + "\" has no ToolName and no matching assistant tool_call"}
 				}
+				resp := wrapToolResponse(partsText(tm))
+				if tm.IsError {
+					resp = wrapToolError(partsText(tm))
+				}
 				parts = append(parts, gmPart{
-					FunctionResponse: &gmFnResp{
-						Name:     name,
-						Response: wrapToolResponse(tm.Content),
-					},
+					FunctionResponse: &gmFnResp{Name: name, Response: resp},
 				})
+				// Images from the tool ride the same user turn as inlineData.
+				for _, p := range imageParts(tm) {
+					images = append(images, gmPart{InlineData: &gmBlob{MIMEType: wireMIME(p.MIMEType), Data: base64.StdEncoding.EncodeToString(p.Image)}})
+				}
 			}
+			parts = append(parts, images...)
 			i--
 			out.Contents = append(out.Contents, gmContent{Role: "user", Parts: parts})
 		}

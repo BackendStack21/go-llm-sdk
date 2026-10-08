@@ -59,15 +59,9 @@ func (s *SDK) Transcribe(ctx context.Context, providerID, model string, req Tran
 	if strings.TrimSpace(model) == "" {
 		return nil, &ConfigError{Msg: "transcribe request requires a model"}
 	}
-	p, err := s.Provider(providerID)
+	p, err := s.usableProvider(providerID)
 	if err != nil {
 		return nil, err
-	}
-	if !p.Authenticated() {
-		return nil, &ConfigError{Msg: providerID + " has no API key (set " + strings.ToUpper(providerID) + "_API_KEY or use WithAPIKey)"}
-	}
-	if p.invalid {
-		return nil, &ConfigError{Msg: providerID + " has an invalid configuration"}
 	}
 	pc := s.newClient(p, s.timeout, nil)
 	return pc.transcribe(ctx, model, req)

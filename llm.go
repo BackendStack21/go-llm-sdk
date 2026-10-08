@@ -221,17 +221,35 @@ func (s *SDK) Provider(id string) (*Provider, error) {
 	return p, nil
 }
 
-// Chat returns a chat client bound to a provider and model.
-func (s *SDK) Chat(providerID, model string) (*ChatClient, error) {
+// usableProvider resolves an authenticated, validly configured provider.
+func (s *SDK) usableProvider(providerID string) (*Provider, error) {
 	p, err := s.Provider(providerID)
 	if err != nil {
 		return nil, err
 	}
 	if !p.Authenticated() {
-		return nil, &ConfigError{Msg: providerID + " has no API key (set " + strings.ToUpper(providerID) + "_API_KEY or use WithAPIKey)"}
+		return nil, &ConfigError{Msg: providerID + " has no API key (" + keyHint(p.cfg) + ")"}
 	}
 	if p.invalid {
 		return nil, &ConfigError{Msg: providerID + " has an invalid configuration"}
+	}
+	return p, nil
+}
+
+// keyHint names the env vars actually consulted for cfg's key; a custom
+// provider without EnvKeys reads none, so the hint never invents one.
+func keyHint(cfg ProviderConfig) string {
+	if len(cfg.EnvKeys) == 0 {
+		return "use WithAPIKey, or WithEnvKeys to read it from the environment"
+	}
+	return "set " + strings.Join(cfg.EnvKeys, " or ") + ", or use WithAPIKey"
+}
+
+// Chat returns a chat client bound to a provider and model.
+func (s *SDK) Chat(providerID, model string) (*ChatClient, error) {
+	p, err := s.usableProvider(providerID)
+	if err != nil {
+		return nil, err
 	}
 	p.chatLearnOnce.Do(func() { p.chatLearn = &learnOnce{} })
 	return &ChatClient{
