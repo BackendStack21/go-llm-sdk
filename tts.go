@@ -162,7 +162,7 @@ func (pc *providerClient) postAudio(ctx context.Context, url string, body []byte
 		return nil, "", 0, &ConfigError{Msg: "build request: " + err.Error()}
 	}
 	req.Header.Set("Content-Type", "application/json")
-	pc.setAuthHeaders(req.Header)
+	pc.setHeaders(req.Header)
 
 	resp, err := pc.buffered().Do(req)
 	if err != nil {

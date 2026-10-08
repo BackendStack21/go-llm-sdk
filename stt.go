@@ -210,7 +210,7 @@ func (pc *providerClient) postMultipart(ctx context.Context, url string, body []
 		return nil, 0, &ConfigError{Msg: "build request: " + err.Error()}
 	}
 	req.Header.Set("Content-Type", ctype)
-	pc.setAuthHeaders(req.Header)
+	pc.setHeaders(req.Header)
 
 	resp, err := pc.buffered().Do(req)
 	if err != nil {

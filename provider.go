@@ -61,6 +61,12 @@ type ProviderConfig struct {
 	// (aliases after). Resolution stops at the first non-empty value.
 	EnvKeys []string
 	Quirks  Quirks
+	// Headers are extra HTTP headers sent on every request to this
+	// provider (OpenRouter attribution, OpenAI-Organization, anthropic-beta,
+	// api-key gateways, …). They are applied last, so they can override the
+	// SDK's own headers; an empty value removes that header. Like APIKey,
+	// header values are never logged or included in String().
+	Headers map[string]string
 }
 
 func (c ProviderConfig) String() string {

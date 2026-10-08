@@ -64,7 +64,7 @@ func (pc *providerClient) get(ctx context.Context, url string) ([]byte, time.Dur
 		return nil, 0, &ConfigError{Msg: "build request: " + err.Error()}
 	}
 	req.Header.Set("Accept", "application/json")
-	pc.setAuthHeaders(req.Header)
+	pc.setHeaders(req.Header)
 
 	resp, err := pc.buffered().Do(req)
 	if err != nil {

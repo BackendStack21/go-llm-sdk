@@ -146,6 +146,23 @@ func WithQuirks(q Quirks) ProviderOption {
 	return func(c *ProviderConfig) { c.Quirks = q }
 }
 
+// WithHeaders adds extra HTTP headers to every request this provider makes
+// (merged over earlier WithHeaders calls). An empty value removes that
+// header, e.g. {"Authorization": ""} for gateways that authenticate with
+// an api-key header instead. The map is copied.
+func WithHeaders(h map[string]string) ProviderOption {
+	return func(c *ProviderConfig) {
+		merged := make(map[string]string, len(c.Headers)+len(h))
+		for k, v := range c.Headers {
+			merged[k] = v
+		}
+		for k, v := range h {
+			merged[k] = v
+		}
+		c.Headers = merged
+	}
+}
+
 // WithEnvKeys sets env var names consulted for this provider's key,
 // primary first.
 func WithEnvKeys(keys ...string) ProviderOption {

@@ -247,6 +247,11 @@ type ChatRequest struct {
 	// Seed asks for deterministic sampling where supported (OpenAI chat
 	// completions, Gemini). Anthropic and the Responses API ignore it.
 	Seed *int
+	// Extra holds provider-specific top-level body fields merged into the
+	// request JSON after the SDK's own (so they override them): an escape
+	// hatch for parameters the canonical shape does not model yet. The
+	// "stream" key is reserved (use Call vs CallStream).
+	Extra map[string]any
 }
 
 // ChatResult is the canonical response for both buffered and streaming calls.

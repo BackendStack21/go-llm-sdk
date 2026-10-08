@@ -180,6 +180,16 @@ func (pc *providerClient) buildChatRequest(req *ChatRequest, model string, strea
 	if model == "" {
 		return nil, "", &ConfigError{Msg: "no model set (ChatRequest.Model empty and no ChatClient model)"}
 	}
+	body, url, err := pc.buildFormatBody(req, model, stream)
+	if err != nil {
+		return nil, "", err
+	}
+	body, err = mergeExtra(body, req.Extra)
+	return body, url, err
+}
+
+// buildFormatBody serializes a validated request in the provider's format.
+func (pc *providerClient) buildFormatBody(req *ChatRequest, model string, stream bool) ([]byte, string, error) {
 	switch pc.cfg.Format {
 	case FormatAnthropic:
 		body, err := buildAnthropicRequest(req, model, stream)
@@ -207,8 +217,45 @@ func (pc *providerClient) buildChatRequest(req *ChatRequest, model string, strea
 	}
 }
 
-// setAuthHeaders applies format-specific authentication headers. Keys are
-// never logged.
+// mergeExtra overlays ChatRequest.Extra onto a marshaled body: top-level
+// keys replace the SDK's own. "stream" is reserved because the SDK's
+// buffered/SSE handling depends on it.
+func mergeExtra(body []byte, extra map[string]any) ([]byte, error) {
+	if len(extra) == 0 {
+		return body, nil
+	}
+	var m map[string]json.RawMessage
+	if err := json.Unmarshal(body, &m); err != nil {
+		return nil, err
+	}
+	for k, v := range extra {
+		if k == "" || k == "stream" {
+			return nil, &ConfigError{Msg: fmt.Sprintf("ChatRequest.Extra key %q is reserved", k)}
+		}
+		raw, err := json.Marshal(v)
+		if err != nil {
+			return nil, &ConfigError{Msg: fmt.Sprintf("ChatRequest.Extra[%q]: %v", k, err)}
+		}
+		m[k] = raw
+	}
+	return json.Marshal(m)
+}
+
+// setHeaders applies format-specific authentication headers, then the
+// provider's custom Headers (last, so they can override; an empty value
+// removes the header). Keys and header values are never logged.
+func (pc *providerClient) setHeaders(h http.Header) {
+	pc.setAuthHeaders(h)
+	for k, v := range pc.cfg.Headers {
+		if v == "" {
+			h.Del(k)
+			continue
+		}
+		h.Set(k, v)
+	}
+}
+
+// setAuthHeaders applies format-specific authentication headers.
 func (pc *providerClient) setAuthHeaders(h http.Header) {
 	switch pc.cfg.Format {
 	case FormatAnthropic:
@@ -304,7 +351,7 @@ func (pc *providerClient) post(ctx context.Context, client *http.Client, url str
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Accept", "application/json")
-	pc.setAuthHeaders(req.Header)
+	pc.setHeaders(req.Header)
 
 	resp, err := client.Do(req)
 	if err != nil {
@@ -608,7 +655,7 @@ func (pc *providerClient) attemptStream(ctx context.Context, url string, body []
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Accept", "text/event-stream")
-	pc.setAuthHeaders(req.Header)
+	pc.setHeaders(req.Header)
 
 	resp, derr := pc.streamHTTP.Do(req)
 	if derr != nil {
