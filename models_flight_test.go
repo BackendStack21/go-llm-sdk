@@ -4,8 +4,10 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -131,5 +133,59 @@ func TestListModels_SingleFlightLeaderCancelled(t *testing.T) {
 	}
 	if ms := <-followerRes; len(ms) != 1 {
 		t.Errorf("follower models = %+v", ms)
+	}
+}
+
+type rtFunc func(*http.Request) (*http.Response, error)
+
+func (f rtFunc) RoundTrip(r *http.Request) (*http.Response, error) { return f(r) }
+
+// A panic inside the leader's fetch (e.g. a user RoundTripper) must never
+// leave the flight in place: later calls fetch again.
+func TestListModels_LeaderPanicDoesNotWedge(t *testing.T) {
+	var calls atomic.Int32
+	rt := rtFunc(func(r *http.Request) (*http.Response, error) {
+		if calls.Add(1) == 1 {
+			panic("transport exploded")
+		}
+		return &http.Response{StatusCode: 200, Header: http.Header{}, Body: io.NopCloser(strings.NewReader(`{"data":[{"id":"m"}]}`))}, nil
+	})
+	sdk := New(WithTransport(rt), WithProvider("openai", WithAPIKey("k"), WithBaseURL("http://x")))
+	p, _ := sdk.Provider("openai")
+	func() {
+		defer func() { _ = recover() }()
+		_, _ = p.ListModels(context.Background())
+	}()
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	ms, err := p.ListModels(ctx)
+	if err != nil || len(ms) != 1 {
+		t.Fatalf("after leader panic: models=%v err=%v", ms, err)
+	}
+}
+
+// An upstream timeout inside the leader's fetch is the shared result, not a
+// cancellation: followers must not re-lead one after another.
+func TestListModels_UpstreamTimeoutShared(t *testing.T) {
+	fastBackoff(t)
+	var calls atomic.Int32
+	gate := make(chan struct{})
+	rt := rtFunc(func(r *http.Request) (*http.Response, error) {
+		calls.Add(1)
+		<-gate
+		return nil, fmt.Errorf("dial: %w", context.DeadlineExceeded)
+	})
+	sdk := New(WithTransport(rt), WithProvider("openai", WithAPIKey("k"), WithBaseURL("http://x")))
+	p, _ := sdk.Provider("openai")
+	var wg sync.WaitGroup
+	for i := 0; i < 4; i++ {
+		wg.Add(1)
+		go func() { defer wg.Done(); _, _ = p.ListModels(context.Background()) }()
+	}
+	time.Sleep(50 * time.Millisecond)
+	close(gate)
+	wg.Wait()
+	if got := calls.Load(); got != 3 { // one flight = 3 attempts
+		t.Errorf("upstream attempts = %d, want 3 (one shared flight)", got)
 	}
 }

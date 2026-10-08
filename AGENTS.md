@@ -29,9 +29,11 @@ go test -tags e2e -run 'TestE2E' -timeout 15m -v .   # LIVE provider e2e (see be
 | `openai.go` / `gemini.go` / `anthropic.go` | Per-format request builders, response/stream mappers, model listing |
 | `responses.go` | OpenAI Responses API (`/v1/responses`) for GPT-5.6+ tools+reasoning |
 | `tts.go` | Text-to-speech: `Speak`/`SpeakRequest`/`SpeakResult` — OpenAI-compat `/audio/speech` + Gemini AUDIO modality, no transcoding |
+| `controls.go` | Request controls: `ToolChoice`, `ResponseFormat` (incl. Anthropic forced-tool JSON emulation + `foldAnthropicJSON`), `ParallelToolCalls`, per-format mapping and boundary validation |
+| `embed.go` | Embeddings: `Embed`/`EmbedRequest`/`EmbedResult` — OpenAI-compat `/embeddings` + Gemini `batchEmbedContents` |
 | `stt.go` | Speech-to-text: `Transcribe`/`TranscribeRequest`/`TranscribeResult` — OpenAI-compat `/audio/transcriptions` (multipart), 25MB input cap |
 | `sse.go` | SSE parser (abort-safe via `done` channel) + idle-watchdog pump |
-| `retry.go` | Backoff/jitter/`Retry-After`/`retrySleep` (8 attempts, cap 30s) |
+| `retry.go` | `RetryPolicy` + the single buffered ladder `withRetry` (chat, tts, stt, embed); backoff/jitter/`Retry-After`/`retrySleep` (default 8 attempts, cap 30s) |
 | `provider.go` | Built-in registry, quirks flags, config validation |
 | `models.go` | `ListModels` orchestration (retries, caps, cache backing) |
 | `auth.go`, `transport.go`, `errors.go` | Env resolution, pooled HTTP clients, typed errors |
@@ -40,19 +42,22 @@ The canonical type system is OpenAI-shaped; `gemini.go`/`anthropic.go` translate
 
 ## Invariants (breaking any of these is a defect)
 
-1. **Canonical finish reasons** are `stop | length | tool_calls | content_filter | ""`. Unmapped provider stop reasons map to `""` on every format — provider-specific strings never leak.
+1. **Canonical finish reasons** are `stop | length | tool_calls | content_filter | ""`. Unmapped provider stop reasons map to `""` on every format — provider-specific strings never leak. A turn with tool calls finishes `tool_calls` on every format (Gemini's `STOP` is mapped).
 2. **API keys never appear** in error text, `String()`, or any typed error.
-3. **Streaming**: retries only before the first emitted delta; a failure after partial output returns the partial `*ChatResult` + wrapped error and is **never retried**; a premature close (no completion signal) is an error, never a silent empty success; the parser goroutine is always released (abort-safe `done` protocol).
+3. **Streaming**: retries only before the first emitted delta; a failure after partial output returns the partial `*ChatResult` + wrapped error and is **never retried**; a premature close (no completion signal — on every format, Gemini included; an unmapped finish reason still counts as one) is an error, never a silent empty or partial success; the parser goroutine is always released (abort-safe `done` protocol).
    A successful non-SSE response is parsed directly with the usual body cap and format mapper. It learns buffered mode for future requests, but never discards the current generation or makes a replacement request; parse/read errors remain terminal for that response.
 4. **Unknown message roles are rejected** at the SDK boundary (`ConfigError`) — never dropped or reinterpreted per format.
 5. **Unknown provider data stays unknown** (zero values) — no static guesses, no fallback model tables.
 6. **Learn-once fallback state is per-`Provider`**, monotonic, atomic, shared by every `ChatClient` — never move it back to per-client.
-7. Anthropic extended-thinking rounds trip via `Message.ThinkingSignature` / `ChatResult.ThinkingSignature` — replay is signature-gated and the thinking block goes **first**.
+7. Anthropic extended-thinking rounds trip via `ThinkingBlocks` (every `thinking` / `redacted_thinking` block, each with its own signature, in order) or the legacy single `ReasoningContent` + `ThinkingSignature` pair — replay is signature-gated and the thinking blocks go **first**. Signatures are per block, never concatenated. Gemini `thoughtSignature`s round-trip per part (`ToolCall.Signature`, `ThinkingSignature`).
+8. **`Delta.ToolIndex` is the call's position in `ChatResult.ToolCalls`** on every format — never a provider content-block or output-item index.
+9. **`Usage` has one meaning everywhere**: `PromptTokens` uncached-only, cache reads/writes in their fields (a DeepSeek miss is uncached input, not a write), `CompletionTokens` includes reasoning, `CachedTokens` is a diagnostic subset never summed.
+10. **The request timeout is a whole-call budget**, retries included, on every entry point (buffered, streaming, speech, transcription, embeddings).
 
 ## Testing conventions
 
 - **RED-first TDD**: failing test first, then the fix. Table-driven tests; `httptest` servers for hermetic coverage; `newTestClient` helper pins `backoffUnit` to 1ms — restore package vars in `t.Cleanup`.
-- Two timing knobs are package vars for tests: `backoffUnit`, `streamIdleTimeout`. Operators override the idle watchdog via `SetStreamIdleTimeout` (positive values only).
+- Timing knobs for tests: the package var `backoffUnit` (use `fastBackoff(t)`), and the process-wide idle default (atomic; use `setIdleForTest(t, d)`). Operators override the idle watchdog per SDK with `WithStreamIdleTimeout`, or process-wide with the race-safe `SetStreamIdleTimeout` (positive values only). Retry shape is per SDK via `WithRetryPolicy`.
 - The e2e suite (`e2e_test.go`) is behind a `e2e` build tag and hits **live APIs**. It must never lose that tag. Keys come from env or a gitignored `.env`; contents are never logged; tests skip when a key is absent. Adding a provider = one `e2eTarget` entry; models overridable via `<ID>_E2E_MODEL`.
 - Live-provider behavior (e.g. DeepSeek eliding `reasoning_content`) is **not an SDK contract** — probe softly, assert only what the SDK guarantees (call success, parsing, canonical finish). Model answer correctness is never an assertion. Elision is absorbed by an explicit provider quirk rather than hope: on a chat-completions request that carries tools, providers flagged `Quirks.EchoReasoningWithTools` always get the `reasoning_content` key, empty included — including on assistant turns that made no tool call themselves (a request diverted to `/responses` never reaches that builder). That flag is off for every provider except `deepseek`, and whether DeepSeek *accepts* a present-but-empty value is measured live by the tag-gated `TestE2EDeepSeekEmptyReasoningEcho` probe — not asserted by the unit suite.
 - Timer hygiene: since Go 1.23 no drain-before-`Reset` is needed for `time.Timer`. Note: on some dev machines `time.After` + select-default spin loops have hung — prefer deadline loops in tests.

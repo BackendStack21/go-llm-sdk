@@ -5,6 +5,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"math"
 	neturl "net/url"
 	"strings"
 )
@@ -258,6 +259,9 @@ func buildGeminiRequest(req *ChatRequest, model string, stream bool) ([]byte, er
 	if tc := geminiThinkingConfig(req.Thinking, req.ThinkingBudget); tc != nil {
 		cfg.ThinkingConfig = tc
 	}
+	if req.Seed != nil && (*req.Seed > math.MaxInt32 || *req.Seed < math.MinInt32) {
+		return nil, &ConfigError{Msg: "Gemini Seed must fit in 32 bits"}
+	}
 	cfg.Seed = req.Seed
 	if req.ResponseFormat.jsonMode() {
 		cfg.ResponseMimeType = "application/json"
@@ -302,9 +306,16 @@ type gmUsage struct {
 	CachedContentTokenCount *int `json:"cachedContentTokenCount"`
 }
 
+// gmPromptFeedback reports a prompt Gemini blocked before generating (no
+// candidates follow).
+type gmPromptFeedback struct {
+	BlockReason string `json:"blockReason"`
+}
+
 type gmResponse struct {
-	Candidates    []gmCandidate `json:"candidates"`
-	UsageMetadata gmUsage       `json:"usageMetadata"`
+	Candidates     []gmCandidate     `json:"candidates"`
+	UsageMetadata  gmUsage           `json:"usageMetadata"`
+	PromptFeedback *gmPromptFeedback `json:"promptFeedback"`
 }
 
 // mapGeminiFinishReason maps finishReason to canonical values.
@@ -406,6 +417,10 @@ func parseGeminiResponse(body []byte) (*ChatResult, error) {
 		return nil, fmt.Errorf("llm: parse response: %w", err)
 	}
 	if len(r.Candidates) == 0 {
+		if r.PromptFeedback != nil && r.PromptFeedback.BlockReason != "" {
+			// A blocked prompt is a completed, filtered turn.
+			return &ChatResult{FinishReason: FinishContentFilter, Usage: mapGeminiUsage(r.UsageMetadata)}, nil
+		}
 		return nil, fmt.Errorf("llm: response has no candidates")
 	}
 	acc := newStreamAccum()
@@ -420,8 +435,9 @@ func parseGeminiResponse(body []byte) (*ChatResult, error) {
 // ── streaming ────────────────────────────────────────────────────────────
 
 type gmStreamChunk struct {
-	Candidates    []gmCandidate `json:"candidates"`
-	UsageMetadata *gmUsage      `json:"usageMetadata"` // nil = chunk carries no usage update
+	Candidates     []gmCandidate     `json:"candidates"`
+	PromptFeedback *gmPromptFeedback `json:"promptFeedback"`
+	UsageMetadata  *gmUsage          `json:"usageMetadata"` // nil = chunk carries no usage update
 }
 
 // mapGeminiStreamEvent folds one Gemini SSE chunk into acc. Chunks carry
@@ -436,6 +452,12 @@ func mapGeminiStreamEvent(data []byte, acc *streamAccum) ([]Delta, bool, error) 
 		acc.usage = mapGeminiUsage(*c.UsageMetadata)
 	}
 	if len(c.Candidates) == 0 {
+		if c.PromptFeedback != nil && c.PromptFeedback.BlockReason != "" {
+			// Blocked prompt: a completed content_filter turn, not a
+			// truncated stream to retry.
+			acc.finishReason = FinishContentFilter
+			acc.sawFinish = true
+		}
 		return nil, false, nil
 	}
 	cand := c.Candidates[0]

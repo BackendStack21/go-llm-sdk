@@ -204,6 +204,9 @@ func (pc *providerClient) buildFormatBody(req *ChatRequest, model string, stream
 		}
 		return body, fmt.Sprintf("%s/v1beta/models/%s:generateContent", pc.base, m), err
 	default: // FormatOpenAI
+		if pc.cfg.Quirks.NoJSONSchema && req.ResponseFormat != nil && req.ResponseFormat.Type == ResponseJSONSchema {
+			return nil, "", &ConfigError{Msg: pc.cfg.ID + " supports ResponseFormat json_object only, not json_schema"}
+		}
 		if useResponsesAPI(pc.learn, pc.cfg.Format, model, req) {
 			body, err := json.Marshal(buildResponsesRequest(req, model, stream))
 			return body, pc.base + "/responses", err
@@ -215,6 +218,17 @@ func (pc *providerClient) buildFormatBody(req *ChatRequest, model string, stream
 		body, err := json.Marshal(oa)
 		return body, pc.base + "/chat/completions", err
 	}
+}
+
+// extraReserved are body keys Extra may not set: "stream" drives the SDK's
+// buffered/SSE handling, and the model, conversation, system prompt and tool
+// catalog are validated by the SDK (roles, content, controls), so replacing
+// them would bypass that validation.
+var extraReserved = map[string]bool{
+	"stream": true, "model": true,
+	"messages": true, "contents": true, "input": true,
+	"system": true, "systemInstruction": true, "instructions": true,
+	"tools": true,
 }
 
 // mergeExtra overlays ChatRequest.Extra onto a marshaled body: top-level
@@ -229,7 +243,7 @@ func mergeExtra(body []byte, extra map[string]any) ([]byte, error) {
 		return nil, err
 	}
 	for k, v := range extra {
-		if k == "" || k == "stream" {
+		if k == "" || extraReserved[k] {
 			return nil, &ConfigError{Msg: fmt.Sprintf("ChatRequest.Extra key %q is reserved", k)}
 		}
 		raw, err := json.Marshal(v)
@@ -555,8 +569,9 @@ func (pc *providerClient) callStream(ctx context.Context, req *ChatRequest, mode
 			break
 		}
 		if pc.learn.forceBuffered.Load() {
-			cancel()
-			return pc.call(ctx, req, model)
+			// Another client learned buffered mode mid-call: finish within
+			// this call's remaining budget, never a fresh one.
+			return pc.call(deadlineCtx, req, model)
 		}
 		body, url, err := pc.buildChatRequest(req, model, true)
 		if err != nil {

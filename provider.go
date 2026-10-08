@@ -44,6 +44,10 @@ type Quirks struct {
 	// thinking.type=disabled outright (GLM-5.3 always reasons; the
 	// documented migration is {type: enabled} + reasoning_effort "low").
 	ForceThinking []string
+	// NoJSONSchema: the provider accepts response_format json_object but
+	// rejects json_schema (DeepSeek); a json_schema ResponseFormat fails fast
+	// with a ConfigError instead of a provider 400.
+	NoJSONSchema bool
 	// AnthropicVersion is the anthropic-version header value required by
 	// FormatAnthropic providers ("2023-06-01").
 	AnthropicVersion string
@@ -82,6 +86,9 @@ func (c ProviderConfig) String() string {
 	b.WriteString("}")
 	return b.String()
 }
+
+// GoString keeps %#v from printing the API key and header values.
+func (c ProviderConfig) GoString() string { return c.String() }
 
 func strconvBool(b bool) string {
 	if b {
@@ -158,7 +165,7 @@ func builtinProviders() []ProviderConfig {
 			Format:  FormatOpenAI,
 			BaseURL: "https://api.deepseek.com",
 			EnvKeys: []string{"DEEPSEEK_API_KEY"},
-			Quirks:  Quirks{ThinkingObject: true, EchoReasoningWithTools: true},
+			Quirks:  Quirks{ThinkingObject: true, EchoReasoningWithTools: true, NoJSONSchema: true},
 		},
 		{
 			ID:      "zai",

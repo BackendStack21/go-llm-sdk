@@ -56,6 +56,10 @@ func (s *SDK) Transcribe(ctx context.Context, providerID, model string, req Tran
 	if len(req.Audio) > maxTranscribeAudioBytes {
 		return nil, &ConfigError{Msg: "transcribe audio exceeds 25MB limit"}
 	}
+	if strings.ContainsFunc(req.Filename+req.MIMEType, func(r rune) bool { return r < 0x20 || r == 0x7f }) {
+		// Written into multipart part headers: a CR/LF would inject one.
+		return nil, &ConfigError{Msg: "transcribe Filename and MIMEType must not contain control characters"}
+	}
 	if strings.TrimSpace(model) == "" {
 		return nil, &ConfigError{Msg: "transcribe request requires a model"}
 	}

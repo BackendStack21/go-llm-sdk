@@ -199,8 +199,11 @@ func anthropicToolControls(req *ChatRequest, out *anRequest, thinking bool) erro
 			return &ConfigError{Msg: "Anthropic JSON ResponseFormat forces its own tool; it cannot be combined with ToolChoice"}
 		case thinking:
 			return &ConfigError{Msg: "Anthropic JSON ResponseFormat forces tool use, which extended thinking rejects"}
-		case hasTool(req.Tools, name):
-			return &ConfigError{Msg: fmt.Sprintf("ResponseFormat name %q collides with a tool name", name)}
+		case len(req.Tools) > 0:
+			// The forced JSON tool would make every user tool uncallable.
+			return &ConfigError{Msg: "Anthropic JSON ResponseFormat forces its own tool; it cannot be combined with Tools"}
+		case !objectSchema(req.ResponseFormat.Schema):
+			return &ConfigError{Msg: "Anthropic JSON ResponseFormat needs a top-level \"type\": \"object\" schema"}
 		}
 		schema := req.ResponseFormat.Schema
 		if len(schema) == 0 {
@@ -227,7 +230,7 @@ func anthropicToolControls(req *ChatRequest, out *anRequest, thinking bool) erro
 			return &ConfigError{Msg: "Anthropic extended thinking rejects forced tool use (ToolChoice required/tool)"}
 		}
 	}
-	if p := req.ParallelToolCalls; p != nil && !*p && len(out.Tools) > 0 {
+	if p := req.ParallelToolCalls; p != nil && !*p && len(out.Tools) > 0 && (choice == nil || choice.Type != "none") {
 		if choice == nil {
 			choice = &anToolChoice{Type: "auto"}
 		}
@@ -235,6 +238,19 @@ func anthropicToolControls(req *ChatRequest, out *anRequest, thinking bool) erro
 	}
 	out.ToolChoice = choice
 	return nil
+}
+
+// objectSchema reports whether a schema is absent (json_object) or declares
+// a top-level object type — the only shape Anthropic accepts as a tool's
+// input_schema.
+func objectSchema(schema json.RawMessage) bool {
+	if len(schema) == 0 {
+		return true
+	}
+	var s struct {
+		Type any `json:"type"`
+	}
+	return json.Unmarshal(schema, &s) == nil && s.Type == "object"
 }
 
 // foldAnthropicJSON moves the JSON-mode tool call back into Content: the

@@ -3,6 +3,7 @@ package llm
 import (
 	"encoding/json"
 	"errors"
+	"strings"
 	"testing"
 )
 
@@ -41,8 +42,17 @@ func TestBuildAnthropicRequest_ThinkingPresetClampedBelowMaxTokens(t *testing.T)
 	if m["max_tokens"].(float64) != 4000 {
 		t.Errorf("explicit max_tokens must be honored, got %v", m["max_tokens"])
 	}
-	if b := m["thinking"].(map[string]any)["budget_tokens"].(float64); b != 3999 {
-		t.Errorf("budget_tokens = %v, want 3999 (clamped below max_tokens)", b)
+	// Half the cap stays for visible output (never a one-token answer).
+	if b := m["thinking"].(map[string]any)["budget_tokens"].(float64); b != 2000 {
+		t.Errorf("budget_tokens = %v, want 2000 (half of max_tokens)", b)
+	}
+	m = decodeAnthropicBody(t, &ChatRequest{Thinking: "high", MaxTokens: 1500, Messages: []Message{{Role: RoleUser, Content: "x"}}})
+	if b := m["thinking"].(map[string]any)["budget_tokens"].(float64); b != 1024 {
+		t.Errorf("small cap: budget_tokens = %v, want the 1024 minimum", b)
+	}
+	m = decodeAnthropicBody(t, &ChatRequest{Thinking: "low", MaxTokens: 1500, Messages: []Message{{Role: RoleUser, Content: "x"}}})
+	if b := m["thinking"].(map[string]any)["budget_tokens"].(float64); b != 1024 {
+		t.Errorf("preset below cap is kept: budget_tokens = %v", b)
 	}
 }
 
@@ -194,5 +204,21 @@ func TestChatResult_AssistantMessage(t *testing.T) {
 	var nilRes *ChatResult
 	if got := nilRes.AssistantMessage(); got.Role != RoleAssistant {
 		t.Errorf("nil result → %+v", got)
+	}
+}
+
+// A signed thinking block with empty text (summarized/omitted display)
+// still carries the required "thinking" key on replay.
+func TestBuildAnthropicRequest_EmptyThinkingTextKeepsKey(t *testing.T) {
+	for _, m := range []Message{
+		{Role: RoleAssistant, ThinkingBlocks: []ThinkingBlock{{Signature: "sig"}}},
+	} {
+		b, err := buildAnthropicRequest(&ChatRequest{Messages: []Message{{Role: RoleUser, Content: "q"}, m}}, "claude", false)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !strings.Contains(string(b), `{"type":"thinking","thinking":"","signature":"sig"}`) {
+			t.Errorf("body = %s", b)
+		}
 	}
 }

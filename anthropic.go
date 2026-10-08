@@ -36,9 +36,9 @@ type anBlock struct {
 	// thinking / redacted_thinking (replayed assistant turns; they go
 	// FIRST, in response order, and carry the provider signature or the
 	// opaque redacted data)
-	Thinking  string `json:"thinking,omitempty"`
-	Signature string `json:"signature,omitempty"`
-	Data      string `json:"data,omitempty"`
+	Thinking  *string `json:"thinking,omitempty"` // pointer: an empty signed thinking text still sends the key
+	Signature string  `json:"signature,omitempty"`
+	Data      string  `json:"data,omitempty"`
 	// tool_use
 	ID    string          `json:"id,omitempty"`
 	Name  string          `json:"name,omitempty"`
@@ -145,11 +145,13 @@ func anthropicThinkingReplay(m Message, i int) ([]anBlock, error) {
 		case tb.Signature == "":
 			return nil, &ConfigError{Msg: fmt.Sprintf("message %d thinking block %d: Anthropic thinking replay requires a Signature", i, j)}
 		default:
-			blocks = append(blocks, anBlock{Type: "thinking", Thinking: tb.Text, Signature: tb.Signature})
+			blocks = append(blocks, anBlock{Type: "thinking", Thinking: strPtr(tb.Text), Signature: tb.Signature})
 		}
 	}
 	return blocks, nil
 }
+
+func strPtr(s string) *string { return &s }
 
 func maxInt(a, b int) int {
 	if a > b {
@@ -195,16 +197,20 @@ func buildAnthropicRequest(req *ChatRequest, model string, stream bool) ([]byte,
 		// Anthropic requires max_tokens > budget_tokens, and the budget
 		// counts against max_tokens. An unset MaxTokens leaves the usual
 		// visible-output room on top of the budget; an explicit MaxTokens
-		// is a hard cap, so a preset level is clamped below it and an
-		// explicit ThinkingBudget that cannot fit fails fast.
+		// is a hard cap, so a preset level is clamped to half of it (the
+		// rest stays for the answer) and an explicit ThinkingBudget that
+		// cannot fit fails fast.
 		switch {
 		case out.MaxTokens <= 0:
 			out.MaxTokens = budget + anthropicDefaultMaxTokens
 		case budget >= out.MaxTokens && req.ThinkingBudget > 0:
 			return nil, &ConfigError{Msg: fmt.Sprintf("Anthropic ThinkingBudget %d must be below MaxTokens %d", budget, out.MaxTokens)}
-		case budget >= out.MaxTokens:
-			budget = out.MaxTokens - 1
-			if budget < anthropicMinThinkingBudget {
+		case budget > out.MaxTokens/2 && req.ThinkingBudget <= 0:
+			// A preset larger than half an explicit cap would starve the
+			// visible answer: keep half for output (never below Anthropic's
+			// minimum budget, which must still fit under the cap).
+			budget = maxInt(out.MaxTokens/2, anthropicMinThinkingBudget)
+			if budget >= out.MaxTokens {
 				return nil, &ConfigError{Msg: fmt.Sprintf("Anthropic thinking needs MaxTokens above %d, got %d", anthropicMinThinkingBudget, out.MaxTokens)}
 			}
 		}
@@ -265,7 +271,7 @@ func buildAnthropicRequest(req *ChatRequest, model string, stream bool) ([]byte,
 				// Anthropic requires a replayed thinking block to be the
 				// FIRST block and to carry its signature; extended-thinking
 				// tool loops are otherwise rejected mid-conversation.
-				blocks = append(blocks, anBlock{Type: "thinking", Thinking: m.ReasoningContent, Signature: m.ThinkingSignature})
+				blocks = append(blocks, anBlock{Type: "thinking", Thinking: strPtr(m.ReasoningContent), Signature: m.ThinkingSignature})
 			}
 			if m.Content != "" {
 				blocks = append(blocks, anBlock{Type: "text", Text: m.Content})
@@ -511,9 +517,12 @@ func mapAnthropicStreamEvent(data []byte, acc *streamAccum) ([]Delta, bool, erro
 				acc.finishReason = FinishStop // the JSON tool is the answer, not a tool turn
 			}
 		}
-		// message_delta usage is cumulative. Output is always present; input
-		// and cache volumes may only arrive here, so non-zero values win.
-		acc.usage.CompletionTokens = ev.Usage.OutputTokens
+		// message_delta usage is cumulative; input and cache volumes may only
+		// arrive here. Non-zero values win, so a sparse delta never zeroes
+		// what message_start reported.
+		if ev.Usage.OutputTokens > 0 {
+			acc.usage.CompletionTokens = ev.Usage.OutputTokens
+		}
 		if ev.Usage.InputTokens > 0 {
 			acc.usage.PromptTokens = ev.Usage.InputTokens
 		}

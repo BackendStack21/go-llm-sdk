@@ -281,6 +281,13 @@ type Provider struct {
 	flight   *modelFlight // in-progress listing shared by concurrent callers
 }
 
+// String and GoString redact the provider for fmt verbs (%v, %+v, %#v):
+// the API key and header values never print.
+func (p *Provider) String() string { return p.cfg.String() }
+
+// GoString implements fmt.GoStringer with the same redaction as String.
+func (p *Provider) GoString() string { return p.cfg.String() }
+
 // ID returns the provider's registry id.
 func (p *Provider) ID() string { return p.cfg.ID }
 
@@ -339,15 +346,22 @@ func (p *Provider) ListModels(ctx context.Context, opts ...ListOption) ([]Model,
 // modelFlight is one in-progress upstream model listing that concurrent
 // callers share.
 type modelFlight struct {
-	done   chan struct{}
-	models []Model
-	err    error
+	done           chan struct{}
+	models         []Model
+	err            error
+	leaderCanceled bool // the leader's own context ended (not an upstream failure)
 }
+
+// errModelFetchPanicked is what followers of a leader whose fetch panicked
+// receive; the panic itself propagates to the leader's caller.
+var errModelFetchPanicked = errors.New("llm: model listing fetch panicked")
 
 // fetchModels fetches the listing once for all concurrent callers (a cold
 // cache never stampedes the provider) and refreshes the cache on success.
-// A follower whose leader died with the leader's own context error fetches
-// again under its own context instead of inheriting that cancellation.
+// A follower whose leader stopped because the leader's own context ended
+// fetches again under its own context instead of inheriting that
+// cancellation; an upstream failure (including an upstream timeout) is the
+// shared result. The flight is always cleared, even if the fetch panics.
 func (p *Provider) fetchModels(ctx context.Context) ([]Model, error) {
 	for {
 		p.mu.Lock()
@@ -358,16 +372,23 @@ func (p *Provider) fetchModels(ctx context.Context) ([]Model, error) {
 			case <-ctx.Done():
 				return nil, ctx.Err()
 			}
-			if f.err != nil && (errors.Is(f.err, context.Canceled) || errors.Is(f.err, context.DeadlineExceeded)) && ctx.Err() == nil {
+			if f.leaderCanceled && ctx.Err() == nil {
 				continue
 			}
 			return f.models, f.err
 		}
-		f := &modelFlight{done: make(chan struct{})}
+		f := &modelFlight{done: make(chan struct{}), err: errModelFetchPanicked}
 		p.flight = f
 		p.mu.Unlock()
+		p.lead(ctx, f)
+		return f.models, f.err
+	}
+}
 
-		f.models, f.err = p.listClient.listModels(ctx)
+// lead runs the leader's fetch and publishes it; the deferred release runs
+// on panic too, so a crashed fetch can never wedge later callers.
+func (p *Provider) lead(ctx context.Context, f *modelFlight) {
+	defer func() {
 		p.mu.Lock()
 		p.flight = nil
 		if f.err == nil {
@@ -375,8 +396,9 @@ func (p *Provider) fetchModels(ctx context.Context) ([]Model, error) {
 		}
 		p.mu.Unlock()
 		close(f.done)
-		return f.models, f.err
-	}
+	}()
+	f.models, f.err = p.listClient.listModels(ctx)
+	f.leaderCanceled = f.err != nil && ctx.Err() != nil
 }
 
 // ── ChatClient ───────────────────────────────────────────────────────────

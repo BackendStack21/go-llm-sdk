@@ -163,6 +163,9 @@ func buildOpenAIRequest(cfg ProviderConfig, req *ChatRequest, model string, stre
 			// stay on the tool message and images ride a user message right
 			// after the run of tool results. IsError has no wire field here.
 			c := partsText(m)
+			if c == "" && len(m.Parts) > 0 {
+				c = "(image result attached below)" // some providers reject empty tool content
+			}
 			msgs = append(msgs, oaMessage{Role: "tool", Content: &c, ToolCallID: m.ToolCallID})
 			if imgs := imageParts(m); len(imgs) > 0 {
 				toolImages = append(toolImages, TextPart("Images returned by tool call "+m.ToolCallID+":"))
@@ -418,6 +421,7 @@ type oaRespUsage struct {
 	PromptTokensDetails     *oaPromptDetails `json:"prompt_tokens_details"`
 	PromptCacheHitTokens    int              `json:"prompt_cache_hit_tokens"`
 	PromptCacheMissTokens   int              `json:"prompt_cache_miss_tokens"`
+	TopCachedTokens         int              `json:"cached_tokens"` // Moonshot/Kimi: top-level, subset of prompt_tokens
 }
 
 // usageFromOpenAI maps a chat-completions usage object onto canonical
@@ -455,10 +459,24 @@ func usageFromOpenAI(u *oaRespUsage) Usage {
 			out.PromptTokens -= hit
 			out.CacheReadTokens += hit
 		}
+	case u.CacheReadTokens > 0:
+		// Anthropic-named field from a gateway, already in CacheReadTokens.
+		// When the OpenAI-shaped cached_tokens rides along, prompt_tokens
+		// follows OpenAI (inclusive) semantics and both fields describe the
+		// same read: subtract it from the prompt once, never add it twice.
+		if d := u.PromptTokensDetails; d != nil && d.CachedTokens > 0 && d.CachedTokens <= out.PromptTokens {
+			out.PromptTokens -= d.CachedTokens
+		}
 	case u.PromptTokensDetails != nil && u.PromptTokensDetails.CachedTokens > 0 &&
 		u.PromptTokensDetails.CachedTokens <= out.PromptTokens:
 		out.PromptTokens -= u.PromptTokensDetails.CachedTokens
 		out.CacheReadTokens += u.PromptTokensDetails.CachedTokens
+	case u.TopCachedTokens > 0 && u.TopCachedTokens <= out.PromptTokens:
+		// Moonshot/Kimi report the cached subset top-level.
+		out.CacheReported = true
+		out.CachedTokens = u.TopCachedTokens
+		out.PromptTokens -= u.TopCachedTokens
+		out.CacheReadTokens += u.TopCachedTokens
 	}
 	return out
 }

@@ -395,7 +395,14 @@ func reasoningSummary(sum []rsSummaryText) string {
 func responsesFinishReason(r *rsResponse, hasTools bool) string {
 	switch r.Status {
 	case "incomplete":
-		if r.IncompleteDetails != nil && strings.Contains(strings.ToLower(r.IncompleteDetails.Reason), "max_output") {
+		reason := ""
+		if r.IncompleteDetails != nil {
+			reason = strings.ToLower(r.IncompleteDetails.Reason)
+		}
+		switch {
+		case strings.Contains(reason, "content_filter"):
+			return FinishContentFilter
+		case strings.Contains(reason, "max_output"):
 			return FinishLength
 		}
 		if hasTools {

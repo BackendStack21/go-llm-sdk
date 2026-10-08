@@ -227,7 +227,9 @@ type ResponseFormat struct {
 // when empty. Thinking accepts "", "enabled", "disabled", "low", "medium",
 // "high", "max" and is translated per provider format. Temperature and TopP:
 // 0 means use the provider default (field omitted); use a negative value to
-// explicitly send 0. Stop maps to each provider's stop-sequence field.
+// explicitly send 0. Stop maps to each provider's stop-sequence field (the
+// OpenAI Responses API has none, so it is not sent on requests diverted
+// there).
 type ChatRequest struct {
 	Model          string
 	Messages       []Message
@@ -253,8 +255,13 @@ type ChatRequest struct {
 	Seed *int
 	// Extra holds provider-specific top-level body fields merged into the
 	// request JSON after the SDK's own (so they override them): an escape
-	// hatch for parameters the canonical shape does not model yet. The
-	// "stream" key is reserved (use Call vs CallStream).
+	// hatch for parameters the canonical shape does not model yet. The merge
+	// is shallow: an object value replaces the SDK's whole object (e.g.
+	// Gemini generationConfig). Keys go to whichever endpoint the request
+	// is sent to, including /responses when an OpenAI request is diverted
+	// there. Reserved (ConfigError): "stream" (use Call vs CallStream) and
+	// the keys the SDK validates — model, messages/contents/input,
+	// system/systemInstruction/instructions, tools.
 	Extra map[string]any
 }
 

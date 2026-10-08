@@ -134,6 +134,19 @@ func (pc *providerClient) parseEmbedResponse(data []byte, n int) ([][]float64, U
 	if len(r.Data) != n {
 		return nil, Usage{}, fmt.Errorf("llm: embeddings: got %d vectors for %d inputs", len(r.Data), n)
 	}
+	allZero := true
+	for _, d := range r.Data {
+		if d.Index != 0 {
+			allZero = false
+			break
+		}
+	}
+	if allZero {
+		// Gateways that omit index: trust response order.
+		for i := range r.Data {
+			r.Data[i].Index = i
+		}
+	}
 	sort.SliceStable(r.Data, func(i, j int) bool { return r.Data[i].Index < r.Data[j].Index })
 	out := make([][]float64, n)
 	for i, d := range r.Data {
@@ -149,32 +162,50 @@ func (pc *providerClient) parseEmbedResponse(data []byte, n int) ([][]float64, U
 	return out, u, nil
 }
 
-// embed runs the request with the shared retry ladder and whole-call
-// budget.
+// Per-request input caps: Gemini batchEmbedContents takes at most 100
+// requests, OpenAI /embeddings at most 2048 inputs. Larger calls are split
+// into consecutive batches and concatenated in input order.
+const (
+	geminiEmbedBatch = 100
+	openAIEmbedBatch = 2048
+)
+
+// embed runs the request in provider-sized batches, each with the shared
+// retry ladder, all under one whole-call budget.
 func (pc *providerClient) embed(ctx context.Context, model string, req EmbedRequest) (*EmbedResult, error) {
-	body, url, err := pc.buildEmbedRequest(model, req)
-	if err != nil {
-		return nil, err
+	model = strings.TrimPrefix(model, "models/") // Gemini ids as ListModels may echo them
+	batch := openAIEmbedBatch
+	if pc.cfg.Format == FormatGemini {
+		batch = geminiEmbedBatch
 	}
 	ctx, cancel := context.WithTimeout(ctx, pc.requestTimeout())
 	defer cancel()
-	var res *EmbedResult
-	err = pc.withRetry(ctx, func() (time.Duration, error) {
-		data, ra, err := pc.post(ctx, pc.buffered(), url, body)
+	res := &EmbedResult{Model: model, Embeddings: make([][]float64, 0, len(req.Inputs))}
+	for start := 0; start < len(req.Inputs); start += batch {
+		part := req
+		part.Inputs = req.Inputs[start:min(start+batch, len(req.Inputs))]
+		body, url, err := pc.buildEmbedRequest(model, part)
 		if err != nil {
-			return ra, err
+			return nil, err
 		}
-		vecs, usage, perr := pc.parseEmbedResponse(data, len(req.Inputs))
-		if perr != nil {
-			// 2xx with an unusable body is a provider protocol failure:
-			// typed, at the actual HTTP status, never retried.
-			return 0, terminal(&APIError{Provider: pc.cfg.ID, Status: http.StatusOK, Message: perr.Error()})
+		err = pc.withRetry(ctx, func() (time.Duration, error) {
+			data, ra, err := pc.post(ctx, pc.buffered(), url, body)
+			if err != nil {
+				return ra, err
+			}
+			vecs, usage, perr := pc.parseEmbedResponse(data, len(part.Inputs))
+			if perr != nil {
+				// 2xx with an unusable body is a provider protocol failure:
+				// typed, at the actual HTTP status, never retried.
+				return 0, terminal(&APIError{Provider: pc.cfg.ID, Status: http.StatusOK, Message: perr.Error()})
+			}
+			res.Embeddings = append(res.Embeddings, vecs...)
+			res.Usage.PromptTokens += usage.PromptTokens
+			return 0, nil
+		}, nil)
+		if err != nil {
+			return nil, err
 		}
-		res = &EmbedResult{Embeddings: vecs, Model: model, Usage: usage}
-		return 0, nil
-	}, nil)
-	if err != nil {
-		return nil, err
 	}
 	return res, nil
 }

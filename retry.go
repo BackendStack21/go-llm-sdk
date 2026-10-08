@@ -191,6 +191,10 @@ func (pc *providerClient) withRetry(ctx context.Context, op func() (time.Duratio
 		var apiErr *APIError
 		if !errors.As(err, &apiErr) {
 			// Transport error — retryable.
+			if cerr := ctx.Err(); cerr != nil {
+				// Interrupted by deadline/cancel, not exhaustion.
+				return cerr
+			}
 			if last {
 				return fmt.Errorf("llm: retry exhausted (%d attempts): %w", n, err)
 			}

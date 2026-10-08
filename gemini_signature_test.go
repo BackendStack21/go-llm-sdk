@@ -165,3 +165,26 @@ func TestGeminiModelPathEscaped(t *testing.T) {
 		t.Errorf("plain model url = %s", url)
 	}
 }
+
+// A prompt blocked by Gemini safety (promptFeedback.blockReason, no
+// candidates) is a completed content_filter turn, not a truncated stream.
+func TestGeminiPromptBlocked(t *testing.T) {
+	cfg := ProviderConfig{ID: "gemini", Format: FormatGemini}
+	var n int
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		n++
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = fmt.Fprint(w, "data: {\"promptFeedback\":{\"blockReason\":\"SAFETY\"}}\n\n")
+	}))
+	t.Cleanup(srv.Close)
+	cfg.BaseURL = srv.URL
+	c := newTestClient(t, cfg, srv)
+	res, err := c.CallStream(context.Background(), &ChatRequest{Messages: []Message{{Role: RoleUser, Content: "x"}}}, func(Delta) error { return nil })
+	if err != nil || res.FinishReason != FinishContentFilter || n != 1 {
+		t.Fatalf("res=%+v err=%v attempts=%d", res, err, n)
+	}
+	r, err := parseGeminiResponse([]byte(`{"promptFeedback":{"blockReason":"PROHIBITED_CONTENT"}}`))
+	if err != nil || r.FinishReason != FinishContentFilter {
+		t.Fatalf("buffered: res=%+v err=%v", r, err)
+	}
+}
