@@ -214,7 +214,15 @@ func TestBuildAnthropicRequestArms(t *testing.T) {
 			t.Errorf("anthropic request missing %q:\n%s", want, s)
 		}
 	}
-	if !strings.Contains(s, `"temperature":0`) {
+	if strings.Contains(s, `"temperature"`) {
+		t.Error("extended thinking must omit temperature")
+	}
+	req.Thinking, req.ThinkingBudget = "", 0
+	b, err = buildAnthropicRequest(req, "claude-x", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(b), `"temperature":0`) {
 		t.Error("negative temperature must normalize to an explicit 0")
 	}
 }

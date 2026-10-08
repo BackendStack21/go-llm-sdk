@@ -72,9 +72,10 @@ func TestBuildAnthropicRequest_Golden(t *testing.T) {
 		}
 	}
 
-	// max_tokens default + thinking budget.
-	if m["max_tokens"].(float64) != 8192 {
-		t.Errorf("max_tokens = %v, want default 8192", m["max_tokens"])
+	// max_tokens default leaves the visible-output default on top of the
+	// thinking budget (Anthropic requires max_tokens > budget_tokens).
+	if m["max_tokens"].(float64) != 2000+8192 {
+		t.Errorf("max_tokens = %v, want budget+8192", m["max_tokens"])
 	}
 	th := m["thinking"].(map[string]any)
 	if th["type"] != "enabled" || th["budget_tokens"].(float64) != 2000 {

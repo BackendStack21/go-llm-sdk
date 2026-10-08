@@ -71,6 +71,19 @@ type ToolCall struct {
 	ID        string
 	Name      string
 	Arguments string // JSON object as a string
+	// Signature is the provider's opaque per-call reasoning signature
+	// (Gemini thoughtSignature). Replay it unchanged; Gemini 3 rejects a
+	// function-call turn whose signature is missing.
+	Signature string
+}
+
+// ThinkingBlock is one provider-signed reasoning segment that must be
+// replayed verbatim and in order: an Anthropic thinking or
+// redacted_thinking block, or an OpenAI Responses reasoning item.
+type ThinkingBlock struct {
+	Text      string // reasoning text (summary on Responses); empty when redacted
+	Signature string // Anthropic signature / Responses encrypted_content
+	Redacted  string // Anthropic redacted_thinking data; Text and Signature stay empty
 }
 
 // Message is one canonical chat message. For RoleTool messages, ToolCallID
@@ -94,9 +107,13 @@ type Message struct {
 	// require thinking to be replayed verbatim (Anthropic signature, OpenAI
 	// Responses encrypted_content).
 	ThinkingSignature string
-	ToolCalls         []ToolCall
-	ToolCallID        string
-	ToolName          string
+	// ThinkingBlocks replays every signed reasoning segment of a previous
+	// assistant turn, in order. When set it supersedes ReasoningContent and
+	// ThinkingSignature on Anthropic and Responses requests.
+	ThinkingBlocks []ThinkingBlock
+	ToolCalls      []ToolCall
+	ToolCallID     string
+	ToolName       string
 	// Cache marks this user message for Anthropic prompt caching
 	// (cache_control ephemeral on the text block). Ignored on other
 	// formats and on non-user roles.
@@ -166,9 +183,12 @@ type ChatResult struct {
 	// thinking). Consumers must carry it back on the next assistant Message
 	// for tool loops to stay valid.
 	ThinkingSignature string
-	ToolCalls         []ToolCall
-	FinishReason      string
-	Usage             Usage
+	// ThinkingBlocks lists every signed reasoning segment in response order
+	// (Anthropic thinking/redacted_thinking, Responses reasoning items).
+	ThinkingBlocks []ThinkingBlock
+	ToolCalls      []ToolCall
+	FinishReason   string
+	Usage          Usage
 }
 
 // DeltaKind discriminates streamed fragments.
@@ -203,4 +223,25 @@ type Model struct {
 	ContextWindow   int // input token limit, 0 = unknown
 	MaxOutputTokens int // 0 = unknown
 	Capabilities    []string
+}
+
+// AssistantMessage returns the assistant turn to append to the conversation
+// before the next request. It carries every replay field (reasoning,
+// signatures, thinking blocks, tool calls) so tool loops stay valid on
+// every format. Slices are copied.
+func (r *ChatResult) AssistantMessage() Message {
+	m := Message{Role: RoleAssistant}
+	if r == nil {
+		return m
+	}
+	m.Content = r.Content
+	m.ReasoningContent = r.ReasoningContent
+	m.ThinkingSignature = r.ThinkingSignature
+	if len(r.ThinkingBlocks) > 0 {
+		m.ThinkingBlocks = append([]ThinkingBlock(nil), r.ThinkingBlocks...)
+	}
+	if len(r.ToolCalls) > 0 {
+		m.ToolCalls = append([]ToolCall(nil), r.ToolCalls...)
+	}
+	return m
 }

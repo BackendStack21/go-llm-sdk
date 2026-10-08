@@ -33,10 +33,12 @@ type anBlock struct {
 	Source *anImageSource `json:"source,omitempty"`
 	// CacheControl is set on user text blocks when Message.Cache is true.
 	CacheControl *anCacheControl `json:"cache_control,omitempty"`
-	// thinking (replayed assistant turns; must be the FIRST block and
-	// carry the provider signature)
+	// thinking / redacted_thinking (replayed assistant turns; they go
+	// FIRST, in response order, and carry the provider signature or the
+	// opaque redacted data)
 	Thinking  string `json:"thinking,omitempty"`
 	Signature string `json:"signature,omitempty"`
+	Data      string `json:"data,omitempty"`
 	// tool_use
 	ID    string          `json:"id,omitempty"`
 	Name  string          `json:"name,omitempty"`
@@ -84,6 +86,9 @@ type anRequest struct {
 
 const anthropicDefaultMaxTokens = 8192
 
+// anthropicMinThinkingBudget is Anthropic's minimum budget_tokens.
+const anthropicMinThinkingBudget = 1024
+
 // anthropicThinkingBudget maps canonical thinking levels to budgets.
 // Anthropic requires budget_tokens >= 1024.
 func anthropicThinkingBudget(level string, explicit int) (int, bool) {
@@ -101,9 +106,34 @@ func anthropicThinkingBudget(level string, explicit int) (int, bool) {
 		return 0, false
 	}
 	if explicit > 0 {
-		budget = maxInt(explicit, 1024)
+		budget = maxInt(explicit, anthropicMinThinkingBudget)
 	}
 	return budget, true
+}
+
+// anthropicThinkingReplay renders the signed reasoning of a replayed
+// assistant turn. ThinkingBlocks (every thinking and redacted_thinking block,
+// in response order) supersede the legacy single ReasoningContent +
+// ThinkingSignature pair, which is validated here and rendered by the caller.
+func anthropicThinkingReplay(m Message, i int) ([]anBlock, error) {
+	if len(m.ThinkingBlocks) == 0 {
+		if m.ReasoningContent != "" && m.ThinkingSignature == "" {
+			return nil, &ConfigError{Msg: fmt.Sprintf("message %d: Anthropic thinking replay requires ThinkingSignature", i)}
+		}
+		return nil, nil
+	}
+	blocks := make([]anBlock, 0, len(m.ThinkingBlocks))
+	for j, tb := range m.ThinkingBlocks {
+		switch {
+		case tb.Redacted != "":
+			blocks = append(blocks, anBlock{Type: "redacted_thinking", Data: tb.Redacted})
+		case tb.Signature == "":
+			return nil, &ConfigError{Msg: fmt.Sprintf("message %d thinking block %d: Anthropic thinking replay requires a Signature", i, j)}
+		default:
+			blocks = append(blocks, anBlock{Type: "thinking", Thinking: tb.Text, Signature: tb.Signature})
+		}
+	}
+	return blocks, nil
 }
 
 func maxInt(a, b int) int {
@@ -146,11 +176,30 @@ func buildAnthropicRequest(req *ChatRequest, model string, stream bool) ([]byte,
 		}
 		out.TopP = &p
 	}
+	if budget, ok := anthropicThinkingBudget(req.Thinking, req.ThinkingBudget); ok {
+		// Anthropic requires max_tokens > budget_tokens, and the budget
+		// counts against max_tokens. An unset MaxTokens leaves the usual
+		// visible-output room on top of the budget; an explicit MaxTokens
+		// is a hard cap, so a preset level is clamped below it and an
+		// explicit ThinkingBudget that cannot fit fails fast.
+		switch {
+		case out.MaxTokens <= 0:
+			out.MaxTokens = budget + anthropicDefaultMaxTokens
+		case budget >= out.MaxTokens && req.ThinkingBudget > 0:
+			return nil, &ConfigError{Msg: fmt.Sprintf("Anthropic ThinkingBudget %d must be below MaxTokens %d", budget, out.MaxTokens)}
+		case budget >= out.MaxTokens:
+			budget = out.MaxTokens - 1
+			if budget < anthropicMinThinkingBudget {
+				return nil, &ConfigError{Msg: fmt.Sprintf("Anthropic thinking needs MaxTokens above %d, got %d", anthropicMinThinkingBudget, out.MaxTokens)}
+			}
+		}
+		out.Thinking = &anThinking{Type: "enabled", BudgetTokens: budget}
+		// Extended thinking rejects modified sampling; the provider default
+		// is the only accepted value.
+		out.Temperature, out.TopP = nil, nil
+	}
 	if out.MaxTokens <= 0 {
 		out.MaxTokens = anthropicDefaultMaxTokens
-	}
-	if budget, ok := anthropicThinkingBudget(req.Thinking, req.ThinkingBudget); ok {
-		out.Thinking = &anThinking{Type: "enabled", BudgetTokens: budget}
 	}
 	for _, t := range req.Tools {
 		schema := t.Parameters
@@ -196,11 +245,11 @@ func buildAnthropicRequest(req *ChatRequest, model string, stream bool) ([]byte,
 			}
 			out.Messages = append(out.Messages, anMessage{Role: "user", Content: blocks})
 		case RoleAssistant:
-			if m.ReasoningContent != "" && m.ThinkingSignature == "" {
-				return nil, &ConfigError{Msg: fmt.Sprintf("message %d: Anthropic thinking replay requires ThinkingSignature", i)}
+			blocks, err := anthropicThinkingReplay(m, i)
+			if err != nil {
+				return nil, err
 			}
-			var blocks []anBlock
-			if m.ReasoningContent != "" && m.ThinkingSignature != "" {
+			if len(m.ThinkingBlocks) == 0 && m.ReasoningContent != "" {
 				// Anthropic requires a replayed thinking block to be the
 				// FIRST block and to carry its signature; extended-thinking
 				// tool loops are otherwise rejected mid-conversation.
@@ -251,6 +300,7 @@ type anRespBlock struct {
 	Text      string          `json:"text"`
 	Thinking  string          `json:"thinking"`
 	Signature string          `json:"signature"`
+	Data      string          `json:"data"` // redacted_thinking payload
 	ID        string          `json:"id"`
 	Name      string          `json:"name"`
 	Input     json.RawMessage `json:"input"`
@@ -323,6 +373,15 @@ func parseAnthropicResponse(body []byte) (*ChatResult, error) {
 			content = append(content, b.Text)
 		case "thinking":
 			thinking = append(thinking, b.Thinking)
+			res.ThinkingBlocks = append(res.ThinkingBlocks, ThinkingBlock{Text: b.Thinking, Signature: b.Signature})
+			if b.Signature != "" {
+				// Legacy single-signature field: the last block's.
+				res.ThinkingSignature = b.Signature
+			}
+		case "redacted_thinking":
+			// Opaque, encrypted reasoning: never surfaced as text, but it
+			// must be replayed verbatim for tool loops to stay valid.
+			res.ThinkingBlocks = append(res.ThinkingBlocks, ThinkingBlock{Redacted: b.Data})
 		case "tool_use":
 			args := string(b.Input)
 			if args == "" {
@@ -333,11 +392,6 @@ func parseAnthropicResponse(body []byte) (*ChatResult, error) {
 	}
 	res.Content = strings.Join(content, "")
 	res.ReasoningContent = strings.Join(thinking, "")
-	for _, b := range r.Content {
-		if b.Type == "thinking" && b.Signature != "" {
-			res.ThinkingSignature = b.Signature
-		}
-	}
 	res.Usage = usageFromAnthropic(r.Usage)
 	return res, nil
 }
@@ -386,15 +440,20 @@ func mapAnthropicStreamEvent(data []byte, acc *streamAccum) ([]Delta, bool, erro
 	case "message_start":
 		acc.usage = usageFromAnthropic(ev.Message.Usage)
 	case "content_block_start":
-		if ev.ContentBlock.Type == "tool_use" {
+		switch ev.ContentBlock.Type {
+		case "tool_use":
 			c := acc.call(ev.Index)
 			c.id, c.name = ev.ContentBlock.ID, ev.ContentBlock.Name
 			deltas = append(deltas, Delta{
 				Kind:      DeltaToolArgs,
-				ToolIndex: ev.Index,
+				ToolIndex: c.pos,
 				ToolID:    c.id,
 				ToolName:  c.name,
 			})
+		case "thinking":
+			acc.block(ev.Index)
+		case "redacted_thinking":
+			acc.block(ev.Index).redacted = ev.ContentBlock.Data
 		}
 	case "content_block_delta":
 		switch ev.Delta.Type {
@@ -403,16 +462,21 @@ func mapAnthropicStreamEvent(data []byte, acc *streamAccum) ([]Delta, bool, erro
 			deltas = append(deltas, Delta{Kind: DeltaContent, Text: ev.Delta.Text})
 		case "thinking_delta":
 			acc.reasoning.WriteString(ev.Delta.Thinking)
+			acc.block(ev.Index).text.WriteString(ev.Delta.Thinking)
 			deltas = append(deltas, Delta{Kind: DeltaReasoning, Text: ev.Delta.Thinking})
 		case "signature_delta":
-			acc.thinkingSignature += ev.Delta.Signature
+			// Signatures belong to their own block; concatenating them
+			// across blocks would produce an invalid signature.
+			b := acc.block(ev.Index)
+			b.sig += ev.Delta.Signature
+			acc.thinkingSignature = b.sig
 		case "input_json_delta":
 			c := acc.call(ev.Index)
 			c.args.WriteString(ev.Delta.PartialJSON)
 			deltas = append(deltas, Delta{
 				Kind:      DeltaToolArgs,
 				Text:      ev.Delta.PartialJSON,
-				ToolIndex: ev.Index,
+				ToolIndex: c.pos,
 				ToolID:    c.id,
 				ToolName:  c.name,
 			})
@@ -420,6 +484,7 @@ func mapAnthropicStreamEvent(data []byte, acc *streamAccum) ([]Delta, bool, erro
 	case "message_delta":
 		if ev.Delta.StopReason != "" {
 			acc.finishReason = mapAnthropicStopReason(ev.Delta.StopReason)
+			acc.sawFinish = true
 		}
 		acc.usage.CompletionTokens = ev.Usage.OutputTokens
 	case "message_stop":

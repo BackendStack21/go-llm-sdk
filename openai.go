@@ -563,12 +563,13 @@ func mapOpenAIStreamEvent(data []byte, acc *streamAccum) (deltas []Delta, done b
 			if tc.Function.Name != "" {
 				call.name = tc.Function.Name
 			}
-			accDelta := Delta{Kind: DeltaToolArgs, Text: tc.Function.Arguments, ToolIndex: idx, ToolID: call.id, ToolName: call.name}
+			accDelta := Delta{Kind: DeltaToolArgs, Text: tc.Function.Arguments, ToolIndex: call.pos, ToolID: call.id, ToolName: call.name}
 			call.args.WriteString(tc.Function.Arguments)
 			deltas = append(deltas, accDelta)
 		}
 		if ch.FinishReason != "" {
 			acc.finishReason = mapOpenAIFinishReason(ch.FinishReason)
+			acc.sawFinish = true
 		}
 	}
 	return deltas, false, nil

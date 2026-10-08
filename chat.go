@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	neturl "net/url"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -153,10 +154,13 @@ func (pc *providerClient) buildChatRequest(req *ChatRequest, model string, strea
 		return body, pc.base + "/v1/messages", err
 	case FormatGemini:
 		body, err := buildGeminiRequest(req, model, stream)
+		// The model rides the URL path: escape it so a model id can never
+		// rewrite the path or smuggle a query.
+		m := neturl.PathEscape(model)
 		if stream {
-			return body, fmt.Sprintf("%s/v1beta/models/%s:streamGenerateContent?alt=sse", pc.base, model), err
+			return body, fmt.Sprintf("%s/v1beta/models/%s:streamGenerateContent?alt=sse", pc.base, m), err
 		}
-		return body, fmt.Sprintf("%s/v1beta/models/%s:generateContent", pc.base, model), err
+		return body, fmt.Sprintf("%s/v1beta/models/%s:generateContent", pc.base, m), err
 	default: // FormatOpenAI
 		if useResponsesAPI(pc.learn, pc.cfg.Format, model, req) {
 			body, err := json.Marshal(buildResponsesRequest(req, model, stream))
@@ -677,10 +681,11 @@ func (pc *providerClient) attemptStream(ctx context.Context, url string, body []
 
 	switch {
 	case perr == nil, errors.Is(perr, errStreamStop):
-		if perr == nil && pc.cfg.Format != FormatGemini && acc.finishReason == "" {
-			// Gemini completes at EOF; every other format has an explicit
-			// completion signal that never arrived — the provider dropped
-			// the stream. Never surface this as an empty success.
+		if perr == nil && !acc.sawFinish {
+			// Every format sends an explicit completion signal ([DONE],
+			// finish_reason, message_stop, finishReason, response.completed)
+			// before EOF. It never arrived: the provider dropped the stream.
+			// Never surface this as a silent (partial or empty) success.
 			if acc.emitted {
 				return streamOutcome{
 					result: acc.result(),
@@ -713,10 +718,21 @@ func (pc *providerClient) attemptStream(ctx context.Context, url string, body []
 
 // toolCallAccum assembles one tool call from streaming fragments: the first
 // fragment for an index carries id/name; argument fragments concatenate.
+// pos is the call's position in ChatResult.ToolCalls — the canonical
+// Delta.ToolIndex on every format.
 type toolCallAccum struct {
+	pos  int
 	id   string
 	name string
+	sig  string
 	args strings.Builder
+}
+
+// thinkingAccum assembles one signed reasoning segment (ThinkingBlock).
+type thinkingAccum struct {
+	text     strings.Builder
+	sig      string
+	redacted string
 }
 
 // streamAccum assembles a ChatResult from SSE chunks across formats.
@@ -725,25 +741,47 @@ type streamAccum struct {
 	reasoning         strings.Builder
 	calls             []*toolCallAccum
 	callIndex         map[int]*toolCallAccum
+	thinking          []*thinkingAccum
+	thinkingIndex     map[int]*thinkingAccum
 	finishReason      string
+	sawFinish         bool // provider sent a completion signal (even an unmapped one)
 	usage             Usage
 	emitted           bool   // any delta delivered to the consumer
-	thinkingSignature string // anthropic signature_delta capture
+	thinkingSignature string // legacy single signature (last block's)
+	jsonTool          string // Anthropic JSON-mode synthetic tool name ("" = off)
+	jsonBlock         int    // content-block index of the JSON-mode tool_use (-1 = none)
 }
 
 func newStreamAccum() *streamAccum {
-	return &streamAccum{callIndex: make(map[int]*toolCallAccum)}
+	return &streamAccum{
+		callIndex:     make(map[int]*toolCallAccum),
+		thinkingIndex: make(map[int]*thinkingAccum),
+		jsonBlock:     -1,
+	}
 }
 
-// call returns the accumulator for tool-call index, creating it in order.
+// call returns the accumulator for provider index idx, creating it in
+// first-seen order.
 func (a *streamAccum) call(idx int) *toolCallAccum {
 	if c, ok := a.callIndex[idx]; ok {
 		return c
 	}
-	c := &toolCallAccum{}
+	c := &toolCallAccum{pos: len(a.calls)}
 	a.callIndex[idx] = c
 	a.calls = append(a.calls, c)
 	return c
+}
+
+// block returns the thinking accumulator for provider index idx, creating
+// it in first-seen order.
+func (a *streamAccum) block(idx int) *thinkingAccum {
+	if b, ok := a.thinkingIndex[idx]; ok {
+		return b
+	}
+	b := &thinkingAccum{}
+	a.thinkingIndex[idx] = b
+	a.thinking = append(a.thinking, b)
+	return b
 }
 
 func (a *streamAccum) result() *ChatResult {
@@ -754,8 +792,11 @@ func (a *streamAccum) result() *ChatResult {
 		FinishReason:      a.finishReason,
 		Usage:             a.usage,
 	}
+	for _, b := range a.thinking {
+		res.ThinkingBlocks = append(res.ThinkingBlocks, ThinkingBlock{Text: b.text.String(), Signature: b.sig, Redacted: b.redacted})
+	}
 	for _, c := range a.calls {
-		res.ToolCalls = append(res.ToolCalls, ToolCall{ID: c.id, Name: c.name, Arguments: c.args.String()})
+		res.ToolCalls = append(res.ToolCalls, ToolCall{ID: c.id, Name: c.name, Arguments: c.args.String(), Signature: c.sig})
 	}
 	return res
 }

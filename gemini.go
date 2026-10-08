@@ -32,6 +32,7 @@ type gmPart struct {
 	Thought          bool      `json:"thought,omitempty"`
 	FunctionCall     *gmFnCall `json:"functionCall,omitempty"`
 	FunctionResponse *gmFnResp `json:"functionResponse,omitempty"`
+	ThoughtSignature string    `json:"thoughtSignature,omitempty"`
 }
 type gmBlob struct {
 	MIMEType string `json:"mimeType"`
@@ -159,19 +160,23 @@ func buildGeminiRequest(req *ChatRequest, model string, stream bool) ([]byte, er
 					toolNameByID[tc.ID] = tc.Name
 				}
 			}
+			// Thought signatures are replayed on the part they arrived on:
+			// per function call (Gemini 3 rejects a function-call turn
+			// without them) and on the text part.
 			parts := []gmPart{}
 			if m.Content != "" {
-				parts = append(parts, gmPart{Text: m.Content})
+				parts = append(parts, gmPart{Text: m.Content, ThoughtSignature: m.ThinkingSignature})
 			}
 			for _, tc := range m.ToolCalls {
 				args := json.RawMessage(tc.Arguments)
 				if len(args) == 0 {
 					args = json.RawMessage("{}")
 				}
-				parts = append(parts, gmPart{FunctionCall: &gmFnCall{Name: tc.Name, Args: args}})
+				parts = append(parts, gmPart{FunctionCall: &gmFnCall{Name: tc.Name, Args: args}, ThoughtSignature: tc.Signature})
 			}
 			if len(parts) == 0 {
-				parts = []gmPart{{Text: " "}} // Gemini rejects empty parts
+				// Gemini rejects empty parts.
+				parts = []gmPart{{Text: " ", ThoughtSignature: m.ThinkingSignature}}
 			}
 			out.Contents = append(out.Contents, gmContent{Role: "model", Parts: parts})
 		case RoleTool:
@@ -243,9 +248,10 @@ func buildGeminiRequest(req *ChatRequest, model string, stream bool) ([]byte, er
 // ── response ─────────────────────────────────────────────────────────────
 
 type gmRespPart struct {
-	Text         string    `json:"text"`
-	Thought      bool      `json:"thought"`
-	FunctionCall *gmFnCall `json:"functionCall"`
+	Text             string    `json:"text"`
+	Thought          bool      `json:"thought"`
+	FunctionCall     *gmFnCall `json:"functionCall"`
+	ThoughtSignature string    `json:"thoughtSignature"`
 }
 
 type gmCandidate struct {
@@ -286,6 +292,17 @@ func mapGeminiFinishReason(s string) string {
 	}
 }
 
+// geminiFinish maps finishReason and folds in the tool-call turn: Gemini
+// reports STOP for a function-call response, which every other format
+// reports as tool_calls.
+func geminiFinish(reason string, hasCalls bool) string {
+	f := mapGeminiFinishReason(reason)
+	if f == FinishStop && hasCalls {
+		return FinishToolCalls
+	}
+	return f
+}
+
 func mapGeminiUsage(u gmUsage) Usage {
 	return Usage{
 		PromptTokens:     u.PromptTokenCount,
@@ -310,6 +327,7 @@ func foldGeminiParts(parts []gmRespPart, acc *streamAccum) []Delta {
 				args = "{}"
 			}
 			c.args.WriteString(args)
+			c.sig = p.ThoughtSignature
 			deltas = append(deltas, Delta{
 				Kind:      DeltaToolArgs,
 				Text:      args,
@@ -317,7 +335,13 @@ func foldGeminiParts(parts []gmRespPart, acc *streamAccum) []Delta {
 				ToolID:    c.id,
 				ToolName:  c.name,
 			})
+		case p.ThoughtSignature != "" && p.Text == "":
+			// Signature-only part (streams often close with one).
+			acc.thinkingSignature = p.ThoughtSignature
 		case p.Text != "":
+			if p.ThoughtSignature != "" {
+				acc.thinkingSignature = p.ThoughtSignature
+			}
 			if p.Thought {
 				acc.reasoning.WriteString(p.Text)
 				deltas = append(deltas, Delta{Kind: DeltaReasoning, Text: p.Text})
@@ -343,7 +367,7 @@ func parseGeminiResponse(body []byte) (*ChatResult, error) {
 	c := r.Candidates[0]
 	foldGeminiParts(c.Content.Parts, acc)
 	res := acc.result()
-	res.FinishReason = mapGeminiFinishReason(c.FinishReason)
+	res.FinishReason = geminiFinish(c.FinishReason, len(res.ToolCalls) > 0)
 	res.Usage = mapGeminiUsage(r.UsageMetadata)
 	return res, nil
 }
@@ -372,7 +396,8 @@ func mapGeminiStreamEvent(data []byte, acc *streamAccum) ([]Delta, bool, error) 
 	cand := c.Candidates[0]
 	deltas := foldGeminiParts(cand.Content.Parts, acc)
 	if cand.FinishReason != "" {
-		acc.finishReason = mapGeminiFinishReason(cand.FinishReason)
+		acc.finishReason = geminiFinish(cand.FinishReason, len(acc.calls) > 0)
+		acc.sawFinish = true
 	}
 	return deltas, false, nil
 }

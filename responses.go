@@ -431,7 +431,7 @@ func mapResponsesStreamEvent(data []byte, acc *streamAccum) (deltas []Delta, don
 		deltas = append(deltas, Delta{
 			Kind:      DeltaToolArgs,
 			Text:      ev.Delta,
-			ToolIndex: ev.OutputIndex,
+			ToolIndex: call.pos,
 			ToolID:    call.id,
 			ToolName:  call.name,
 		})
@@ -450,6 +450,7 @@ func mapResponsesStreamEvent(data []byte, acc *streamAccum) (deltas []Delta, don
 			acc.thinkingSignature = ev.Item.EncryptedContent
 		}
 	case "response.completed", "response.incomplete":
+		acc.sawFinish = true
 		if ev.Response != nil {
 			if ev.Response.Usage != nil {
 				acc.usage = usageFromResponses(ev.Response.Usage)
