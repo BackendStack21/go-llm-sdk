@@ -78,17 +78,20 @@ type rsFunctionOutputItem struct {
 }
 
 type rsRequest struct {
-	Model           string       `json:"model"`
-	Instructions    string       `json:"instructions,omitempty"`
-	Input           []any        `json:"input"`
-	Tools           []rsTool     `json:"tools,omitempty"`
-	MaxOutputTokens int          `json:"max_output_tokens,omitempty"`
-	Temperature     *float64     `json:"temperature,omitempty"`
-	TopP            *float64     `json:"top_p,omitempty"`
-	Stream          bool         `json:"stream,omitempty"`
-	Store           *bool        `json:"store,omitempty"`
-	Include         []string     `json:"include,omitempty"`
-	Reasoning       *rsReasoning `json:"reasoning,omitempty"`
+	Model             string       `json:"model"`
+	Instructions      string       `json:"instructions,omitempty"`
+	Input             []any        `json:"input"`
+	Tools             []rsTool     `json:"tools,omitempty"`
+	MaxOutputTokens   int          `json:"max_output_tokens,omitempty"`
+	Temperature       *float64     `json:"temperature,omitempty"`
+	TopP              *float64     `json:"top_p,omitempty"`
+	Stream            bool         `json:"stream,omitempty"`
+	Store             *bool        `json:"store,omitempty"`
+	Include           []string     `json:"include,omitempty"`
+	Reasoning         *rsReasoning `json:"reasoning,omitempty"`
+	ToolChoice        any          `json:"tool_choice,omitempty"`
+	ParallelToolCalls *bool        `json:"parallel_tool_calls,omitempty"`
+	Text              *rsText      `json:"text,omitempty"`
 }
 
 func boolPtr(v bool) *bool { return &v }
@@ -159,6 +162,10 @@ func buildResponsesRequest(req *ChatRequest, model string, stream bool) rsReques
 		Stream:       stream,
 		Store:        boolPtr(false),
 		Include:      []string{"reasoning.encrypted_content"},
+		// Seed and Stop have no Responses equivalent and are not sent.
+		ToolChoice:        responsesToolChoice(req.ToolChoice),
+		ParallelToolCalls: parallelToolCalls(req),
+		Text:              responsesText(req.ResponseFormat),
 	}
 	if req.MaxTokens > 0 {
 		out.MaxOutputTokens = req.MaxTokens

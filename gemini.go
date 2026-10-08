@@ -60,17 +60,21 @@ type gmThinkCfg struct {
 }
 
 type gmGenCfg struct {
-	MaxOutputTokens int         `json:"maxOutputTokens,omitempty"`
-	Temperature     *float64    `json:"temperature,omitempty"`
-	TopP            *float64    `json:"topP,omitempty"`
-	StopSequences   []string    `json:"stopSequences,omitempty"`
-	ThinkingConfig  *gmThinkCfg `json:"thinkingConfig,omitempty"`
+	MaxOutputTokens    int             `json:"maxOutputTokens,omitempty"`
+	Temperature        *float64        `json:"temperature,omitempty"`
+	TopP               *float64        `json:"topP,omitempty"`
+	StopSequences      []string        `json:"stopSequences,omitempty"`
+	ThinkingConfig     *gmThinkCfg     `json:"thinkingConfig,omitempty"`
+	Seed               *int            `json:"seed,omitempty"`
+	ResponseMimeType   string          `json:"responseMimeType,omitempty"`
+	ResponseJSONSchema json.RawMessage `json:"responseJsonSchema,omitempty"`
 }
 
 type gmRequest struct {
 	SystemInstruction *gmContent    `json:"systemInstruction,omitempty"`
 	Contents          []gmContent   `json:"contents"`
 	Tools             []gmToolGroup `json:"tools,omitempty"`
+	ToolConfig        *gmToolConfig `json:"toolConfig,omitempty"`
 	GenerationConfig  *gmGenCfg     `json:"generationConfig,omitempty"`
 }
 
@@ -238,8 +242,17 @@ func buildGeminiRequest(req *ChatRequest, model string, stream bool) ([]byte, er
 	if tc := geminiThinkingConfig(req.Thinking, req.ThinkingBudget); tc != nil {
 		cfg.ThinkingConfig = tc
 	}
+	cfg.Seed = req.Seed
+	if req.ResponseFormat.jsonMode() {
+		cfg.ResponseMimeType = "application/json"
+		if req.ResponseFormat.Type == ResponseJSONSchema {
+			cfg.ResponseJSONSchema = req.ResponseFormat.Schema
+		}
+	}
+	out.ToolConfig = geminiToolConfig(req.ToolChoice)
 	if cfg.MaxOutputTokens != 0 || cfg.Temperature != nil || cfg.TopP != nil ||
-		len(cfg.StopSequences) > 0 || cfg.ThinkingConfig != nil {
+		len(cfg.StopSequences) > 0 || cfg.ThinkingConfig != nil || cfg.Seed != nil ||
+		cfg.ResponseMimeType != "" {
 		out.GenerationConfig = &cfg
 	}
 	return json.Marshal(out)

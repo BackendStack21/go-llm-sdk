@@ -82,7 +82,7 @@ func TestAttemptStream_NonSSEBodyBounds(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			client := &http.Client{Transport: nonSSETransport{body: io.NopCloser(tc.reader)}}
 			pc := newProviderClient(ProviderConfig{Format: FormatOpenAI}, client, client)
-			out := pc.attemptStream(context.Background(), "http://provider.test/chat/completions", []byte(`{}`), mapOpenAIStreamEvent, func(Delta) error { t.Error("unexpected delta"); return nil }, false)
+			out := pc.attemptStream(context.Background(), "http://provider.test/chat/completions", []byte(`{}`), mapOpenAIStreamEvent, func(Delta) error { t.Error("unexpected delta"); return nil }, false, "")
 			if !out.bufferedResponse || out.result != nil || out.err == nil || !strings.Contains(out.err.Error(), tc.errorText) {
 				t.Fatalf("outcome=%+v", out)
 			}

@@ -171,6 +171,9 @@ func (pc *providerClient) buildChatRequest(req *ChatRequest, model string, strea
 	if err := validateRequestContent(req.Messages); err != nil {
 		return nil, "", err
 	}
+	if err := validateRequestControls(req); err != nil {
+		return nil, "", err
+	}
 	if model == "" {
 		model = req.Model
 	}
@@ -408,7 +411,7 @@ func (pc *providerClient) call(ctx context.Context, req *ChatRequest, model stri
 		if err != nil {
 			return ra, err
 		}
-		res, err = pc.parseResponse(data, url)
+		res, err = pc.parseResponse(data, url, pc.jsonTool(req))
 		return 0, terminal(err)
 	}, func(apiErr *APIError) bool {
 		return pc.learnFromChatError(req, apiErr)
@@ -440,11 +443,22 @@ func (pc *providerClient) learnFromChatError(req *ChatRequest, apiErr *APIError)
 	return false
 }
 
-// parseResponse dispatches format-specific buffered parsing.
-func (pc *providerClient) parseResponse(data []byte, url string) (*ChatResult, error) {
+// jsonTool is the Anthropic JSON-mode tool for req ("" elsewhere).
+func (pc *providerClient) jsonTool(req *ChatRequest) string {
+	if pc.cfg.Format != FormatAnthropic {
+		return ""
+	}
+	return anthropicJSONToolName(req)
+}
+
+// parseResponse dispatches format-specific buffered parsing. jsonTool
+// names the Anthropic JSON-mode tool to fold into Content ("" = off).
+func (pc *providerClient) parseResponse(data []byte, url, jsonTool string) (*ChatResult, error) {
 	switch pc.cfg.Format {
 	case FormatAnthropic:
-		return parseAnthropicResponse(data)
+		res, err := parseAnthropicResponse(data)
+		foldAnthropicJSON(res, jsonTool)
+		return res, err
 	case FormatGemini:
 		return parseGeminiResponse(data)
 	default:
@@ -506,7 +520,7 @@ func (pc *providerClient) callStream(ctx context.Context, req *ChatRequest, mode
 			attemptMapper = mapResponsesStreamEvent
 		}
 
-		out := pc.attemptStream(deadlineCtx, url, body, attemptMapper, onDelta, len(req.Tools) > 0)
+		out := pc.attemptStream(deadlineCtx, url, body, attemptMapper, onDelta, len(req.Tools) > 0, pc.jsonTool(req))
 		switch {
 		case out.bufferedResponse:
 			// A successful HTTP response already contains this generation.
@@ -587,7 +601,7 @@ func (o *streamOutcome) success() bool {
 
 // attemptStream performs one streaming attempt. learnEffort enables the
 // reasoning_effort learn-once trigger (set when the request carries tools).
-func (pc *providerClient) attemptStream(ctx context.Context, url string, body []byte, mapper streamEventMapper, onDelta func(Delta) error, learnEffort bool) streamOutcome {
+func (pc *providerClient) attemptStream(ctx context.Context, url string, body []byte, mapper streamEventMapper, onDelta func(Delta) error, learnEffort bool, jsonTool string) streamOutcome {
 	req, rerr := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body))
 	if rerr != nil {
 		return streamOutcome{err: &ConfigError{Msg: "build request: " + rerr.Error()}}
@@ -635,11 +649,12 @@ func (pc *providerClient) attemptStream(ctx context.Context, url string, body []
 		if len(data) > maxResponseSize {
 			return streamOutcome{bufferedResponse: true, err: fmt.Errorf("llm: response exceeds %d bytes", maxResponseSize)}
 		}
-		result, err := pc.parseResponse(data, url)
+		result, err := pc.parseResponse(data, url, jsonTool)
 		return streamOutcome{bufferedResponse: true, result: result, err: err}
 	}
 
 	acc := newStreamAccum()
+	acc.jsonTool = jsonTool
 	perr := pumpSSE(ctx, resp.Body, pc.idleTimeout(), func(data []byte) error {
 		if string(bytes.TrimSpace(data)) == "[DONE]" {
 			return errStreamStop
@@ -729,12 +744,15 @@ type streamAccum struct {
 	usage             Usage
 	emitted           bool   // any delta delivered to the consumer
 	thinkingSignature string // legacy single signature (last block's)
+	jsonTool          string // Anthropic JSON-mode synthetic tool name ("" = off)
+	jsonBlock         int    // content-block index of the JSON-mode tool_use (-1 = none)
 }
 
 func newStreamAccum() *streamAccum {
 	return &streamAccum{
 		callIndex:     make(map[int]*toolCallAccum),
 		thinkingIndex: make(map[int]*thinkingAccum),
+		jsonBlock:     -1,
 	}
 }
 

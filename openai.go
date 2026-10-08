@@ -95,28 +95,36 @@ type oaStreamOptions struct {
 }
 
 type oaRequest struct {
-	Model               string           `json:"model"`
-	Messages            []oaMessage      `json:"messages"`
-	Tools               []oaToolDef      `json:"tools,omitempty"`
-	MaxTokens           int              `json:"max_tokens,omitempty"`
-	MaxCompletionTokens int              `json:"max_completion_tokens,omitempty"`
-	Temperature         *float64         `json:"temperature,omitempty"`
-	TopP                *float64         `json:"top_p,omitempty"`
-	Stop                []string         `json:"stop,omitempty"`
-	Stream              bool             `json:"stream,omitempty"`
-	StreamOptions       *oaStreamOptions `json:"stream_options,omitempty"`
-	ReasoningEffort     string           `json:"reasoning_effort,omitempty"`
-	IncludeReasoning    *bool            `json:"include_reasoning,omitempty"`
-	Thinking            *oaThinking      `json:"thinking,omitempty"`
+	Model               string            `json:"model"`
+	Messages            []oaMessage       `json:"messages"`
+	Tools               []oaToolDef       `json:"tools,omitempty"`
+	MaxTokens           int               `json:"max_tokens,omitempty"`
+	MaxCompletionTokens int               `json:"max_completion_tokens,omitempty"`
+	Temperature         *float64          `json:"temperature,omitempty"`
+	TopP                *float64          `json:"top_p,omitempty"`
+	Stop                []string          `json:"stop,omitempty"`
+	Stream              bool              `json:"stream,omitempty"`
+	StreamOptions       *oaStreamOptions  `json:"stream_options,omitempty"`
+	ReasoningEffort     string            `json:"reasoning_effort,omitempty"`
+	IncludeReasoning    *bool             `json:"include_reasoning,omitempty"`
+	Thinking            *oaThinking       `json:"thinking,omitempty"`
+	ToolChoice          any               `json:"tool_choice,omitempty"`
+	ParallelToolCalls   *bool             `json:"parallel_tool_calls,omitempty"`
+	ResponseFormat      *oaResponseFormat `json:"response_format,omitempty"`
+	Seed                *int              `json:"seed,omitempty"`
 }
 
 // buildOpenAIRequest renders the canonical request in OpenAI format.
 func buildOpenAIRequest(cfg ProviderConfig, req *ChatRequest, model string, stream, includeStreamOptions bool) oaRequest {
 	q := cfg.Quirks
 	out := oaRequest{
-		Model:  model,
-		Stop:   req.Stop,
-		Stream: stream,
+		Model:             model,
+		Stop:              req.Stop,
+		Stream:            stream,
+		ToolChoice:        openAIToolChoice(req.ToolChoice),
+		ParallelToolCalls: parallelToolCalls(req),
+		ResponseFormat:    openAIResponseFormat(req.ResponseFormat),
+		Seed:              req.Seed,
 	}
 	// OpenAI o-series/gpt-5 models reject max_tokens in favor of
 	// max_completion_tokens; everyone else keeps the classic parameter.

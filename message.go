@@ -177,6 +177,48 @@ func (u Usage) InputTokens() int {
 // TotalTokens is InputTokens plus CompletionTokens.
 func (u Usage) TotalTokens() int { return u.InputTokens() + u.CompletionTokens }
 
+// ToolChoiceMode selects how the model may use the request's tools.
+type ToolChoiceMode string
+
+const (
+	ToolChoiceAuto     ToolChoiceMode = "auto"     // the model decides (provider default)
+	ToolChoiceNone     ToolChoiceMode = "none"     // never call a tool
+	ToolChoiceRequired ToolChoiceMode = "required" // call at least one tool
+	ToolChoiceTool     ToolChoiceMode = "tool"     // call the tool named by Name
+)
+
+// ToolChoice constrains tool use. Name is set only with ToolChoiceTool and
+// must match one of the request's Tools.
+type ToolChoice struct {
+	Mode ToolChoiceMode
+	Name string
+}
+
+// ToolChoiceNamed forces a call to the named tool.
+func ToolChoiceNamed(name string) *ToolChoice {
+	return &ToolChoice{Mode: ToolChoiceTool, Name: name}
+}
+
+// ResponseFormatType selects the shape of the model's text output.
+type ResponseFormatType string
+
+const (
+	ResponseText       ResponseFormatType = "text"        // free text (default; nothing sent)
+	ResponseJSONObject ResponseFormatType = "json_object" // any JSON object
+	ResponseJSONSchema ResponseFormatType = "json_schema" // JSON matching Schema
+)
+
+// ResponseFormat requests structured output. Name (json_schema only;
+// default "response", letters/digits/_/- up to 64) names the schema;
+// Schema is a JSON Schema object; Strict asks OpenAI-format providers for
+// strict schema adherence.
+type ResponseFormat struct {
+	Type   ResponseFormatType
+	Name   string
+	Schema json.RawMessage
+	Strict bool
+}
+
 // ChatRequest is the canonical request. Model is filled from the ChatClient
 // when empty. Thinking accepts "", "enabled", "disabled", "low", "medium",
 // "high", "max" and is translated per provider format. Temperature and TopP:
@@ -193,6 +235,18 @@ type ChatRequest struct {
 	Temperature    float64
 	TopP           float64
 	Stop           []string
+	// ToolChoice constrains tool use (nil = provider default). It requires
+	// Tools.
+	ToolChoice *ToolChoice
+	// ParallelToolCalls, when set with Tools, allows or forbids several
+	// tool calls in one turn (OpenAI parallel_tool_calls, Anthropic
+	// disable_parallel_tool_use). Gemini has no equivalent and ignores it.
+	ParallelToolCalls *bool
+	// ResponseFormat requests JSON output (nil = free text).
+	ResponseFormat *ResponseFormat
+	// Seed asks for deterministic sampling where supported (OpenAI chat
+	// completions, Gemini). Anthropic and the Responses API ignore it.
+	Seed *int
 }
 
 // ChatResult is the canonical response for both buffered and streaming calls.

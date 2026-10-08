@@ -72,16 +72,17 @@ type anThinking struct {
 }
 
 type anRequest struct {
-	Model       string       `json:"model"`
-	MaxTokens   int          `json:"max_tokens"`
-	Messages    []anMessage  `json:"messages"`
-	System      []anSysBlock `json:"system,omitempty"`
-	Tools       []anTool     `json:"tools,omitempty"`
-	Temperature *float64     `json:"temperature,omitempty"`
-	TopP        *float64     `json:"top_p,omitempty"`
-	Stop        []string     `json:"stop_sequences,omitempty"`
-	Stream      bool         `json:"stream,omitempty"`
-	Thinking    *anThinking  `json:"thinking,omitempty"`
+	Model       string        `json:"model"`
+	MaxTokens   int           `json:"max_tokens"`
+	Messages    []anMessage   `json:"messages"`
+	System      []anSysBlock  `json:"system,omitempty"`
+	Tools       []anTool      `json:"tools,omitempty"`
+	Temperature *float64      `json:"temperature,omitempty"`
+	TopP        *float64      `json:"top_p,omitempty"`
+	Stop        []string      `json:"stop_sequences,omitempty"`
+	Stream      bool          `json:"stream,omitempty"`
+	Thinking    *anThinking   `json:"thinking,omitempty"`
+	ToolChoice  *anToolChoice `json:"tool_choice,omitempty"`
 }
 
 const anthropicDefaultMaxTokens = 8192
@@ -215,6 +216,9 @@ func buildAnthropicRequest(req *ChatRequest, model string, stream bool) ([]byte,
 			tool.CacheControl = &anCacheControl{Type: "ephemeral"}
 		}
 		out.Tools = append(out.Tools, tool)
+	}
+	if err := anthropicToolControls(req, &out, out.Thinking != nil); err != nil {
+		return nil, err
 	}
 
 	// Messages. Hard edges:
@@ -440,6 +444,11 @@ func mapAnthropicStreamEvent(data []byte, acc *streamAccum) ([]Delta, bool, erro
 	case "content_block_start":
 		switch ev.ContentBlock.Type {
 		case "tool_use":
+			if acc.jsonTool != "" && acc.jsonBlock < 0 && ev.ContentBlock.Name == acc.jsonTool {
+				// JSON-mode tool: its input streams as content.
+				acc.jsonBlock = ev.Index
+				break
+			}
 			c := acc.call(ev.Index)
 			c.id, c.name = ev.ContentBlock.ID, ev.ContentBlock.Name
 			deltas = append(deltas, Delta{
@@ -469,6 +478,11 @@ func mapAnthropicStreamEvent(data []byte, acc *streamAccum) ([]Delta, bool, erro
 			b.sig += ev.Delta.Signature
 			acc.thinkingSignature = b.sig
 		case "input_json_delta":
+			if acc.jsonTool != "" && ev.Index == acc.jsonBlock {
+				acc.content.WriteString(ev.Delta.PartialJSON)
+				deltas = append(deltas, Delta{Kind: DeltaContent, Text: ev.Delta.PartialJSON})
+				break
+			}
 			c := acc.call(ev.Index)
 			c.args.WriteString(ev.Delta.PartialJSON)
 			deltas = append(deltas, Delta{
@@ -483,6 +497,9 @@ func mapAnthropicStreamEvent(data []byte, acc *streamAccum) ([]Delta, bool, erro
 		if ev.Delta.StopReason != "" {
 			acc.finishReason = mapAnthropicStopReason(ev.Delta.StopReason)
 			acc.sawFinish = true
+			if acc.jsonBlock >= 0 && acc.finishReason == FinishToolCalls && len(acc.calls) == 0 {
+				acc.finishReason = FinishStop // the JSON tool is the answer, not a tool turn
+			}
 		}
 		// message_delta usage is cumulative. Output is always present; input
 		// and cache volumes may only arrive here, so non-zero values win.
