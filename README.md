@@ -17,7 +17,7 @@ Multi-provider Go SDK for LLM inference endpoints — **OpenAI, Google Gemini, D
 ## Install
 
 ```bash
-go get github.com/BackendStack21/go-llm-sdk@v0.3.2
+go get github.com/BackendStack21/go-llm-sdk@v1.0.0
 ```
 
 Requires Go 1.25+. No dependencies beyond the standard library.
@@ -387,9 +387,27 @@ Coverage sits at **99.0%** of statements (unit suite, no e2e), including the str
 
 See [AGENTS.md](AGENTS.md) for the architecture map, invariants, testing conventions, and the odek migration path.
 
+## Upgrading to v1.0 (from v0.7)
+
+v1.0 removes or renames nothing exported. Existing code compiles unchanged unless it builds `ToolCall`, `Message`, `ChatRequest`, `ChatResult`, `ProviderConfig` or `Quirks` with positional (unkeyed) struct literals; those structs gained fields, so switch to field names. A few behaviors changed on purpose. Check these before upgrading:
+
+| Area | v0.7 | v1.0 | What to do |
+|---|---|---|---|
+| Buffered timeout | Each of up to 8 attempts got the full request timeout | The request timeout (default 120s) covers the **whole call, retries included**, on `Call`, `Speak`, `Transcribe` and `Embed`, as streaming already did | Raise `WithRequestTimeout` if long calls relied on retries outliving one timeout; tune retries with `WithRetryPolicy` |
+| DeepSeek usage | A cache miss counted as `CacheCreationTokens` | A miss is ordinary input in `PromptTokens`; only hits go to `CacheReadTokens` | Re-check cost math that priced misses as cache writes |
+| Gemini usage | `CompletionTokens` excluded thinking; cached tokens stayed in `PromptTokens` | `CompletionTokens` includes thinking (as on every format); cached tokens move to `CacheReadTokens` | Use `Usage.InputTokens()` / `TotalTokens()` for totals |
+| Gemini finish reason | A function-call turn returned `stop` | Returns `tool_calls`, like every other format | Loops checking `len(res.ToolCalls) > 0` are unaffected |
+| Gemini truncated streams | A stream ending without `finishReason` was a silent success | It is a premature-close error (retried before the first delta, partial result + error after) | None; this surfaces real truncation |
+| `Delta.ToolIndex` | Anthropic content-block / Responses output index | The call's position in `ChatResult.ToolCalls` on every format | Streaming UIs that grouped fragments by index on Anthropic or Responses |
+| Anthropic thinking | Unset `MaxTokens` sent 8192 (rejected with budgets ≥ 8192); sampling fields sent | Unset `MaxTokens` → budget + 8192; `temperature`/`top_p` omitted; impossible budgets are a `ConfigError` | Requests that used to 400 now succeed |
+| Thinking replay | One `ReasoningContent` + `ThinkingSignature` pair | Every block in `ThinkingBlocks` (incl. redacted), Gemini signatures per `ToolCall` | Append `res.AssistantMessage()` instead of copying fields by hand |
+| Redirects | Followed to any host | Cross-host redirects are not followed (credential leak); they surface as `*APIError` | Point `WithBaseURL` at the final host |
+| Validation | Sent to the provider | DeepSeek `json_schema`, malformed base URLs, control characters in `TranscribeRequest.Filename`/`MIMEType` are `ConfigError`s | — |
+| `ListModels` | Silently truncated at 10 pages | Up to 100 pages, then `ErrModelListTruncated` | — |
+
 ## Status
 
-v0.3.2 — API may shift until v1.0.
+v1.0.0 — stable. The exported API follows semantic versioning from here: breaking changes only in a new major version.
 
 ## License
 
