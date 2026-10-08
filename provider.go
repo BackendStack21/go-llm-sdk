@@ -1,6 +1,7 @@
 package llm
 
 import (
+	neturl "net/url"
 	"strings"
 )
 
@@ -212,6 +213,9 @@ func validateProviderConfig(c ProviderConfig) error {
 	}
 	if !strings.HasPrefix(c.BaseURL, "http://") && !strings.HasPrefix(c.BaseURL, "https://") {
 		return &ConfigError{Msg: c.ID + ": base URL must start with http:// or https://"}
+	}
+	if _, err := neturl.Parse(c.BaseURL); err != nil {
+		return &ConfigError{Msg: c.ID + ": base URL is malformed"}
 	}
 	return nil
 }

@@ -187,6 +187,10 @@ func (pc *providerClient) withRetry(ctx context.Context, op func() (time.Duratio
 		if errors.As(err, &te) {
 			return te.err
 		}
+		var ce *ConfigError
+		if errors.As(err, &ce) {
+			return err // the request cannot be built: retrying cannot help
+		}
 		last := attempt == n-1
 		var apiErr *APIError
 		if !errors.As(err, &apiErr) {

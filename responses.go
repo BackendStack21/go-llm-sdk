@@ -428,11 +428,8 @@ func parseResponsesAPI(body []byte) (*ChatResult, error) {
 		return nil, fmt.Errorf("llm: provider error: %s", r.Error.Message)
 	}
 	if r.Status == "failed" {
-		msg := "responses failed"
-		if r.Error != nil && r.Error.Message != "" {
-			msg = r.Error.Message
-		}
-		return nil, fmt.Errorf("llm: provider error: %s", msg)
+		// An error message, when present, was returned just above.
+		return nil, fmt.Errorf("llm: provider error: responses failed")
 	}
 	return chatResultFromResponses(&r), nil
 }

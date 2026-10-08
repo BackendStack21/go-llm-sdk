@@ -598,11 +598,7 @@ func (pc *providerClient) callStream(ctx context.Context, req *ChatRequest, mode
 			// partial result (a retry would duplicate user-visible output).
 			return out.result, out.err
 		case out.learnRetry: // learn-once applied; retry without backoff
-			if out.apiErr != nil {
-				lastErr = out.apiErr
-			} else if out.err != nil {
-				lastErr = out.err
-			}
+			lastErr = out.apiErr // every learn trigger is a provider 400
 			if attempt < n-1 {
 				continue
 			}
@@ -628,10 +624,7 @@ func (pc *providerClient) callStream(ctx context.Context, req *ChatRequest, mode
 			if retrySleep(deadlineCtx, pc.retryDelay(0, attempt)) {
 				continue
 			}
-			if err := deadlineCtx.Err(); err != nil {
-				return nil, err // interrupted by deadline/cancel, not exhaustion
-			}
-			return nil, fmt.Errorf("llm: retry exhausted (%d attempts): %w", attempt+1, lastErr)
+			return nil, deadlineCtx.Err() // interrupted by deadline/cancel, not exhaustion
 		default:
 			return nil, out.err
 		}

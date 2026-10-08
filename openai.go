@@ -62,10 +62,8 @@ type oaContentPart struct {
 	ImageURL *oaImageURL `json:"image_url,omitempty"`
 }
 
-func openAIContent(m Message) any {
-	if len(m.Parts) == 0 {
-		return m.Content
-	}
+// openAIContent renders ordered content parts as chat-completions parts.
+func openAIContent(m Message) []oaContentPart {
 	parts := make([]oaContentPart, 0, len(m.Parts))
 	for _, p := range m.Parts {
 		if p.Type == ContentPartImage {
@@ -175,16 +173,11 @@ func buildOpenAIRequest(cfg ProviderConfig, req *ChatRequest, model string, stre
 				continue
 			}
 			if len(toolImages) > 0 {
-				msgs = append(msgs, oaMessage{Role: "user", ContentParts: openAIContent(Message{Parts: toolImages}).([]oaContentPart)})
+				msgs = append(msgs, oaMessage{Role: "user", ContentParts: openAIContent(Message{Parts: toolImages})})
 				toolImages = nil
 			}
 		case RoleAssistant:
-			om := oaMessage{Role: "assistant"}
-			if len(m.Parts) == 0 {
-				om.Content = openAIText(m)
-			} else {
-				om.ContentParts = openAIContent(m).([]oaContentPart)
-			}
+			om := oaMessage{Role: "assistant", Content: openAIText(m)} // Parts are user/tool only
 			// DeepSeek thinking mode requires the reasoning_content key on every
 			// replayed assistant turn once the request carries tools — including
 			// turns where the provider returned no reasoning of its own. Omitting
@@ -219,7 +212,7 @@ func buildOpenAIRequest(cfg ProviderConfig, req *ChatRequest, model string, stre
 			if len(m.Parts) == 0 {
 				om.Content = openAIText(m)
 			} else {
-				om.ContentParts = openAIContent(m).([]oaContentPart)
+				om.ContentParts = openAIContent(m)
 			}
 			msgs = append(msgs, om)
 		}

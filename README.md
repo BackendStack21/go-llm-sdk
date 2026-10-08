@@ -89,7 +89,7 @@ res, err = chat.CallStream(ctx, req, func(d llm.Delta) error {
 | `kimi` | openai | `https://api.moonshot.ai/v1` | `KIMI_API_KEY` (`MOONSHOT_API_KEY`) | `KIMI_BASE_URL` |
 | `anthropic` | anthropic | `https://api.anthropic.com` | `ANTHROPIC_API_KEY` | `ANTHROPIC_BASE_URL` |
 
-Primary env var beats its alias. Explicit keys (`WithAPIKey`) beat env. Base-URL overrides accept any gateway speaking the provider's format. A bad URL passed to `WithBaseURL` is rejected at wiring time: the provider is marked invalid, `Providers()` omits it, and `Chat` returns a `*ConfigError` — no request is sent.
+Primary env var beats its alias. Explicit keys (`WithAPIKey`) beat env. Base-URL overrides accept any gateway speaking the provider's format. A bad URL passed to `WithBaseURL` (wrong scheme or malformed) is rejected at wiring time: the provider is marked invalid, `Providers()` omits it, and `Chat` returns a `*ConfigError` — no request is sent.
 
 Custom gateways:
 
@@ -381,7 +381,7 @@ go test -tags e2e -run 'TestE2E' -timeout 15m -v .
 
 Credentials come from the environment or a repo-root `.env` file (`KEY=VALUE`); the file is gitignored and its contents are never logged. Override a target's model with `<ID>_E2E_MODEL` (e.g. `DEEPSEEK_E2E_MODEL`). Adding a provider is one `e2eTarget` entry in `e2e_test.go`.
 
-Coverage sits at **97.7%** of statements, including the streaming failure-orchestration paths (deadline, 429, premature close, partial-output) that are usually the blind spot of SDK test suites. The residual ~2% is unreachable defensive code.
+Coverage sits at **99.0%** of statements (unit suite, no e2e), including the streaming failure-orchestration paths (deadline, 429, premature close, partial-output) that are usually the blind spot of SDK test suites. The residual ~1% is unreachable defensive code (multipart writes into an in-memory buffer, `json.Marshal` of plain values, SSE shutdown races).
 
 ## Repo guidance
 

@@ -17,7 +17,7 @@ go test -tags e2e -run 'TestE2E' -timeout 15m -v .   # LIVE provider e2e (see be
 ```
 
 - Always run tests with `-count=1` and an explicit `-timeout` (house rule: no unbounded runs).
-- Coverage sits at ~97.7% of statements. The residual is documented unreachable defensive code — do not pad with fake tests to move the number.
+- Coverage sits at ~99.0% of statements (unit suite). The residual is documented unreachable defensive code — do not pad with fake tests to move the number.
 
 ## Architecture (flat package)
 
