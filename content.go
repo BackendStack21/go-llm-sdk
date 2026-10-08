@@ -28,14 +28,17 @@ func validateRequestContent(messages []Message) error {
 }
 
 func validateMessageContent(m Message, index int) error {
+	if m.IsError && m.Role != RoleTool {
+		return &ConfigError{Msg: fmt.Sprintf("message %d: IsError requires the tool role", index)}
+	}
 	if len(m.Parts) == 0 {
 		return nil
 	}
 	if m.Content != "" {
 		return &ConfigError{Msg: fmt.Sprintf("message %d: Content and Parts cannot both be set", index)}
 	}
-	if m.Role != RoleUser {
-		return &ConfigError{Msg: fmt.Sprintf("message %d: content parts require user role", index)}
+	if m.Role != RoleUser && m.Role != RoleTool {
+		return &ConfigError{Msg: fmt.Sprintf("message %d: content parts require the user or tool role", index)}
 	}
 	for j, p := range m.Parts {
 		switch p.Type {
@@ -81,4 +84,30 @@ func wireMIME(m string) string {
 		return "image/jpeg"
 	}
 	return m
+}
+
+// partsText returns a message's text: Content, or its text parts joined by
+// newlines when it carries Parts.
+func partsText(m Message) string {
+	if len(m.Parts) == 0 {
+		return m.Content
+	}
+	var texts []string
+	for _, p := range m.Parts {
+		if p.Type == ContentPartText {
+			texts = append(texts, p.Text)
+		}
+	}
+	return strings.Join(texts, "\n")
+}
+
+// imageParts returns a message's inline-image parts.
+func imageParts(m Message) []ContentPart {
+	var out []ContentPart
+	for _, p := range m.Parts {
+		if p.Type == ContentPartImage {
+			out = append(out, p)
+		}
+	}
+	return out
 }

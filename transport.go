@@ -41,7 +41,7 @@ func newBufferedHTTP(rt http.RoundTripper, timeout time.Duration) *http.Client {
 	if timeout <= 0 {
 		timeout = DefaultTimeout
 	}
-	return &http.Client{Timeout: timeout, Transport: rt}
+	return &http.Client{Timeout: timeout, Transport: rt, CheckRedirect: sameHostRedirect}
 }
 
 // newStreamHTTP returns a client with no whole-request timeout: a
@@ -49,5 +49,16 @@ func newBufferedHTTP(rt http.RoundTripper, timeout time.Duration) *http.Client {
 // calls enforce a hard wall-clock deadline plus an idle watchdog via
 // context instead (chat.go).
 func newStreamHTTP(rt http.RoundTripper) *http.Client {
-	return &http.Client{Timeout: 0, Transport: rt}
+	return &http.Client{Timeout: 0, Transport: rt, CheckRedirect: sameHostRedirect}
+}
+
+// sameHostRedirect refuses to follow a redirect to another host: Go strips
+// only Authorization/Cookie across hosts, so x-api-key, x-goog-api-key and
+// custom Headers would otherwise reach the redirect target. The redirect
+// response itself is returned (and surfaces as an APIError).
+func sameHostRedirect(req *http.Request, via []*http.Request) error {
+	if len(via) >= 10 || req.URL.Host != via[0].URL.Host {
+		return http.ErrUseLastResponse
+	}
+	return nil
 }

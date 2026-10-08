@@ -214,7 +214,15 @@ func TestBuildAnthropicRequestArms(t *testing.T) {
 			t.Errorf("anthropic request missing %q:\n%s", want, s)
 		}
 	}
-	if !strings.Contains(s, `"temperature":0`) {
+	if strings.Contains(s, `"temperature"`) {
+		t.Error("extended thinking must omit temperature")
+	}
+	req.Thinking, req.ThinkingBudget = "", 0
+	b, err = buildAnthropicRequest(req, "claude-x", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(b), `"temperature":0`) {
 		t.Error("negative temperature must normalize to an explicit 0")
 	}
 }
@@ -749,12 +757,9 @@ func TestListModelsAnthropicPageLimitExit(t *testing.T) {
 	srv := httptestNewServer(func(w http.ResponseWriter, r *http.Request) {
 		fmt.Fprint(w, `{"data":[{"id":"x"}],"has_more":true,"last_id":"x"}`)
 	})
-	got, err := newListModels(srv.URL, FormatAnthropic)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(got) != 10 {
-		t.Errorf("models = %d, want 10 (page cap)", len(got))
+	// The page cap is an error, never a silently truncated listing.
+	if _, err := newListModels(srv.URL, FormatAnthropic); !errors.Is(err, ErrModelListTruncated) {
+		t.Fatalf("err = %v, want ErrModelListTruncated", err)
 	}
 }
 
@@ -976,6 +981,7 @@ func TestParseOpenAIResponseToolCalls(t *testing.T) {
 }
 
 func TestListModelsAnthropicMidPageError(t *testing.T) {
+	fastBackoff(t)
 	var n int
 	srv := httptestNewServer(func(w http.ResponseWriter, r *http.Request) {
 		n++
@@ -993,6 +999,7 @@ func TestListModelsAnthropicMidPageError(t *testing.T) {
 }
 
 func TestListModelsGeminiMidPageError(t *testing.T) {
+	fastBackoff(t)
 	var n int
 	srv := httptestNewServer(func(w http.ResponseWriter, r *http.Request) {
 		n++

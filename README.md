@@ -17,7 +17,7 @@ Multi-provider Go SDK for LLM inference endpoints — **OpenAI, Google Gemini, D
 ## Install
 
 ```bash
-go get github.com/BackendStack21/go-llm-sdk@v0.3.2
+go get github.com/BackendStack21/go-llm-sdk@v1.0.0
 ```
 
 Requires Go 1.25+. No dependencies beyond the standard library.
@@ -72,7 +72,7 @@ res, err = chat.CallStream(ctx, req, func(d llm.Delta) error {
 	switch d.Kind {
 	case llm.DeltaReasoning: // thinking fragment
 	case llm.DeltaContent:   // text fragment
-	case llm.DeltaToolArgs:  // tool-call argument fragment (d.ToolID, d.ToolName)
+	case llm.DeltaToolArgs:  // tool-call argument fragment (d.ToolID, d.ToolName; d.ToolIndex = position in res.ToolCalls)
 	}
 	return nil // or an error to abort — partial result comes back with *StreamAbortedError
 })
@@ -89,7 +89,7 @@ res, err = chat.CallStream(ctx, req, func(d llm.Delta) error {
 | `kimi` | openai | `https://api.moonshot.ai/v1` | `KIMI_API_KEY` (`MOONSHOT_API_KEY`) | `KIMI_BASE_URL` |
 | `anthropic` | anthropic | `https://api.anthropic.com` | `ANTHROPIC_API_KEY` | `ANTHROPIC_BASE_URL` |
 
-Primary env var beats its alias. Explicit keys (`WithAPIKey`) beat env. Base-URL overrides accept any gateway speaking the provider's format. A bad URL passed to `WithBaseURL` is rejected at wiring time: the provider is marked invalid, `Providers()` omits it, and `Chat` returns a `*ConfigError` — no request is sent.
+Primary env var beats its alias. Explicit keys (`WithAPIKey`) beat env. Base-URL overrides accept any gateway speaking the provider's format. A bad URL passed to `WithBaseURL` (wrong scheme or malformed) is rejected at wiring time: the provider is marked invalid, `Providers()` omits it, and `Chat` returns a `*ConfigError` — no request is sent.
 
 Custom gateways:
 
@@ -101,14 +101,33 @@ sdk := llm.New(llm.WithProvider("my-gateway",
 ))
 ```
 
+Extra HTTP headers ride every request a provider makes — chat, streaming, model listing, speech, transcription, embeddings. They are applied last, so they can override the SDK's own; an empty value removes a header. Values are treated like keys: never logged, never in `String()` or errors.
+
+```go
+llm.WithProvider("openrouter", llm.WithFormat(llm.FormatOpenAI),
+	llm.WithBaseURL("https://openrouter.ai/api/v1"), llm.WithEnvKeys("OPENROUTER_API_KEY"),
+	llm.WithHeaders(map[string]string{"HTTP-Referer": "https://myapp.example", "X-Title": "myapp"}))
+
+llm.WithProvider("anthropic", llm.WithHeaders(map[string]string{"anthropic-beta": "interleaved-thinking-2025-05-14"}))
+
+// api-key gateways (e.g. Azure OpenAI): drop the Bearer header, send api-key.
+llm.WithProvider("azure", llm.WithFormat(llm.FormatOpenAI), llm.WithBaseURL(azureURL), llm.WithAPIKey(key),
+	llm.WithHeaders(map[string]string{"Authorization": "", "api-key": key}))
+```
+
+Redirects to another host are never followed (the redirect response surfaces as an `*APIError`): Go strips only `Authorization` across hosts, so `x-api-key`, `x-goog-api-key` and custom headers would otherwise leak to the target. `Provider` and `ProviderConfig` redact the key and header values under every `fmt` verb (`%v`, `%+v`, `%#v`).
+
+For request/response observability (logging, metrics, tracing), wrap the transport: `llm.WithTransport(myRoundTripper)` sees every HTTP exchange the SDK makes.
+
 ## Canonical API
 
 Requests and results are provider-neutral. Unknown message roles are rejected at the SDK boundary (never silently dropped or reinterpreted).
 
-User messages may contain ordered text and inline image parts. `Content` remains
-the backwards-compatible plain-text form; use `TextPart` and `ImagePart` when
-an image is needed. Parts are user-role only and cannot be combined with
-`Content` on the same message; empty text parts are rejected. Accepted image
+User messages and tool results may contain ordered text and inline image parts.
+`Content` remains the backwards-compatible plain-text form; use `TextPart` and
+`ImagePart` when an image is needed. Parts are user- and tool-role only and
+cannot be combined with `Content` on the same message; empty text parts are
+rejected. Accepted image
 types are png, jpeg, gif, and webp (the informal `image/jpg` alias is accepted
 and normalized to `image/jpeg` on the wire). Per-image (`MaxImageBytes`, 10 MiB)
 and per-request aggregate (`MaxRequestImageBytes`, 32 MiB) caps are enforced
@@ -135,29 +154,75 @@ type ChatRequest struct {
 	MaxTokens      int            // routed to max_completion_tokens on o-series/gpt-5
 	Temperature    float64        // 0 = provider default; negative = explicit 0
 	TopP           float64        // 0 = provider default; negative = explicit 0
-	Stop           []string       // provider-native stop / stop_sequences / stopSequences
+	Stop           []string       // provider-native stop / stop_sequences / stopSequences (not sent on /responses)
+	ToolChoice        *ToolChoice     // nil = provider default; see "Request controls"
+	ParallelToolCalls *bool           // with Tools: allow/forbid several calls per turn
+	ResponseFormat    *ResponseFormat // JSON object / JSON Schema structured output
+	Seed              *int            // OpenAI chat completions, Gemini
+	Extra             map[string]any  // provider-specific top-level body fields (override the SDK's)
 }
 
 type ChatResult struct {
 	Content           string
-	ReasoningContent  string      // provider thinking text; replay rules per provider in "Extended thinking"
-	ThinkingSignature string      // Anthropic: replay via Message.ThinkingSignature
-	ToolCalls         []ToolCall  // {ID, Name, Arguments}
-	FinishReason      string      // stop | length | tool_calls | content_filter | ""
-	Usage             Usage       // PromptTokens is uncached-only; cache volumes in CacheReadTokens / CacheCreationTokens / CachedTokens
+	ReasoningContent  string          // provider thinking text; replay rules per provider in "Extended thinking"
+	ThinkingSignature string          // last signature (Anthropic / Responses / Gemini text part)
+	ThinkingBlocks    []ThinkingBlock // every signed reasoning segment, in order (Anthropic, Responses)
+	ToolCalls         []ToolCall      // {ID, Name, Arguments, Signature (Gemini thoughtSignature)}
+	FinishReason      string          // stop | length | tool_calls | content_filter | ""
+	Usage             Usage           // see "Usage" below
 }
 ```
 
-Finish reasons are canonical: anything a provider reports outside that vocabulary maps to `""` (unknown) rather than leaking provider-specific strings.
+Finish reasons are canonical: anything a provider reports outside that vocabulary maps to `""` (unknown) rather than leaking provider-specific strings. A turn that requested tools finishes as `tool_calls` on every format (Gemini reports `STOP` for it; the SDK maps it).
+
+Signatures (`ThinkingSignature`, `ThinkingBlocks`, `ToolCall.Signature`) are provider-specific: replay them only to the provider that produced them — never carry a conversation's signed turns across providers.
+
+`res.AssistantMessage()` returns the assistant turn to append before the next request, carrying every replay field (content, reasoning, signatures, thinking blocks, tool calls) — use it instead of copying fields by hand.
+
+### Usage
+
+One meaning on every format:
+
+- `PromptTokens` — uncached input only. Inclusive provider counts (OpenAI `cached_tokens`, DeepSeek `prompt_cache_hit_tokens`, Gemini `cachedContentTokenCount`) are moved to `CacheReadTokens`.
+- `CacheReadTokens` / `CacheCreationTokens` — cache reads and writes. A DeepSeek cache *miss* is ordinary input, not a write, and stays in `PromptTokens`.
+- `CompletionTokens` — every generated token, reasoning included (Gemini thoughts are added); `ReasoningTokens` is that subset.
+- `CachedTokens` — the raw provider-reported cached count, for diagnostics; already inside `CacheReadTokens`, never add it.
+- `InputTokens()` = prompt + cache reads + cache writes; `TotalTokens()` = input + completion. Use these instead of summing by hand.
+
+## Request controls
+
+```go
+req := &llm.ChatRequest{
+	Messages: msgs,
+	Tools:    tools,
+	ToolChoice:        llm.ToolChoiceNamed("lookup"),         // or &llm.ToolChoice{Mode: llm.ToolChoiceRequired}
+	ParallelToolCalls: &no,
+	ResponseFormat:    &llm.ResponseFormat{Type: llm.ResponseJSONSchema, Name: "answer", Schema: schema, Strict: true},
+	Seed:              &seed,
+	Extra:             map[string]any{"service_tier": "flex"},
+}
+```
+
+| Control | OpenAI chat / Responses | Anthropic | Gemini |
+|---|---|---|---|
+| `ToolChoice` auto / none / required / tool | `tool_choice` | `tool_choice` auto / none / any / tool | `toolConfig.functionCallingConfig` AUTO / NONE / ANY (+ `allowedFunctionNames`) |
+| `ParallelToolCalls` | `parallel_tool_calls` (only with tools) | `disable_parallel_tool_use` | — (ignored) |
+| `ResponseFormat` json_object / json_schema | `response_format` / `text.format` | forced synthetic tool whose input is folded back into `Content` (buffered and streamed as `DeltaContent`) | `responseMimeType` + `responseJsonSchema` |
+| `Seed` | `seed` (chat completions only) | — (ignored) | `generationConfig.seed` |
+| `Extra` | merged into the body | merged into the body | merged into the body |
+
+Caveats: DeepSeek accepts `json_object` only (`Quirks.NoJSONSchema`; `json_schema` fails fast with a `ConfigError` — set the flag via `WithQuirks` for other gateways with the same limit). On Anthropic, JSON mode forces its own tool, so it cannot be combined with `Tools` and needs a top-level `"type": "object"` schema. Gemini 2.x models reject JSON mode together with function declarations; Gemini 3 accepts it. `Extra` is a shallow, top-level override: an object value replaces the SDK's whole object (e.g. `generationConfig`), and keys go to whichever endpoint the request lands on (including `/responses` for diverted OpenAI calls). It may not replace what the SDK validates (`model`, `messages`/`contents`/`input`, `system`/`systemInstruction`/`instructions`, `tools`) or `stream`. Gemini seeds must fit in 32 bits.
+
+Controls are validated before any network I/O (`*ConfigError`): `ToolChoice` needs `Tools` and a known tool name; `json_schema` needs a JSON object schema; names match `[A-Za-z0-9_-]{1,64}`; `Extra` may not set the reserved keys above. Anthropic rejects forced tool use under extended thinking, so `ToolChoice` required/tool and JSON `ResponseFormat` fail fast with `Thinking` on, and JSON mode cannot be combined with `ToolChoice` (it forces its own tool).
 
 ## Streaming semantics
 
 `CallStream` enforces four guarantees, each covered by regression tests:
 
-1. **Idle watchdog** — a stream silent longer than `StreamIdleTimeout()` (120s default; override with `SetStreamIdleTimeout`, positive values only) fails with `ErrIdleTimeout`. Keepalive comments reset it.
+1. **Idle watchdog** — a stream silent longer than the idle timeout (120s default; per SDK via `WithStreamIdleTimeout`, process-wide default via the race-safe `SetStreamIdleTimeout`; positive values only) fails with `ErrIdleTimeout`. Keepalive comments reset it.
 2. **Hard wall-clock deadline** — the whole stream is bounded by the per-request timeout (`WithRequestTimeout`, default 120s; per-client via `SetRequestTimeout`).
 3. **Retries never duplicate output** — retries happen only before the first emitted delta. A failure after partial output returns the partial `*ChatResult` plus a wrapped error and is never retried.
-4. **No silent empty successes** — a provider that closes the stream before its completion signal (before `[DONE]` / `message_stop`) yields a retryable error, not an empty result. Gemini, whose streams legitimately end at EOF, is exempt.
+4. **No silent truncation** — a provider that closes the stream before any completion signal (`[DONE]`, a `finish_reason`, `message_stop`, a Gemini `finishReason`, `response.completed`) yields an error: retryable before the first delta, the partial result plus a wrapped error after it. Gemini is no longer exempt. An unmapped provider finish reason still counts as completion.
 
 Aborting from the delta handler returns the partial result alongside `*StreamAbortedError` — the parser goroutine is always released, so aborted streams leak nothing.
 
@@ -172,26 +237,26 @@ for {
 	if len(res.ToolCalls) == 0 {
 		return nil
 	}
-	req.Messages = append(req.Messages,
-		llm.Message{Role: llm.RoleAssistant, Content: res.Content,
-			ReasoningContent: res.ReasoningContent, ThinkingSignature: res.ThinkingSignature,
-			ToolCalls: res.ToolCalls})
+	req.Messages = append(req.Messages, res.AssistantMessage()) // every replay field
 	for _, tc := range res.ToolCalls {
+		out, err := execute(tc)
 		req.Messages = append(req.Messages,
-			llm.Message{Role: llm.RoleTool, ToolCallID: tc.ID, ToolName: tc.Name, Content: execute(tc)})
+			llm.Message{Role: llm.RoleTool, ToolCallID: tc.ID, ToolName: tc.Name, Content: out, IsError: err != nil})
 	}
 }
 ```
+
+`IsError` marks a failed tool execution (Anthropic `is_error`, Gemini `{"error": …}`; OpenAI formats have no flag, so describe the failure in `Content`). Tool results may carry image `Parts`: Anthropic and the Responses API take them natively, Gemini sends them as `inlineData` in the same turn, and Chat Completions (whose tool messages are text-only) receives them in a user message right after the tool results.
 
 On Gemini, a tool result's `ToolName` may be omitted — the SDK recovers the function name from the assistant `ToolCall` it answers, and errors loudly if it cannot.
 
 ## Extended thinking
 
-- **OpenAI GPT-5.6+** — function tools plus reasoning cannot ride Chat Completions (`reasoning_effort` 400s). Those calls go to `POST /v1/responses` with `reasoning.effort` and `reasoning.summary=auto`; summaries land in `ReasoningContent` and encrypted reasoning replays via `ThinkingSignature`. `Thinking: disabled` stays on Chat Completions with `reasoning_effort: none`. Other OpenAI models keep `reasoning_effort` on Chat Completions.
-- **Anthropic** — `thinking` blocks are parsed in both buffered and streaming modes. `ChatResult.ThinkingSignature` carries the provider signature; for tool loops, replay it on the assistant message (`Message.ReasoningContent` + `Message.ThinkingSignature`) — the SDK re-serializes it as the first block, as Anthropic's API requires. Unsigned thinking replay is rejected locally with `ConfigError`.
+- **OpenAI GPT-5.6+** — function tools plus reasoning cannot ride Chat Completions (`reasoning_effort` 400s). Those calls go to `POST /v1/responses` with `reasoning.effort` and `reasoning.summary=auto`; summaries land in `ReasoningContent`, every reasoning item lands in `ThinkingBlocks` (encrypted content as `Signature`) and is replayed in order; the legacy `ThinkingSignature` carries the last one. `Thinking: disabled` stays on Chat Completions with `reasoning_effort: none`. Other OpenAI models keep `reasoning_effort` on Chat Completions.
+- **Anthropic** — every `thinking` and `redacted_thinking` block is parsed in both buffered and streaming modes into `ChatResult.ThinkingBlocks`, each with its own signature (redacted blocks keep their opaque `data`). For tool loops, replay them via `Message.ThinkingBlocks` (or `res.AssistantMessage()`): the SDK re-serializes them first, in order, as Anthropic's API requires. The legacy single pair (`ReasoningContent` + `ThinkingSignature`) still works for one-block turns. Unsigned thinking replay is rejected locally with `ConfigError`. With thinking on, `max_tokens` always exceeds `budget_tokens` (unset `MaxTokens` → budget + 8192; a preset larger than half an explicit `MaxTokens` is clamped to half of it — never below 1024 — so the answer keeps room; an explicit `ThinkingBudget` that cannot fit is a `ConfigError`), and `temperature` / `top_p` are omitted (extended thinking rejects them).
 - **DeepSeek** — reasoning streams as `DeltaReasoning` fragments and lands in `ReasoningContent`. Assistant-turn replay echoes it as `reasoning_content`, which DeepSeek requires for tool loops. On a chat-completions request that carries tools, the key is echoed for **every** assistant turn, even where the provider returned no reasoning for that turn (empty value instead of a dropped key) — including turns that made no tool call themselves: DeepSeek documents that a tool-bearing request whose assistant turns omit `reasoning_content` returns 400 for *every* later request in the loop, so one elided turn would otherwise poison the rest of the session. Whether DeepSeek accepts a present-but-empty value is measured against the live API by `TestE2EDeepSeekEmptyReasoningEcho` (tag-gated), not assumed by the suite.
 - **zai / GLM** — same reasoning field shape and `DeltaReasoning` streaming; GLM maps thinking `medium` → `reasoning_effort` `high` (no medium level) and `max` → `max`. GLM does **not** get the empty echo: no z.ai documentation confirms the same replay requirement, so `Quirks.EchoReasoningWithTools` is off and `zai` bodies are byte-identical to the pre-fix shape. A custom provider registered under its own id inherits **no** quirks — set `WithQuirks` explicitly if it needs the echo.
-- **Gemini** — `thought: true` parts map to reasoning deltas; `thinkingConfig` is derived from `Thinking` / `ThinkingBudget`.
+- **Gemini** — a prompt blocked by safety (`promptFeedback.blockReason`, no candidates) completes with `content_filter` instead of erroring. `thought: true` parts map to reasoning deltas; `thinkingConfig` is derived from `Thinking` / `ThinkingBudget`. `thoughtSignature`s are captured per function call (`ToolCall.Signature`) and on text parts (`ThinkingSignature`) and replayed on the same parts — Gemini 3 rejects a function-call turn whose signature is missing.
 - **OpenAI-format gateways (OpenRouter, LiteLLM, vLLM)** — responses are accepted in every documented reasoning shape: `reasoning_content` (LiteLLM standardized), the `reasoning` string alias (OpenRouter), and the typed `reasoning_details` array (OpenRouter; `reasoning.text`/`reasoning.summary` fold in order, `reasoning.encrypted` entries are skipped). Precedence: `reasoning_content`, then `reasoning`, then the `reasoning_details` fold. Gateways that require an explicit opt-in get it via `Quirks.IncludeReasoning`, which sends the OpenRouter-documented legacy `include_reasoning: true` (equivalent to the canonical `reasoning: {}`) next to `reasoning_effort`. The flag is off by default — strict OpenAI-format endpoints reject unknown parameters.
 
 `ThinkingBudget`, when positive, overrides the selected non-disabled thinking preset (Anthropic enforces its 1024-token minimum). Canonical `max` selects the highest portable preset: OpenAI `high`, Gemini 24576, Anthropic 16384; GLM retains its native `max`.
@@ -208,17 +273,17 @@ When a provider rejects a request pattern, the SDK learns the constraint **once 
 | Rejects streaming itself | downgrade to buffered calls permanently |
 | Answers a streamed request with a non-SSE body | consume that JSON response directly, then use buffered calls permanently (no duplicate generation) |
 
-Every engagement is observable: `SetLearnObserver(func(LearnEvent))` registers a process-wide callback fired once per engaged fallback, with the kind (`buffered`, `responses`, `none_effort`, `drop_stream_options`), provider id, triggering HTTP status, and the provider's error message. Nil (default) disables observation. The callback runs on the request goroutine — keep it fast and never call back into the SDK from it.
+Every engagement is observable: `WithLearnObserver(func(LearnEvent))` registers a per-SDK callback (taking precedence over the process-wide `SetLearnObserver`) fired once per engaged fallback, with the kind (`buffered`, `responses`, `none_effort`, `drop_stream_options`), provider id, triggering HTTP status, and the provider's error message. Nil (default) disables observation. The callback runs on the request goroutine — keep it fast and never call back into the SDK from it.
 
 ## Retry policy
 
-8 attempts, exponential backoff capped at 30s with ±20% jitter, `Retry-After` (seconds or HTTP-date) honored and capped at 120s, context cancellation honored between and during attempts. Retryable statuses include 408/429/5xx plus Cloudflare 520–524 and Anthropic 529. Persistent 429s surface as `*llm.RateLimitError{Attempts, RetryAfter}` — including when the retry sleep is cut short by a deadline, so the caller never loses the retry signal. A 429 whose body is billing exhaustion (`insufficient_quota`, `exceeded your current quota`, `insufficient balance`, `no resource package`) is not retryable and fails on the first attempt. `RateLimitError` unwraps to `*APIError` for `errors.As` access to `Status`/`Retryable`.
+8 attempts, exponential backoff capped at 30s with ±20% jitter (both configurable per SDK with `WithRetryPolicy(llm.RetryPolicy{MaxAttempts, MaxBackoff})`; `MaxAttempts: 1` disables retries), `Retry-After` (seconds or HTTP-date) honored and capped at 120s, context cancellation honored between and during attempts. Retryable statuses include 408/429/5xx plus Cloudflare 520–524 and Anthropic 529. Persistent 429s surface as `*llm.RateLimitError{Attempts, RetryAfter}` — including when the retry sleep is cut short by a deadline, so the caller never loses the retry signal. A 429 whose body is billing exhaustion (`insufficient_quota`, `exceeded your current quota`, `insufficient balance`, `no resource package`) is not retryable and fails on the first attempt. `RateLimitError` unwraps to `*APIError` for `errors.As` access to `Status`/`Retryable`.
 
 ## Timeouts & cancellation
 
 - The pooled transport honors `HTTP_PROXY` / `HTTPS_PROXY` / `NO_PROXY` via `http.ProxyFromEnvironment`.
-- Buffered calls: per-request timeout on the HTTP client (`WithRequestTimeout`, per-client `SetRequestTimeout` — race-safe, swap is atomic).
-- Streaming: the same timeout becomes the hard wall-clock deadline via context; per-attempt SSE reads are additionally bounded by the idle watchdog.
+- The request timeout (`WithRequestTimeout`, per-client `SetRequestTimeout` — race-safe, swap is atomic) is the wall-clock budget of the **whole call, retries included**, for buffered chat, streaming, speech, transcription and embeddings alike — a failing provider can never hold a caller for timeout × attempts.
+- Streaming: per-attempt SSE reads are additionally bounded by the idle watchdog.
 - Every wait (backoff, Retry-After, stream reads) selects on the caller's context — cancellation propagates everywhere, and a cancelled call never misreports as "retry exhausted".
 - Response bodies are capped (50 MB chat, 8 MB listings, 1 MiB SSE lines, 4 MiB SSE events) as an OOM bound.
 
@@ -276,15 +341,29 @@ res, err := sdk.Transcribe(ctx, "openai", "whisper-1", llm.TranscribeRequest{
 // res.Language, res.DurationSec — provider-reported, zero when omitted
 ```
 
-Requests carry the same retry ladder and error taxonomy as chat. Oversized audio (>25MB) and empty `Audio`/`Model` fail fast with a `ConfigError` before any network I/O. A 2xx body that is not JSON surfaces as a typed `*APIError`. Fields the provider does not report stay zero — the SDK never guesses.
+Requests carry the same retry ladder and error taxonomy as chat. Oversized audio (>25MB), empty `Audio`/`Model`, and control characters in `Filename`/`MIMEType` (header injection) fail fast with a `ConfigError` before any network I/O. A 2xx body that is not JSON surfaces as a typed `*APIError`. Fields the provider does not report stay zero — the SDK never guesses.
+
+## Embeddings
+
+`Embed` turns texts into vectors via OpenAI-compatible `POST {base}/embeddings` or Gemini `batchEmbedContents`; Anthropic (no endpoint) returns a `ConfigError`.
+
+```go
+res, err := sdk.Embed(ctx, "openai", "text-embedding-3-small", llm.EmbedRequest{
+    Inputs:     []string{"first", "second"}, // required, each non-empty
+    Dimensions: 256,                         // optional (0 = model default)
+})
+// res.Embeddings[i] is the vector for Inputs[i]; res.Usage.PromptTokens when reported
+```
+
+Vectors come back in input order (the SDK sorts by the provider's `index` — or trusts response order when a gateway omits it — and rejects a count or index mismatch with a typed `*APIError`). Large inputs are split into provider-sized batches (Gemini 100, OpenAI 2048) under one whole-call budget; a `models/` prefix on Gemini model ids is accepted. Same retry ladder, budget, headers and error taxonomy as chat.
 
 ## Thread safety
 
-`SDK` and `Provider` are safe for concurrent use. `ChatClient` is safe for concurrent `Call`/`CallStream`; `SetRequestTimeout` is race-safe (atomic swap) but should still be called before the first request so in-flight calls use one timeout. Learn-once state is shared per provider via atomics — monotonic, converging, race-free.
+`SDK` and `Provider` are safe for concurrent use; `SetStreamIdleTimeout` and `SetLearnObserver` may be called while requests run. `ChatClient` is safe for concurrent `Call`/`CallStream`; `SetRequestTimeout` is race-safe (atomic swap) but should still be called before the first request so in-flight calls use one timeout. Learn-once state is shared per provider via atomics — monotonic, converging, race-free.
 
 ## Model discovery
 
-`ListModels` hits each provider's models endpoint (Anthropic paginates with `after_id`, Gemini with `pageToken`), caches per SDK for 5 minutes (`WithModelCacheTTL(0)` disables, `ForceRefresh()` bypasses), and retries transient failures 3×. Fields the provider does not report stay zero — the SDK never guesses.
+`ListModels` hits each provider's models endpoint (Anthropic paginates with `after_id`, Gemini with `pageToken`), caches per SDK for 5 minutes (`WithModelCacheTTL(0)` disables, `ForceRefresh()` bypasses), and retries transient failures 3× (a malformed body is not retried). Concurrent cache misses share one upstream fetch. A listing longer than 100 pages returns `ErrModelListTruncated` — never a silently truncated list. Fields the provider does not report stay zero — the SDK never guesses.
 
 ## Testing
 
@@ -302,15 +381,33 @@ go test -tags e2e -run 'TestE2E' -timeout 15m -v .
 
 Credentials come from the environment or a repo-root `.env` file (`KEY=VALUE`); the file is gitignored and its contents are never logged. Override a target's model with `<ID>_E2E_MODEL` (e.g. `DEEPSEEK_E2E_MODEL`). Adding a provider is one `e2eTarget` entry in `e2e_test.go`.
 
-Coverage sits at **97.7%** of statements, including the streaming failure-orchestration paths (deadline, 429, premature close, partial-output) that are usually the blind spot of SDK test suites. The residual ~2% is unreachable defensive code.
+Coverage sits at **99.0%** of statements (unit suite, no e2e), including the streaming failure-orchestration paths (deadline, 429, premature close, partial-output) that are usually the blind spot of SDK test suites. The residual ~1% is unreachable defensive code (multipart writes into an in-memory buffer, `json.Marshal` of plain values, SSE shutdown races).
 
 ## Repo guidance
 
 See [AGENTS.md](AGENTS.md) for the architecture map, invariants, testing conventions, and the odek migration path.
 
+## Upgrading to v1.0 (from v0.7)
+
+v1.0 removes or renames nothing exported. Existing code compiles unchanged unless it builds `ToolCall`, `Message`, `ChatRequest`, `ChatResult`, `ProviderConfig` or `Quirks` with positional (unkeyed) struct literals; those structs gained fields, so switch to field names. A few behaviors changed on purpose. Check these before upgrading:
+
+| Area | v0.7 | v1.0 | What to do |
+|---|---|---|---|
+| Buffered timeout | Each of up to 8 attempts got the full request timeout | The request timeout (default 120s) covers the **whole call, retries included**, on `Call`, `Speak`, `Transcribe` and `Embed`, as streaming already did | Raise `WithRequestTimeout` if long calls relied on retries outliving one timeout; tune retries with `WithRetryPolicy` |
+| DeepSeek usage | A cache miss counted as `CacheCreationTokens` | A miss is ordinary input in `PromptTokens`; only hits go to `CacheReadTokens` | Re-check cost math that priced misses as cache writes |
+| Gemini usage | `CompletionTokens` excluded thinking; cached tokens stayed in `PromptTokens` | `CompletionTokens` includes thinking (as on every format); cached tokens move to `CacheReadTokens` | Use `Usage.InputTokens()` / `TotalTokens()` for totals |
+| Gemini finish reason | A function-call turn returned `stop` | Returns `tool_calls`, like every other format | Loops checking `len(res.ToolCalls) > 0` are unaffected |
+| Gemini truncated streams | A stream ending without `finishReason` was a silent success | It is a premature-close error (retried before the first delta, partial result + error after) | None; this surfaces real truncation |
+| `Delta.ToolIndex` | Anthropic content-block / Responses output index | The call's position in `ChatResult.ToolCalls` on every format | Streaming UIs that grouped fragments by index on Anthropic or Responses |
+| Anthropic thinking | Unset `MaxTokens` sent 8192 (rejected with budgets ≥ 8192); sampling fields sent | Unset `MaxTokens` → budget + 8192; `temperature`/`top_p` omitted; impossible budgets are a `ConfigError` | Requests that used to 400 now succeed |
+| Thinking replay | One `ReasoningContent` + `ThinkingSignature` pair | Every block in `ThinkingBlocks` (incl. redacted), Gemini signatures per `ToolCall` | Append `res.AssistantMessage()` instead of copying fields by hand |
+| Redirects | Followed to any host | Cross-host redirects are not followed (credential leak); they surface as `*APIError` | Point `WithBaseURL` at the final host |
+| Validation | Sent to the provider | DeepSeek `json_schema`, malformed base URLs, control characters in `TranscribeRequest.Filename`/`MIMEType` are `ConfigError`s | — |
+| `ListModels` | Silently truncated at 10 pages | Up to 100 pages, then `ErrModelListTruncated` | — |
+
 ## Status
 
-v0.3.2 — API may shift until v1.0.
+v1.0.0 — stable. The exported API follows semantic versioning from here: breaking changes only in a new major version.
 
 ## License
 

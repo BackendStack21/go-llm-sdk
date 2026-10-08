@@ -170,7 +170,7 @@ func TestParseGeminiResponse(t *testing.T) {
 	if res.Content != "Answer" || res.ReasoningContent != "ponder" {
 		t.Errorf("content: %+v", res)
 	}
-	if res.FinishReason != FinishStop {
+	if res.FinishReason != FinishToolCalls { // STOP with a function call is a tool turn
 		t.Errorf("finish = %q", res.FinishReason)
 	}
 	if len(res.ToolCalls) != 1 || res.ToolCalls[0].ID == "" || res.ToolCalls[0].Name != "f" {
@@ -222,10 +222,10 @@ func TestMapGeminiStreamEvent_Chunks(t *testing.T) {
 	if len(res.ToolCalls) != 1 || res.ToolCalls[0].Name != "f" {
 		t.Errorf("tool calls: %+v", res.ToolCalls)
 	}
-	if res.FinishReason != FinishStop {
+	if res.FinishReason != FinishToolCalls { // STOP with a function call is a tool turn
 		t.Errorf("finish = %q", res.FinishReason)
 	}
-	if res.Usage.CompletionTokens != 3 {
+	if res.Usage.CompletionTokens != 3+2 { // candidates + thoughts (last chunk wins)
 		t.Errorf("usage = %+v (last chunk wins)", res.Usage)
 	}
 }

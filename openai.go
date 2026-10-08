@@ -62,10 +62,8 @@ type oaContentPart struct {
 	ImageURL *oaImageURL `json:"image_url,omitempty"`
 }
 
-func openAIContent(m Message) any {
-	if len(m.Parts) == 0 {
-		return m.Content
-	}
+// openAIContent renders ordered content parts as chat-completions parts.
+func openAIContent(m Message) []oaContentPart {
 	parts := make([]oaContentPart, 0, len(m.Parts))
 	for _, p := range m.Parts {
 		if p.Type == ContentPartImage {
@@ -95,28 +93,36 @@ type oaStreamOptions struct {
 }
 
 type oaRequest struct {
-	Model               string           `json:"model"`
-	Messages            []oaMessage      `json:"messages"`
-	Tools               []oaToolDef      `json:"tools,omitempty"`
-	MaxTokens           int              `json:"max_tokens,omitempty"`
-	MaxCompletionTokens int              `json:"max_completion_tokens,omitempty"`
-	Temperature         *float64         `json:"temperature,omitempty"`
-	TopP                *float64         `json:"top_p,omitempty"`
-	Stop                []string         `json:"stop,omitempty"`
-	Stream              bool             `json:"stream,omitempty"`
-	StreamOptions       *oaStreamOptions `json:"stream_options,omitempty"`
-	ReasoningEffort     string           `json:"reasoning_effort,omitempty"`
-	IncludeReasoning    *bool            `json:"include_reasoning,omitempty"`
-	Thinking            *oaThinking      `json:"thinking,omitempty"`
+	Model               string            `json:"model"`
+	Messages            []oaMessage       `json:"messages"`
+	Tools               []oaToolDef       `json:"tools,omitempty"`
+	MaxTokens           int               `json:"max_tokens,omitempty"`
+	MaxCompletionTokens int               `json:"max_completion_tokens,omitempty"`
+	Temperature         *float64          `json:"temperature,omitempty"`
+	TopP                *float64          `json:"top_p,omitempty"`
+	Stop                []string          `json:"stop,omitempty"`
+	Stream              bool              `json:"stream,omitempty"`
+	StreamOptions       *oaStreamOptions  `json:"stream_options,omitempty"`
+	ReasoningEffort     string            `json:"reasoning_effort,omitempty"`
+	IncludeReasoning    *bool             `json:"include_reasoning,omitempty"`
+	Thinking            *oaThinking       `json:"thinking,omitempty"`
+	ToolChoice          any               `json:"tool_choice,omitempty"`
+	ParallelToolCalls   *bool             `json:"parallel_tool_calls,omitempty"`
+	ResponseFormat      *oaResponseFormat `json:"response_format,omitempty"`
+	Seed                *int              `json:"seed,omitempty"`
 }
 
 // buildOpenAIRequest renders the canonical request in OpenAI format.
 func buildOpenAIRequest(cfg ProviderConfig, req *ChatRequest, model string, stream, includeStreamOptions bool) oaRequest {
 	q := cfg.Quirks
 	out := oaRequest{
-		Model:  model,
-		Stop:   req.Stop,
-		Stream: stream,
+		Model:             model,
+		Stop:              req.Stop,
+		Stream:            stream,
+		ToolChoice:        openAIToolChoice(req.ToolChoice),
+		ParallelToolCalls: parallelToolCalls(req),
+		ResponseFormat:    openAIResponseFormat(req.ResponseFormat),
+		Seed:              req.Seed,
 	}
 	// OpenAI o-series/gpt-5 models reject max_tokens in favor of
 	// max_completion_tokens; everyone else keeps the classic parameter.
@@ -144,21 +150,34 @@ func buildOpenAIRequest(cfg ProviderConfig, req *ChatRequest, model string, stre
 			appendSystem(m.Content)
 		}
 	}
-	for _, m := range req.Messages {
+	var toolImages []ContentPart // pending images from the current run of tool results
+	for i, m := range req.Messages {
 		switch m.Role {
 		case RoleSystem:
 			// already folded into the system message
 			continue
 		case RoleTool:
-			c := m.Content
-			msgs = append(msgs, oaMessage{Role: "tool", Content: &c, ToolCallID: m.ToolCallID})
-		case RoleAssistant:
-			om := oaMessage{Role: "assistant"}
-			if len(m.Parts) == 0 {
-				om.Content = openAIText(m)
-			} else {
-				om.ContentParts = openAIContent(m).([]oaContentPart)
+			// Chat-completions tool messages carry text only: the text parts
+			// stay on the tool message and images ride a user message right
+			// after the run of tool results. IsError has no wire field here.
+			c := partsText(m)
+			if c == "" && len(m.Parts) > 0 {
+				c = "(image result attached below)" // some providers reject empty tool content
 			}
+			msgs = append(msgs, oaMessage{Role: "tool", Content: &c, ToolCallID: m.ToolCallID})
+			if imgs := imageParts(m); len(imgs) > 0 {
+				toolImages = append(toolImages, TextPart("Images returned by tool call "+m.ToolCallID+":"))
+				toolImages = append(toolImages, imgs...)
+			}
+			if i+1 < len(req.Messages) && req.Messages[i+1].Role == RoleTool {
+				continue
+			}
+			if len(toolImages) > 0 {
+				msgs = append(msgs, oaMessage{Role: "user", ContentParts: openAIContent(Message{Parts: toolImages})})
+				toolImages = nil
+			}
+		case RoleAssistant:
+			om := oaMessage{Role: "assistant", Content: openAIText(m)} // Parts are user/tool only
 			// DeepSeek thinking mode requires the reasoning_content key on every
 			// replayed assistant turn once the request carries tools — including
 			// turns where the provider returned no reasoning of its own. Omitting
@@ -193,7 +212,7 @@ func buildOpenAIRequest(cfg ProviderConfig, req *ChatRequest, model string, stre
 			if len(m.Parts) == 0 {
 				om.Content = openAIText(m)
 			} else {
-				om.ContentParts = openAIContent(m).([]oaContentPart)
+				om.ContentParts = openAIContent(m)
 			}
 			msgs = append(msgs, om)
 		}
@@ -395,6 +414,7 @@ type oaRespUsage struct {
 	PromptTokensDetails     *oaPromptDetails `json:"prompt_tokens_details"`
 	PromptCacheHitTokens    int              `json:"prompt_cache_hit_tokens"`
 	PromptCacheMissTokens   int              `json:"prompt_cache_miss_tokens"`
+	TopCachedTokens         int              `json:"cached_tokens"` // Moonshot/Kimi: top-level, subset of prompt_tokens
 }
 
 // usageFromOpenAI maps a chat-completions usage object onto canonical
@@ -421,21 +441,35 @@ func usageFromOpenAI(u *oaRespUsage) Usage {
 	if u.CacheCreationTokens > 0 || u.CacheReadTokens > 0 {
 		out.CacheReported = true
 	}
-	// DeepSeek native fields: a hit is prompt content read from cache; a
-	// miss is newly processed content that DeepSeek then caches for
-	// future requests, i.e. a cache write.
-	if u.PromptCacheHitTokens > 0 || u.PromptCacheMissTokens > 0 {
-		out.CacheReadTokens += u.PromptCacheHitTokens
-		out.CacheCreationTokens += u.PromptCacheMissTokens
+	switch {
+	case u.PromptCacheHitTokens > 0 || u.PromptCacheMissTokens > 0:
+		// DeepSeek native fields (authoritative when present; DeepSeek may
+		// echo the hit count as cached_tokens too). A hit is prompt content
+		// read from cache; a miss is ordinary uncached input and stays in
+		// PromptTokens. Guarded so hostile payloads never go negative.
 		out.CacheReported = true
-	}
-	if u.PromptTokensDetails != nil && u.PromptTokensDetails.CachedTokens > 0 &&
-		u.PromptTokensDetails.CachedTokens <= out.PromptTokens {
+		if hit := u.PromptCacheHitTokens; hit <= out.PromptTokens {
+			out.PromptTokens -= hit
+			out.CacheReadTokens += hit
+		}
+	case u.CacheReadTokens > 0:
+		// Anthropic-named field from a gateway, already in CacheReadTokens.
+		// When the OpenAI-shaped cached_tokens rides along, prompt_tokens
+		// follows OpenAI (inclusive) semantics and both fields describe the
+		// same read: subtract it from the prompt once, never add it twice.
+		if d := u.PromptTokensDetails; d != nil && d.CachedTokens > 0 && d.CachedTokens <= out.PromptTokens {
+			out.PromptTokens -= d.CachedTokens
+		}
+	case u.PromptTokensDetails != nil && u.PromptTokensDetails.CachedTokens > 0 &&
+		u.PromptTokensDetails.CachedTokens <= out.PromptTokens:
 		out.PromptTokens -= u.PromptTokensDetails.CachedTokens
 		out.CacheReadTokens += u.PromptTokensDetails.CachedTokens
-	}
-	if total := u.PromptCacheHitTokens + u.PromptCacheMissTokens; total > 0 && total <= out.PromptTokens {
-		out.PromptTokens -= total
+	case u.TopCachedTokens > 0 && u.TopCachedTokens <= out.PromptTokens:
+		// Moonshot/Kimi report the cached subset top-level.
+		out.CacheReported = true
+		out.CachedTokens = u.TopCachedTokens
+		out.PromptTokens -= u.TopCachedTokens
+		out.CacheReadTokens += u.TopCachedTokens
 	}
 	return out
 }
@@ -563,12 +597,13 @@ func mapOpenAIStreamEvent(data []byte, acc *streamAccum) (deltas []Delta, done b
 			if tc.Function.Name != "" {
 				call.name = tc.Function.Name
 			}
-			accDelta := Delta{Kind: DeltaToolArgs, Text: tc.Function.Arguments, ToolIndex: idx, ToolID: call.id, ToolName: call.name}
+			accDelta := Delta{Kind: DeltaToolArgs, Text: tc.Function.Arguments, ToolIndex: call.pos, ToolID: call.id, ToolName: call.name}
 			call.args.WriteString(tc.Function.Arguments)
 			deltas = append(deltas, accDelta)
 		}
 		if ch.FinishReason != "" {
 			acc.finishReason = mapOpenAIFinishReason(ch.FinishReason)
+			acc.sawFinish = true
 		}
 	}
 	return deltas, false, nil

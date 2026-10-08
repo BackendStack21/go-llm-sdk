@@ -2,6 +2,7 @@ package llm
 
 import (
 	"context"
+	"errors"
 	"net/http"
 	"strings"
 	"sync"
@@ -22,6 +23,21 @@ type SDK struct {
 	timeout   time.Duration
 	cacheTTL  time.Duration
 	rt        http.RoundTripper
+	retry     RetryPolicy
+	idle      time.Duration
+	observer  func(LearnEvent)
+}
+
+// clientOpts snapshots the SDK-level knobs every provider client honors.
+func (s *SDK) clientOpts() clientOpts {
+	return clientOpts{retry: s.retry, idle: s.idle, observer: s.observer}
+}
+
+// newClient builds a provider client for p with the SDK's settings.
+func (s *SDK) newClient(p *Provider, timeout time.Duration, learn *learnOnce) *providerClient {
+	pc := newProviderClientWithLearn(p.cfg, newBufferedHTTP(s.rt, timeout), newStreamHTTP(s.rt), learn)
+	pc.opts = s.clientOpts()
+	return pc
 }
 
 // Option configures an SDK at construction time.
@@ -130,6 +146,23 @@ func WithQuirks(q Quirks) ProviderOption {
 	return func(c *ProviderConfig) { c.Quirks = q }
 }
 
+// WithHeaders adds extra HTTP headers to every request this provider makes
+// (merged over earlier WithHeaders calls). An empty value removes that
+// header, e.g. {"Authorization": ""} for gateways that authenticate with
+// an api-key header instead. The map is copied.
+func WithHeaders(h map[string]string) ProviderOption {
+	return func(c *ProviderConfig) {
+		merged := make(map[string]string, len(c.Headers)+len(h))
+		for k, v := range c.Headers {
+			merged[k] = v
+		}
+		for k, v := range h {
+			merged[k] = v
+		}
+		c.Headers = merged
+	}
+}
+
 // WithEnvKeys sets env var names consulted for this provider's key,
 // primary first.
 func WithEnvKeys(keys ...string) ProviderOption {
@@ -188,21 +221,39 @@ func (s *SDK) Provider(id string) (*Provider, error) {
 	return p, nil
 }
 
-// Chat returns a chat client bound to a provider and model.
-func (s *SDK) Chat(providerID, model string) (*ChatClient, error) {
+// usableProvider resolves an authenticated, validly configured provider.
+func (s *SDK) usableProvider(providerID string) (*Provider, error) {
 	p, err := s.Provider(providerID)
 	if err != nil {
 		return nil, err
 	}
 	if !p.Authenticated() {
-		return nil, &ConfigError{Msg: providerID + " has no API key (set " + strings.ToUpper(providerID) + "_API_KEY or use WithAPIKey)"}
+		return nil, &ConfigError{Msg: providerID + " has no API key (" + keyHint(p.cfg) + ")"}
 	}
 	if p.invalid {
 		return nil, &ConfigError{Msg: providerID + " has an invalid configuration"}
 	}
+	return p, nil
+}
+
+// keyHint names the env vars actually consulted for cfg's key; a custom
+// provider without EnvKeys reads none, so the hint never invents one.
+func keyHint(cfg ProviderConfig) string {
+	if len(cfg.EnvKeys) == 0 {
+		return "use WithAPIKey, or WithEnvKeys to read it from the environment"
+	}
+	return "set " + strings.Join(cfg.EnvKeys, " or ") + ", or use WithAPIKey"
+}
+
+// Chat returns a chat client bound to a provider and model.
+func (s *SDK) Chat(providerID, model string) (*ChatClient, error) {
+	p, err := s.usableProvider(providerID)
+	if err != nil {
+		return nil, err
+	}
 	p.chatLearnOnce.Do(func() { p.chatLearn = &learnOnce{} })
 	return &ChatClient{
-		pc:     newProviderClientWithLearn(p.cfg, newBufferedHTTP(p.sdk.rt, p.sdk.timeout), newStreamHTTP(p.sdk.rt), p.chatLearn),
+		pc:     p.sdk.newClient(p, p.sdk.timeout, p.chatLearn),
 		model:  model,
 		parent: p,
 	}, nil
@@ -227,7 +278,15 @@ type Provider struct {
 	mu       sync.Mutex
 	cached   []Model
 	cachedAt time.Time
+	flight   *modelFlight // in-progress listing shared by concurrent callers
 }
+
+// String and GoString redact the provider for fmt verbs (%v, %+v, %#v):
+// the API key and header values never print.
+func (p *Provider) String() string { return p.cfg.String() }
+
+// GoString implements fmt.GoStringer with the same redaction as String.
+func (p *Provider) GoString() string { return p.cfg.String() }
 
 // ID returns the provider's registry id.
 func (p *Provider) ID() string { return p.cfg.ID }
@@ -273,18 +332,73 @@ func (p *Provider) ListModels(ctx context.Context, opts ...ListOption) ([]Model,
 		return nil, &ConfigError{Msg: p.cfg.ID + " has no API key"}
 	}
 	p.clientOnce.Do(func() {
-		p.listClient = newProviderClient(p.cfg, newBufferedHTTP(p.sdk.rt, 30*time.Second), newStreamHTTP(p.sdk.rt))
+		p.listClient = p.sdk.newClient(p, 30*time.Second, nil)
 	})
-	models, err := p.listClient.listModels(ctx)
+	models, err := p.fetchModels(ctx)
 	if err != nil {
 		return nil, err
 	}
-	p.mu.Lock()
-	p.cached, p.cachedAt = models, time.Now()
-	p.mu.Unlock()
 	out := make([]Model, len(models))
 	copy(out, models)
 	return out, nil
+}
+
+// modelFlight is one in-progress upstream model listing that concurrent
+// callers share.
+type modelFlight struct {
+	done           chan struct{}
+	models         []Model
+	err            error
+	leaderCanceled bool // the leader's own context ended (not an upstream failure)
+}
+
+// errModelFetchPanicked is what followers of a leader whose fetch panicked
+// receive; the panic itself propagates to the leader's caller.
+var errModelFetchPanicked = errors.New("llm: model listing fetch panicked")
+
+// fetchModels fetches the listing once for all concurrent callers (a cold
+// cache never stampedes the provider) and refreshes the cache on success.
+// A follower whose leader stopped because the leader's own context ended
+// fetches again under its own context instead of inheriting that
+// cancellation; an upstream failure (including an upstream timeout) is the
+// shared result. The flight is always cleared, even if the fetch panics.
+func (p *Provider) fetchModels(ctx context.Context) ([]Model, error) {
+	for {
+		p.mu.Lock()
+		if f := p.flight; f != nil {
+			p.mu.Unlock()
+			select {
+			case <-f.done:
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			}
+			if f.leaderCanceled && ctx.Err() == nil {
+				continue
+			}
+			return f.models, f.err
+		}
+		f := &modelFlight{done: make(chan struct{}), err: errModelFetchPanicked}
+		p.flight = f
+		p.mu.Unlock()
+		p.lead(ctx, f)
+		return f.models, f.err
+	}
+}
+
+// lead runs the leader's fetch and publishes it; the deferred release runs
+// on panic too, so a crashed fetch can never wedge later callers.
+func (p *Provider) lead(ctx context.Context, f *modelFlight) {
+	defer func() {
+		p.mu.Lock()
+		p.flight = nil
+		if f.err == nil {
+			p.cached, p.cachedAt = f.models, time.Now()
+		}
+		p.mu.Unlock()
+		close(f.done)
+	}()
+	f.models, f.err = p.listClient.listModels(ctx)
+	f.leaderCanceled = f.err != nil && ctx.Err() != nil
 }
 
 // ── ChatClient ───────────────────────────────────────────────────────────
@@ -331,3 +445,25 @@ func (c *ChatClient) CallStream(ctx context.Context, req *ChatRequest, onDelta f
 	}
 	return c.pc.callStream(ctx, req, c.model, onDelta)
 }
+
+// WithRetryPolicy replaces the default retry ladder (8 attempts, 30s
+// backoff cap) for every chat, speech, transcription and embedding call
+// made through this SDK. Zero fields keep their defaults.
+func WithRetryPolicy(p RetryPolicy) Option { return func(s *SDK) { s.retry = p } }
+
+// WithStreamIdleTimeout sets the SSE idle watchdog for this SDK's streams,
+// taking precedence over the process-wide SetStreamIdleTimeout default.
+// Non-positive values are ignored.
+func WithStreamIdleTimeout(d time.Duration) Option {
+	return func(s *SDK) {
+		if d > 0 {
+			s.idle = d
+		}
+	}
+}
+
+// WithLearnObserver registers a callback fired once per learn-once fallback
+// engaged by this SDK's providers. When set it replaces the process-wide
+// SetLearnObserver callback for this SDK. It runs on the request goroutine:
+// keep it fast and never call back into the SDK from it.
+func WithLearnObserver(fn func(LearnEvent)) Option { return func(s *SDK) { s.observer = fn } }

@@ -74,21 +74,24 @@ type rsFunctionCallItem struct {
 type rsFunctionOutputItem struct {
 	Type   string `json:"type"`
 	CallID string `json:"call_id"`
-	Output string `json:"output"`
+	Output any    `json:"output"` // string, or input_text/input_image parts
 }
 
 type rsRequest struct {
-	Model           string       `json:"model"`
-	Instructions    string       `json:"instructions,omitempty"`
-	Input           []any        `json:"input"`
-	Tools           []rsTool     `json:"tools,omitempty"`
-	MaxOutputTokens int          `json:"max_output_tokens,omitempty"`
-	Temperature     *float64     `json:"temperature,omitempty"`
-	TopP            *float64     `json:"top_p,omitempty"`
-	Stream          bool         `json:"stream,omitempty"`
-	Store           *bool        `json:"store,omitempty"`
-	Include         []string     `json:"include,omitempty"`
-	Reasoning       *rsReasoning `json:"reasoning,omitempty"`
+	Model             string       `json:"model"`
+	Instructions      string       `json:"instructions,omitempty"`
+	Input             []any        `json:"input"`
+	Tools             []rsTool     `json:"tools,omitempty"`
+	MaxOutputTokens   int          `json:"max_output_tokens,omitempty"`
+	Temperature       *float64     `json:"temperature,omitempty"`
+	TopP              *float64     `json:"top_p,omitempty"`
+	Stream            bool         `json:"stream,omitempty"`
+	Store             *bool        `json:"store,omitempty"`
+	Include           []string     `json:"include,omitempty"`
+	Reasoning         *rsReasoning `json:"reasoning,omitempty"`
+	ToolChoice        any          `json:"tool_choice,omitempty"`
+	ParallelToolCalls *bool        `json:"parallel_tool_calls,omitempty"`
+	Text              *rsText      `json:"text,omitempty"`
 }
 
 func boolPtr(v bool) *bool { return &v }
@@ -159,6 +162,10 @@ func buildResponsesRequest(req *ChatRequest, model string, stream bool) rsReques
 		Stream:       stream,
 		Store:        boolPtr(false),
 		Include:      []string{"reasoning.encrypted_content"},
+		// Seed and Stop have no Responses equivalent and are not sent.
+		ToolChoice:        responsesToolChoice(req.ToolChoice),
+		ParallelToolCalls: parallelToolCalls(req),
+		Text:              responsesText(req.ResponseFormat),
 	}
 	if req.MaxTokens > 0 {
 		out.MaxOutputTokens = req.MaxTokens
@@ -194,6 +201,15 @@ func buildResponsesRequest(req *ChatRequest, model string, stream bool) rsReques
 	return out
 }
 
+// responsesReasoningItem renders one replayed reasoning item.
+func responsesReasoningItem(summary, encrypted string) rsReasoningItem {
+	sum := make([]rsSummaryText, 0, 1)
+	if summary != "" {
+		sum = append(sum, rsSummaryText{Type: "summary_text", Text: summary})
+	}
+	return rsReasoningItem{Type: "reasoning", EncryptedContent: encrypted, Summary: sum}
+}
+
 func buildResponsesInput(req *ChatRequest) (instructions string, input []any) {
 	var sys []string
 	appendSys := func(text string) {
@@ -222,16 +238,17 @@ func buildResponsesInput(req *ChatRequest) (instructions string, input []any) {
 			// reasoning as an encrypted reasoning item gated on
 			// ThinkingSignature, so Quirks.EchoReasoningWithTools has nothing to
 			// act on here and no reasoning_content key exists to echo.
-			if m.ThinkingSignature != "" {
-				sum := make([]rsSummaryText, 0)
-				if m.ReasoningContent != "" {
-					sum = append(sum, rsSummaryText{Type: "summary_text", Text: m.ReasoningContent})
+			if len(m.ThinkingBlocks) > 0 {
+				// Every signed reasoning item, in order. Unsigned blocks
+				// cannot be replayed statelessly (store=false) and are
+				// skipped.
+				for _, tb := range m.ThinkingBlocks {
+					if tb.Signature != "" {
+						input = append(input, responsesReasoningItem(tb.Text, tb.Signature))
+					}
 				}
-				input = append(input, rsReasoningItem{
-					Type:             "reasoning",
-					EncryptedContent: m.ThinkingSignature,
-					Summary:          sum,
-				})
+			} else if m.ThinkingSignature != "" {
+				input = append(input, responsesReasoningItem(m.ReasoningContent, m.ThinkingSignature))
 			}
 			for _, tc := range m.ToolCalls {
 				input = append(input, rsFunctionCallItem{
@@ -248,7 +265,7 @@ func buildResponsesInput(req *ChatRequest) (instructions string, input []any) {
 			input = append(input, rsFunctionOutputItem{
 				Type:   "function_call_output",
 				CallID: m.ToolCallID,
-				Output: m.Content,
+				Output: responsesContent(m),
 			})
 		}
 	}
@@ -332,13 +349,16 @@ func chatResultFromResponses(r *rsResponse) *ChatResult {
 		switch item.Type {
 		case "reasoning":
 			if item.EncryptedContent != "" {
+				// Legacy single-signature field: the last item's.
 				res.ThinkingSignature = item.EncryptedContent
 			}
-			for _, s := range item.Summary {
-				if s.Text != "" {
-					summaries = append(summaries, s.Text)
-				}
+			text := reasoningSummary(item.Summary)
+			if text != "" {
+				summaries = append(summaries, text)
 			}
+			// Every item is kept: a tool turn can carry several reasoning
+			// items, and each must be replayed.
+			res.ThinkingBlocks = append(res.ThinkingBlocks, ThinkingBlock{Text: text, Signature: item.EncryptedContent})
 		case "message":
 			for _, p := range item.Content {
 				if p.Type == "output_text" && p.Text != "" {
@@ -361,10 +381,28 @@ func chatResultFromResponses(r *rsResponse) *ChatResult {
 	return res
 }
 
+// reasoningSummary joins one reasoning item's summary texts.
+func reasoningSummary(sum []rsSummaryText) string {
+	var parts []string
+	for _, s := range sum {
+		if s.Text != "" {
+			parts = append(parts, s.Text)
+		}
+	}
+	return strings.Join(parts, "\n")
+}
+
 func responsesFinishReason(r *rsResponse, hasTools bool) string {
 	switch r.Status {
 	case "incomplete":
-		if r.IncompleteDetails != nil && strings.Contains(strings.ToLower(r.IncompleteDetails.Reason), "max_output") {
+		reason := ""
+		if r.IncompleteDetails != nil {
+			reason = strings.ToLower(r.IncompleteDetails.Reason)
+		}
+		switch {
+		case strings.Contains(reason, "content_filter"):
+			return FinishContentFilter
+		case strings.Contains(reason, "max_output"):
 			return FinishLength
 		}
 		if hasTools {
@@ -390,11 +428,8 @@ func parseResponsesAPI(body []byte) (*ChatResult, error) {
 		return nil, fmt.Errorf("llm: provider error: %s", r.Error.Message)
 	}
 	if r.Status == "failed" {
-		msg := "responses failed"
-		if r.Error != nil && r.Error.Message != "" {
-			msg = r.Error.Message
-		}
-		return nil, fmt.Errorf("llm: provider error: %s", msg)
+		// An error message, when present, was returned just above.
+		return nil, fmt.Errorf("llm: provider error: responses failed")
 	}
 	return chatResultFromResponses(&r), nil
 }
@@ -403,10 +438,23 @@ func parseResponsesAPI(body []byte) (*ChatResult, error) {
 
 type rsStreamEvent struct {
 	Type        string        `json:"type"`
+	Message     string        `json:"message"` // top-level "error" event
 	Delta       string        `json:"delta"`
 	OutputIndex int           `json:"output_index"`
 	Item        *rsOutputItem `json:"item"`
 	Response    *rsResponse   `json:"response"`
+}
+
+// addResponsesReasoning records one reasoning item as a ThinkingBlock (and
+// the legacy last-signature field).
+func addResponsesReasoning(acc *streamAccum, idx int, item *rsOutputItem) {
+	b := acc.block(idx)
+	b.text.Reset()
+	b.text.WriteString(reasoningSummary(item.Summary))
+	b.sig = item.EncryptedContent
+	if item.EncryptedContent != "" {
+		acc.thinkingSignature = item.EncryptedContent
+	}
 }
 
 func mapResponsesStreamEvent(data []byte, acc *streamAccum) (deltas []Delta, done bool, err error) {
@@ -431,7 +479,7 @@ func mapResponsesStreamEvent(data []byte, acc *streamAccum) (deltas []Delta, don
 		deltas = append(deltas, Delta{
 			Kind:      DeltaToolArgs,
 			Text:      ev.Delta,
-			ToolIndex: ev.OutputIndex,
+			ToolIndex: call.pos,
 			ToolID:    call.id,
 			ToolName:  call.name,
 		})
@@ -446,21 +494,23 @@ func mapResponsesStreamEvent(data []byte, acc *streamAccum) (deltas []Delta, don
 			}
 		}
 	case "response.output_item.done":
-		if ev.Item != nil && ev.Item.Type == "reasoning" && ev.Item.EncryptedContent != "" {
-			acc.thinkingSignature = ev.Item.EncryptedContent
+		if ev.Item != nil && ev.Item.Type == "reasoning" {
+			addResponsesReasoning(acc, ev.OutputIndex, ev.Item)
 		}
 	case "response.completed", "response.incomplete":
+		acc.sawFinish = true
 		if ev.Response != nil {
 			if ev.Response.Usage != nil {
 				acc.usage = usageFromResponses(ev.Response.Usage)
 			}
 			hasTools := len(acc.calls) > 0
 			acc.finishReason = responsesFinishReason(ev.Response, hasTools)
-			if acc.thinkingSignature == "" {
-				for _, item := range ev.Response.Output {
-					if item.Type == "reasoning" && item.EncryptedContent != "" {
-						acc.thinkingSignature = item.EncryptedContent
-						break
+			if len(acc.thinking) == 0 {
+				// Items not announced via output_item.done: take them from
+				// the final response.
+				for i := range ev.Response.Output {
+					if item := &ev.Response.Output[i]; item.Type == "reasoning" {
+						addResponsesReasoning(acc, i, item)
 					}
 				}
 			}
@@ -474,6 +524,13 @@ func mapResponsesStreamEvent(data []byte, acc *streamAccum) (deltas []Delta, don
 			}
 		}
 		return deltas, true, nil
+	case "error":
+		// Top-level stream error event (no response object).
+		msg := ev.Message
+		if msg == "" {
+			msg = "responses stream error"
+		}
+		return nil, true, fmt.Errorf("llm: provider error: %s", msg)
 	case "response.failed":
 		msg := "responses failed"
 		if ev.Response != nil && ev.Response.Error != nil && ev.Response.Error.Message != "" {

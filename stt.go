@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"io"
 	"mime/multipart"
@@ -57,20 +56,18 @@ func (s *SDK) Transcribe(ctx context.Context, providerID, model string, req Tran
 	if len(req.Audio) > maxTranscribeAudioBytes {
 		return nil, &ConfigError{Msg: "transcribe audio exceeds 25MB limit"}
 	}
+	if strings.ContainsFunc(req.Filename+req.MIMEType, func(r rune) bool { return r < 0x20 || r == 0x7f }) {
+		// Written into multipart part headers: a CR/LF would inject one.
+		return nil, &ConfigError{Msg: "transcribe Filename and MIMEType must not contain control characters"}
+	}
 	if strings.TrimSpace(model) == "" {
 		return nil, &ConfigError{Msg: "transcribe request requires a model"}
 	}
-	p, err := s.Provider(providerID)
+	p, err := s.usableProvider(providerID)
 	if err != nil {
 		return nil, err
 	}
-	if !p.Authenticated() {
-		return nil, &ConfigError{Msg: providerID + " has no API key (set " + strings.ToUpper(providerID) + "_API_KEY or use WithAPIKey)"}
-	}
-	if p.invalid {
-		return nil, &ConfigError{Msg: providerID + " has an invalid configuration"}
-	}
-	pc := newProviderClient(p.cfg, newBufferedHTTP(s.rt, s.timeout), nil)
+	pc := s.newClient(p, s.timeout, nil)
 	return pc.transcribe(ctx, model, req)
 }
 
@@ -130,8 +127,8 @@ func (pc *providerClient) buildTranscribeRequest(model string, req TranscribeReq
 	return buf.Bytes(), pc.base + "/audio/transcriptions", nil
 }
 
-// transcribe runs the STT request against one provider with retry
-// semantics identical to the buffered chat path.
+// transcribe runs the STT request against one provider with the shared
+// retry ladder and whole-call budget of the buffered chat path.
 func (pc *providerClient) transcribe(ctx context.Context, model string, req TranscribeRequest) (*TranscribeResult, error) {
 	body, url, err := pc.buildTranscribeRequest(model, req)
 	if err != nil {
@@ -139,70 +136,33 @@ func (pc *providerClient) transcribe(ctx context.Context, model string, req Tran
 	}
 	ctype := "multipart/form-data; boundary=" + multipartBodyBoundary(body)
 
-	var (
-		lastErr error
-		rateErr *APIError
-		rateRA  time.Duration
-	)
-	for attempt := 0; attempt <= maxRetries; attempt++ {
-		if err := ctx.Err(); err != nil {
-			return nil, err
-		}
+	ctx, cancel := context.WithTimeout(ctx, pc.requestTimeout())
+	defer cancel()
+	var res *TranscribeResult
+	err = pc.withRetry(ctx, func() (time.Duration, error) {
 		data, ra, err := pc.postMultipart(ctx, url, body, ctype)
 		if err != nil {
-			var apiErr *APIError
-			if errors.As(err, &apiErr) {
-				switch {
-				case apiErr.Status == http.StatusTooManyRequests && billingExhausted(apiErr):
-					return nil, apiErr
-				case apiErr.Status == http.StatusTooManyRequests:
-					rateErr, rateRA, lastErr = apiErr, ra, apiErr
-					if attempt < maxRetries {
-						if !retrySleep(ctx, retryDelay(ra, attempt)) {
-							return nil, &RateLimitError{APIError: *rateErr, Attempts: attempt + 1, RetryAfter: rateRA}
-						}
-						continue
-					}
-				case apiErr.Retryable && attempt < maxRetries:
-					lastErr = apiErr
-					if !retrySleep(ctx, retryDelay(ra, attempt)) {
-						return nil, ctx.Err()
-					}
-					continue
-				}
-				if rateErr != nil && !apiErr.Retryable && apiErr.Status != http.StatusTooManyRequests {
-					return nil, apiErr
-				}
-				if rateErr != nil {
-					return nil, &RateLimitError{APIError: *rateErr, Attempts: attempt + 1, RetryAfter: rateRA}
-				}
-				return nil, apiErr
-			}
-			// Transport error — retryable.
-			lastErr = err
-			if attempt < maxRetries {
-				if !retrySleep(ctx, retryDelay(0, attempt)) {
-					return nil, ctx.Err()
-				}
-				continue
-			}
-			return nil, fmt.Errorf("llm: retry exhausted (%d attempts): %w", maxRetries+1, err)
+			return ra, err
 		}
-		res, perr := parseTranscribeResponse(data)
+		r, perr := parseTranscribeResponse(data)
 		if perr != nil {
 			// 2xx with an undecodable body is a provider protocol
 			// failure — surface it through the typed error taxonomy
 			// at the actual HTTP status (never a plain fmt.Errorf).
-			return nil, &APIError{
+			return 0, terminal(&APIError{
 				Provider: pc.cfg.ID,
 				Status:   http.StatusOK,
 				Message:  perr.Error(),
-			}
+			})
 		}
-		res.Model = model
-		return res, nil
+		r.Model = model
+		res = r
+		return 0, nil
+	}, nil)
+	if err != nil {
+		return nil, err
 	}
-	return nil, lastErr
+	return res, nil
 }
 
 // multipartBodyBoundary extracts the boundary from a multipart writer's
@@ -248,7 +208,7 @@ func (pc *providerClient) postMultipart(ctx context.Context, url string, body []
 		return nil, 0, &ConfigError{Msg: "build request: " + err.Error()}
 	}
 	req.Header.Set("Content-Type", ctype)
-	pc.setAuthHeaders(req.Header)
+	pc.setHeaders(req.Header)
 
 	resp, err := pc.buffered().Do(req)
 	if err != nil {

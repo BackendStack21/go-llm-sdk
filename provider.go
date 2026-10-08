@@ -1,6 +1,7 @@
 package llm
 
 import (
+	neturl "net/url"
 	"strings"
 )
 
@@ -44,6 +45,10 @@ type Quirks struct {
 	// thinking.type=disabled outright (GLM-5.3 always reasons; the
 	// documented migration is {type: enabled} + reasoning_effort "low").
 	ForceThinking []string
+	// NoJSONSchema: the provider accepts response_format json_object but
+	// rejects json_schema (DeepSeek); a json_schema ResponseFormat fails fast
+	// with a ConfigError instead of a provider 400.
+	NoJSONSchema bool
 	// AnthropicVersion is the anthropic-version header value required by
 	// FormatAnthropic providers ("2023-06-01").
 	AnthropicVersion string
@@ -61,6 +66,12 @@ type ProviderConfig struct {
 	// (aliases after). Resolution stops at the first non-empty value.
 	EnvKeys []string
 	Quirks  Quirks
+	// Headers are extra HTTP headers sent on every request to this
+	// provider (OpenRouter attribution, OpenAI-Organization, anthropic-beta,
+	// api-key gateways, …). They are applied last, so they can override the
+	// SDK's own headers; an empty value removes that header. Like APIKey,
+	// header values are never logged or included in String().
+	Headers map[string]string
 }
 
 func (c ProviderConfig) String() string {
@@ -76,6 +87,9 @@ func (c ProviderConfig) String() string {
 	b.WriteString("}")
 	return b.String()
 }
+
+// GoString keeps %#v from printing the API key and header values.
+func (c ProviderConfig) GoString() string { return c.String() }
 
 func strconvBool(b bool) string {
 	if b {
@@ -152,7 +166,7 @@ func builtinProviders() []ProviderConfig {
 			Format:  FormatOpenAI,
 			BaseURL: "https://api.deepseek.com",
 			EnvKeys: []string{"DEEPSEEK_API_KEY"},
-			Quirks:  Quirks{ThinkingObject: true, EchoReasoningWithTools: true},
+			Quirks:  Quirks{ThinkingObject: true, EchoReasoningWithTools: true, NoJSONSchema: true},
 		},
 		{
 			ID:      "zai",
@@ -199,6 +213,9 @@ func validateProviderConfig(c ProviderConfig) error {
 	}
 	if !strings.HasPrefix(c.BaseURL, "http://") && !strings.HasPrefix(c.BaseURL, "https://") {
 		return &ConfigError{Msg: c.ID + ": base URL must start with http:// or https://"}
+	}
+	if _, err := neturl.Parse(c.BaseURL); err != nil {
+		return &ConfigError{Msg: c.ID + ": base URL is malformed"}
 	}
 	return nil
 }

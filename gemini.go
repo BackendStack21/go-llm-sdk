@@ -5,6 +5,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"math"
 	neturl "net/url"
 	"strings"
 )
@@ -32,6 +33,7 @@ type gmPart struct {
 	Thought          bool      `json:"thought,omitempty"`
 	FunctionCall     *gmFnCall `json:"functionCall,omitempty"`
 	FunctionResponse *gmFnResp `json:"functionResponse,omitempty"`
+	ThoughtSignature string    `json:"thoughtSignature,omitempty"`
 }
 type gmBlob struct {
 	MIMEType string `json:"mimeType"`
@@ -59,17 +61,21 @@ type gmThinkCfg struct {
 }
 
 type gmGenCfg struct {
-	MaxOutputTokens int         `json:"maxOutputTokens,omitempty"`
-	Temperature     *float64    `json:"temperature,omitempty"`
-	TopP            *float64    `json:"topP,omitempty"`
-	StopSequences   []string    `json:"stopSequences,omitempty"`
-	ThinkingConfig  *gmThinkCfg `json:"thinkingConfig,omitempty"`
+	MaxOutputTokens    int             `json:"maxOutputTokens,omitempty"`
+	Temperature        *float64        `json:"temperature,omitempty"`
+	TopP               *float64        `json:"topP,omitempty"`
+	StopSequences      []string        `json:"stopSequences,omitempty"`
+	ThinkingConfig     *gmThinkCfg     `json:"thinkingConfig,omitempty"`
+	Seed               *int            `json:"seed,omitempty"`
+	ResponseMimeType   string          `json:"responseMimeType,omitempty"`
+	ResponseJSONSchema json.RawMessage `json:"responseJsonSchema,omitempty"`
 }
 
 type gmRequest struct {
 	SystemInstruction *gmContent    `json:"systemInstruction,omitempty"`
 	Contents          []gmContent   `json:"contents"`
 	Tools             []gmToolGroup `json:"tools,omitempty"`
+	ToolConfig        *gmToolConfig `json:"toolConfig,omitempty"`
 	GenerationConfig  *gmGenCfg     `json:"generationConfig,omitempty"`
 }
 
@@ -105,6 +111,16 @@ func wrapToolResponse(content string) json.RawMessage {
 		return json.RawMessage(t)
 	}
 	return json.RawMessage(fmt.Sprintf(`{"result":%s}`, mustJSONString(content)))
+}
+
+// wrapToolError renders a failed tool result as {"error": …}, the Gemini
+// functionResponse convention for errors.
+func wrapToolError(content string) json.RawMessage {
+	t := strings.TrimSpace(content)
+	if strings.HasPrefix(t, "{") && json.Valid([]byte(t)) {
+		return json.RawMessage(`{"error":` + t + `}`)
+	}
+	return json.RawMessage(fmt.Sprintf(`{"error":%s}`, mustJSONString(content)))
 }
 
 func mustJSONString(s string) string {
@@ -159,25 +175,29 @@ func buildGeminiRequest(req *ChatRequest, model string, stream bool) ([]byte, er
 					toolNameByID[tc.ID] = tc.Name
 				}
 			}
+			// Thought signatures are replayed on the part they arrived on:
+			// per function call (Gemini 3 rejects a function-call turn
+			// without them) and on the text part.
 			parts := []gmPart{}
 			if m.Content != "" {
-				parts = append(parts, gmPart{Text: m.Content})
+				parts = append(parts, gmPart{Text: m.Content, ThoughtSignature: m.ThinkingSignature})
 			}
 			for _, tc := range m.ToolCalls {
 				args := json.RawMessage(tc.Arguments)
 				if len(args) == 0 {
 					args = json.RawMessage("{}")
 				}
-				parts = append(parts, gmPart{FunctionCall: &gmFnCall{Name: tc.Name, Args: args}})
+				parts = append(parts, gmPart{FunctionCall: &gmFnCall{Name: tc.Name, Args: args}, ThoughtSignature: tc.Signature})
 			}
 			if len(parts) == 0 {
-				parts = []gmPart{{Text: " "}} // Gemini rejects empty parts
+				// Gemini rejects empty parts.
+				parts = []gmPart{{Text: " ", ThoughtSignature: m.ThinkingSignature}}
 			}
 			out.Contents = append(out.Contents, gmContent{Role: "model", Parts: parts})
 		case RoleTool:
 			// Merge the run of consecutive tool messages into one user
 			// content with functionResponse parts.
-			var parts []gmPart
+			var parts, images []gmPart
 			for ; i < len(req.Messages) && req.Messages[i].Role == RoleTool; i++ {
 				tm := req.Messages[i]
 				name := tm.ToolName
@@ -190,13 +210,19 @@ func buildGeminiRequest(req *ChatRequest, model string, stream bool) ([]byte, er
 				if name == "" {
 					return nil, &ConfigError{Msg: "tool result for \"" + tm.ToolCallID + "\" has no ToolName and no matching assistant tool_call"}
 				}
+				resp := wrapToolResponse(partsText(tm))
+				if tm.IsError {
+					resp = wrapToolError(partsText(tm))
+				}
 				parts = append(parts, gmPart{
-					FunctionResponse: &gmFnResp{
-						Name:     name,
-						Response: wrapToolResponse(tm.Content),
-					},
+					FunctionResponse: &gmFnResp{Name: name, Response: resp},
 				})
+				// Images from the tool ride the same user turn as inlineData.
+				for _, p := range imageParts(tm) {
+					images = append(images, gmPart{InlineData: &gmBlob{MIMEType: wireMIME(p.MIMEType), Data: base64.StdEncoding.EncodeToString(p.Image)}})
+				}
 			}
+			parts = append(parts, images...)
 			i--
 			out.Contents = append(out.Contents, gmContent{Role: "user", Parts: parts})
 		}
@@ -233,8 +259,20 @@ func buildGeminiRequest(req *ChatRequest, model string, stream bool) ([]byte, er
 	if tc := geminiThinkingConfig(req.Thinking, req.ThinkingBudget); tc != nil {
 		cfg.ThinkingConfig = tc
 	}
+	if req.Seed != nil && (*req.Seed > math.MaxInt32 || *req.Seed < math.MinInt32) {
+		return nil, &ConfigError{Msg: "Gemini Seed must fit in 32 bits"}
+	}
+	cfg.Seed = req.Seed
+	if req.ResponseFormat.jsonMode() {
+		cfg.ResponseMimeType = "application/json"
+		if req.ResponseFormat.Type == ResponseJSONSchema {
+			cfg.ResponseJSONSchema = req.ResponseFormat.Schema
+		}
+	}
+	out.ToolConfig = geminiToolConfig(req.ToolChoice)
 	if cfg.MaxOutputTokens != 0 || cfg.Temperature != nil || cfg.TopP != nil ||
-		len(cfg.StopSequences) > 0 || cfg.ThinkingConfig != nil {
+		len(cfg.StopSequences) > 0 || cfg.ThinkingConfig != nil || cfg.Seed != nil ||
+		cfg.ResponseMimeType != "" {
 		out.GenerationConfig = &cfg
 	}
 	return json.Marshal(out)
@@ -243,9 +281,10 @@ func buildGeminiRequest(req *ChatRequest, model string, stream bool) ([]byte, er
 // ── response ─────────────────────────────────────────────────────────────
 
 type gmRespPart struct {
-	Text         string    `json:"text"`
-	Thought      bool      `json:"thought"`
-	FunctionCall *gmFnCall `json:"functionCall"`
+	Text             string    `json:"text"`
+	Thought          bool      `json:"thought"`
+	FunctionCall     *gmFnCall `json:"functionCall"`
+	ThoughtSignature string    `json:"thoughtSignature"`
 }
 
 type gmCandidate struct {
@@ -262,11 +301,21 @@ type gmUsage struct {
 	PromptTokenCount     int `json:"promptTokenCount"`
 	CandidatesTokenCount int `json:"candidatesTokenCount"`
 	ThoughtsTokenCount   int `json:"thoughtsTokenCount"`
+	// CachedContentTokenCount is a subset of PromptTokenCount; nil when the
+	// provider did not report caching.
+	CachedContentTokenCount *int `json:"cachedContentTokenCount"`
+}
+
+// gmPromptFeedback reports a prompt Gemini blocked before generating (no
+// candidates follow).
+type gmPromptFeedback struct {
+	BlockReason string `json:"blockReason"`
 }
 
 type gmResponse struct {
-	Candidates    []gmCandidate `json:"candidates"`
-	UsageMetadata gmUsage       `json:"usageMetadata"`
+	Candidates     []gmCandidate     `json:"candidates"`
+	UsageMetadata  gmUsage           `json:"usageMetadata"`
+	PromptFeedback *gmPromptFeedback `json:"promptFeedback"`
 }
 
 // mapGeminiFinishReason maps finishReason to canonical values.
@@ -286,12 +335,36 @@ func mapGeminiFinishReason(s string) string {
 	}
 }
 
+// geminiFinish maps finishReason and folds in the tool-call turn: Gemini
+// reports STOP for a function-call response, which every other format
+// reports as tool_calls.
+func geminiFinish(reason string, hasCalls bool) string {
+	f := mapGeminiFinishReason(reason)
+	if f == FinishStop && hasCalls {
+		return FinishToolCalls
+	}
+	return f
+}
+
+// mapGeminiUsage normalizes usageMetadata: cached content is a subset of
+// promptTokenCount (moved to CacheReadTokens) and candidatesTokenCount
+// excludes thoughts (added, so CompletionTokens includes reasoning as on
+// every other format).
 func mapGeminiUsage(u gmUsage) Usage {
-	return Usage{
+	out := Usage{
 		PromptTokens:     u.PromptTokenCount,
-		CompletionTokens: u.CandidatesTokenCount,
+		CompletionTokens: u.CandidatesTokenCount + u.ThoughtsTokenCount,
 		ReasoningTokens:  u.ThoughtsTokenCount,
 	}
+	if c := u.CachedContentTokenCount; c != nil {
+		out.CacheReported = true
+		out.CachedTokens = *c
+		if *c > 0 && *c <= out.PromptTokens {
+			out.PromptTokens -= *c
+			out.CacheReadTokens = *c
+		}
+	}
+	return out
 }
 
 // foldGeminiParts folds response parts into acc, emitting deltas for new
@@ -310,6 +383,7 @@ func foldGeminiParts(parts []gmRespPart, acc *streamAccum) []Delta {
 				args = "{}"
 			}
 			c.args.WriteString(args)
+			c.sig = p.ThoughtSignature
 			deltas = append(deltas, Delta{
 				Kind:      DeltaToolArgs,
 				Text:      args,
@@ -317,7 +391,13 @@ func foldGeminiParts(parts []gmRespPart, acc *streamAccum) []Delta {
 				ToolID:    c.id,
 				ToolName:  c.name,
 			})
+		case p.ThoughtSignature != "" && p.Text == "":
+			// Signature-only part (streams often close with one).
+			acc.thinkingSignature = p.ThoughtSignature
 		case p.Text != "":
+			if p.ThoughtSignature != "" {
+				acc.thinkingSignature = p.ThoughtSignature
+			}
 			if p.Thought {
 				acc.reasoning.WriteString(p.Text)
 				deltas = append(deltas, Delta{Kind: DeltaReasoning, Text: p.Text})
@@ -337,13 +417,17 @@ func parseGeminiResponse(body []byte) (*ChatResult, error) {
 		return nil, fmt.Errorf("llm: parse response: %w", err)
 	}
 	if len(r.Candidates) == 0 {
+		if r.PromptFeedback != nil && r.PromptFeedback.BlockReason != "" {
+			// A blocked prompt is a completed, filtered turn.
+			return &ChatResult{FinishReason: FinishContentFilter, Usage: mapGeminiUsage(r.UsageMetadata)}, nil
+		}
 		return nil, fmt.Errorf("llm: response has no candidates")
 	}
 	acc := newStreamAccum()
 	c := r.Candidates[0]
 	foldGeminiParts(c.Content.Parts, acc)
 	res := acc.result()
-	res.FinishReason = mapGeminiFinishReason(c.FinishReason)
+	res.FinishReason = geminiFinish(c.FinishReason, len(res.ToolCalls) > 0)
 	res.Usage = mapGeminiUsage(r.UsageMetadata)
 	return res, nil
 }
@@ -351,8 +435,9 @@ func parseGeminiResponse(body []byte) (*ChatResult, error) {
 // ── streaming ────────────────────────────────────────────────────────────
 
 type gmStreamChunk struct {
-	Candidates    []gmCandidate `json:"candidates"`
-	UsageMetadata *gmUsage      `json:"usageMetadata"` // nil = chunk carries no usage update
+	Candidates     []gmCandidate     `json:"candidates"`
+	PromptFeedback *gmPromptFeedback `json:"promptFeedback"`
+	UsageMetadata  *gmUsage          `json:"usageMetadata"` // nil = chunk carries no usage update
 }
 
 // mapGeminiStreamEvent folds one Gemini SSE chunk into acc. Chunks carry
@@ -367,12 +452,19 @@ func mapGeminiStreamEvent(data []byte, acc *streamAccum) ([]Delta, bool, error) 
 		acc.usage = mapGeminiUsage(*c.UsageMetadata)
 	}
 	if len(c.Candidates) == 0 {
+		if c.PromptFeedback != nil && c.PromptFeedback.BlockReason != "" {
+			// Blocked prompt: a completed content_filter turn, not a
+			// truncated stream to retry.
+			acc.finishReason = FinishContentFilter
+			acc.sawFinish = true
+		}
 		return nil, false, nil
 	}
 	cand := c.Candidates[0]
 	deltas := foldGeminiParts(cand.Content.Parts, acc)
 	if cand.FinishReason != "" {
-		acc.finishReason = mapGeminiFinishReason(cand.FinishReason)
+		acc.finishReason = geminiFinish(cand.FinishReason, len(acc.calls) > 0)
+		acc.sawFinish = true
 	}
 	return deltas, false, nil
 }
@@ -397,7 +489,7 @@ type gmModelsPage struct {
 func listModelsGemini(ctx context.Context, pc *providerClient) ([]Model, error) {
 	var out []Model
 	pageToken := ""
-	for page := 0; page < 10; page++ {
+	for page := 0; page < maxModelPages; page++ {
 		url := pc.base + "/v1beta/models?pageSize=100"
 		if pageToken != "" {
 			url += "&pageToken=" + neturl.QueryEscape(pageToken)
@@ -408,7 +500,7 @@ func listModelsGemini(ctx context.Context, pc *providerClient) ([]Model, error) 
 		}
 		var p gmModelsPage
 		if err := json.Unmarshal(data, &p); err != nil {
-			return nil, fmt.Errorf("llm: parse models response: %w", err)
+			return nil, terminal(fmt.Errorf("llm: parse models response: %w", err))
 		}
 		for _, m := range p.Models {
 			out = append(out, Model{
@@ -424,5 +516,5 @@ func listModelsGemini(ctx context.Context, pc *providerClient) ([]Model, error) 
 		}
 		pageToken = p.NextPageToken
 	}
-	return out, nil
+	return nil, fmt.Errorf("%w (%d pages)", ErrModelListTruncated, maxModelPages)
 }

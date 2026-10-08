@@ -41,12 +41,16 @@ func (pc *providerClient) listModels(ctx context.Context) ([]Model, error) {
 		if err == nil {
 			return models, nil
 		}
+		var te *terminalError
+		if errors.As(err, &te) {
+			return nil, te.err // malformed body: retrying cannot fix it
+		}
 		var apiErr *APIError
-		if errors.As(err, &apiErr) && !apiErr.Retryable {
+		if (errors.As(err, &apiErr) && !apiErr.Retryable) || errors.Is(err, ErrModelListTruncated) {
 			return nil, err
 		}
 		lastErr = err
-		if !retrySleep(ctx, backoffDelay(attempt+1)) {
+		if !retrySleep(ctx, pc.retryDelay(0, attempt)) {
 			break
 		}
 	}
@@ -60,7 +64,7 @@ func (pc *providerClient) get(ctx context.Context, url string) ([]byte, time.Dur
 		return nil, 0, &ConfigError{Msg: "build request: " + err.Error()}
 	}
 	req.Header.Set("Accept", "application/json")
-	pc.setAuthHeaders(req.Header)
+	pc.setHeaders(req.Header)
 
 	resp, err := pc.buffered().Do(req)
 	if err != nil {
@@ -103,7 +107,7 @@ func listModelsOpenAI(ctx context.Context, pc *providerClient) ([]Model, error) 
 	}
 	var r oaModelsResponse
 	if err := json.Unmarshal(data, &r); err != nil {
-		return nil, fmt.Errorf("llm: parse models response: %w", err)
+		return nil, terminal(fmt.Errorf("llm: parse models response: %w", err))
 	}
 	entries := r.Data
 	if len(entries) == 0 {
@@ -129,3 +133,10 @@ func listModelsOpenAI(ctx context.Context, pc *providerClient) ([]Model, error) 
 	}
 	return out, nil
 }
+
+// maxModelPages bounds a paginated listing (100 models per page).
+const maxModelPages = 100
+
+// ErrModelListTruncated reports a model listing longer than the SDK's page
+// cap; the SDK never returns a silently truncated listing.
+var ErrModelListTruncated = errors.New("llm: model listing exceeds the page cap")

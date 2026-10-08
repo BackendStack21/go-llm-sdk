@@ -324,9 +324,7 @@ func TestCallStream_NonSSEBodyFallsBack(t *testing.T) {
 }
 
 func TestCallStream_IdleRetryBeforeFirstDelta(t *testing.T) {
-	oldIdle := streamIdleTimeout
-	streamIdleTimeout = 80 * time.Millisecond
-	t.Cleanup(func() { streamIdleTimeout = oldIdle })
+	setIdleForTest(t, 80*time.Millisecond)
 
 	var attempts int
 	var mu sync.Mutex

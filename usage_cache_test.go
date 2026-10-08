@@ -13,7 +13,8 @@ import (
 // Anthropic reports cache tokens exclusively (input_tokens excludes them).
 // OpenAI (prompt_tokens_details.cached_tokens) and DeepSeek
 // (prompt_cache_hit_tokens + prompt_cache_miss_tokens = prompt_tokens)
-// report them inclusively, as subsets of prompt_tokens.
+// report them inclusively, as subsets of prompt_tokens; a DeepSeek miss is
+// ordinary uncached input.
 //
 // Usage.PromptTokens must be exclusive ("uncached" input) on every
 // provider, with cache volumes carried in CacheReadTokens /
@@ -109,14 +110,15 @@ func TestUsageCache_DeepSeekHitMiss(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if res.Usage.PromptTokens != 0 {
-		t.Errorf("PromptTokens = %d, want 0 (prompt 1000 = hit 750 + miss 250; every token is cache-accounted)", res.Usage.PromptTokens)
+	// A miss is ordinary uncached input (billed as such), not a cache write.
+	if res.Usage.PromptTokens != 250 {
+		t.Errorf("PromptTokens = %d, want 250 (prompt 1000 - hit 750)", res.Usage.PromptTokens)
 	}
 	if res.Usage.CacheReadTokens != 750 {
 		t.Errorf("CacheReadTokens = %d, want 750", res.Usage.CacheReadTokens)
 	}
-	if res.Usage.CacheCreationTokens != 250 {
-		t.Errorf("CacheCreationTokens = %d, want 250", res.Usage.CacheCreationTokens)
+	if res.Usage.CacheCreationTokens != 0 {
+		t.Errorf("CacheCreationTokens = %d, want 0", res.Usage.CacheCreationTokens)
 	}
 	if !res.Usage.CacheReported {
 		t.Error("CacheReported = false, want true (DeepSeek hit/miss present)")
