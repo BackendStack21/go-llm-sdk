@@ -60,7 +60,7 @@ const (
 
 func countClient(t *testing.T, id string, f Format, model string, srv *httptest.Server) *ChatClient {
 	t.Helper()
-	cc := newTestClient(t, ProviderConfig{ID: id, Format: f, BaseURL: srv.URL, APIKey: "sk-count-secret"}, srv)
+	cc := newTestClient(t, ProviderConfig{ID: id, Format: f, BaseURL: srv.URL, APIKey: "countkey"}, srv)
 	cc.model = model
 	return cc
 }
@@ -114,7 +114,7 @@ func TestCountTokens_AnthropicWire(t *testing.T) {
 			t.Errorf("unexpected key %q in count body", k)
 		}
 	}
-	if got := rec.headers[0].Get("x-api-key"); got != "sk-count-secret" {
+	if got := rec.headers[0].Get("x-api-key"); got != "countkey" {
 		t.Errorf("x-api-key = %q", got)
 	}
 }
@@ -164,7 +164,7 @@ func TestCountTokens_GeminiWire(t *testing.T) {
 	if _, ok := g["generationConfig"]; ok {
 		t.Errorf("generationConfig must not be sent: %v", g)
 	}
-	if got := rec.headers[0].Get("x-goog-api-key"); got != "sk-count-secret" {
+	if got := rec.headers[0].Get("x-goog-api-key"); got != "countkey" {
 		t.Errorf("x-goog-api-key = %q", got)
 	}
 }
@@ -192,7 +192,7 @@ func TestCountTokens_UnsupportedNoNetwork(t *testing.T) {
 			if rec.n() != 0 {
 				t.Errorf("made %d HTTP requests, want 0", rec.n())
 			}
-			if strings.Contains(err.Error(), "sk-count-secret") {
+			if strings.Contains(err.Error(), "countkey") {
 				t.Error("error leaks API key")
 			}
 		})
@@ -441,7 +441,7 @@ func TestCountTokens_UnusableSuccessBody(t *testing.T) {
 			if rec.n() != 1 {
 				t.Errorf("attempts = %d, want 1 (terminal, not retried)", rec.n())
 			}
-			if strings.Contains(err.Error(), "sk-count-secret") {
+			if strings.Contains(err.Error(), "countkey") {
 				t.Error("error leaks API key")
 			}
 		})
@@ -458,7 +458,7 @@ func TestCountTokens_ZeroCountIsValid(t *testing.T) {
 }
 
 func TestCountTokens_ErrorNeverLeaksKey(t *testing.T) {
-	srv, _ := countServer(t, obsStep{status: 401, body: `{"error":{"message":"bad key sk-count-secret"}}`})
+	srv, _ := countServer(t, obsStep{status: 401, body: `{"error":{"message":"bad key countkey"}}`})
 	cc := countClient(t, "anthropic", FormatAnthropic, "m", srv)
 	_, err := cc.CountTokens(context.Background(), countReq())
 	if err == nil {

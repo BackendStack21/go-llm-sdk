@@ -20,6 +20,9 @@ var schemaNameRE = regexp.MustCompile(`^[A-Za-z0-9_-]{1,64}$`)
 const defaultSchemaName = "response"
 
 func validateRequestControls(req *ChatRequest) error {
+	if req.TopK < 0 {
+		return &ConfigError{Msg: "TopK must not be negative"}
+	}
 	if tc := req.ToolChoice; tc != nil {
 		if len(req.Tools) == 0 {
 			return &ConfigError{Msg: "ToolChoice requires Tools"}

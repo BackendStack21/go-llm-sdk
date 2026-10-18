@@ -271,7 +271,12 @@ type ChatRequest struct {
 	MaxTokens      int
 	Temperature    float64
 	TopP           float64
-	Stop           []string
+	// TopK limits sampling to the K most likely tokens (0 = provider
+	// default; negative is a ConfigError). Anthropic top_k (omitted when
+	// thinking is on) and Gemini generationConfig.topK; OpenAI chat and
+	// Responses ignore it.
+	TopK int
+	Stop []string
 	// ToolChoice constrains tool use (nil = provider default). It requires
 	// Tools.
 	ToolChoice *ToolChoice
@@ -287,8 +292,9 @@ type ChatRequest struct {
 	// Extra holds provider-specific top-level body fields merged into the
 	// request JSON after the SDK's own (so they override them): an escape
 	// hatch for parameters the canonical shape does not model yet. The merge
-	// is shallow: an object value replaces the SDK's whole object (e.g.
-	// Gemini generationConfig). Keys go to whichever endpoint the request
+	// is shallow: an object value replaces the SDK's whole object, except
+	// Gemini generationConfig, whose keys are set one by one over the SDK's
+	// (nested objects such as thinkingConfig are replaced whole). Keys go to whichever endpoint the request
 	// is sent to, including /responses when an OpenAI request is diverted
 	// there. Reserved (ConfigError): "stream" (use Call vs CallStream) and
 	// the keys the SDK validates — model, messages/contents/input,

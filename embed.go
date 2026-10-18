@@ -28,6 +28,7 @@ type EmbedRequest struct {
 	Headers    map[string]string // per-request headers (SL03)
 	Inputs     []string          // required: one or more non-empty texts
 	Dimensions int               // optional output dimensionality (0 = model default)
+	TaskType   string            // Gemini taskType, e.g. RETRIEVAL_QUERY (OpenAI-format ignores it)
 }
 
 // EmbedResult carries one vector per input, in input order.
@@ -86,6 +87,7 @@ type gmEmbedItem struct {
 	Model                string    `json:"model"`
 	Content              gmContent `json:"content"`
 	OutputDimensionality int       `json:"outputDimensionality,omitempty"`
+	TaskType             string    `json:"taskType,omitempty"`
 }
 
 type gmEmbedRequest struct {
@@ -107,6 +109,7 @@ func (pc *providerClient) buildEmbedRequest(model string, req EmbedRequest) ([]b
 				Model:                "models/" + model,
 				Content:              gmContent{Parts: []gmPart{{Text: in}}},
 				OutputDimensionality: req.Dimensions,
+				TaskType:             strings.TrimSpace(req.TaskType),
 			})
 		}
 		b, err := json.Marshal(r)

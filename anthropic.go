@@ -93,6 +93,7 @@ type anRequest struct {
 	Tools        []anTool        `json:"tools,omitempty"`
 	Temperature  *float64        `json:"temperature,omitempty"`
 	TopP         *float64        `json:"top_p,omitempty"`
+	TopK         *int            `json:"top_k,omitempty"`
 	Stop         []string        `json:"stop_sequences,omitempty"`
 	Stream       bool            `json:"stream,omitempty"`
 	Thinking     *anThinking     `json:"thinking,omitempty"`
@@ -220,6 +221,10 @@ func buildAnthropicRequestQ(req *ChatRequest, model string, stream bool, q Quirk
 		}
 		out.TopP = &p
 	}
+	if req.TopK > 0 {
+		k := req.TopK
+		out.TopK = &k
+	}
 	if anthropicThinkingOn(req.Thinking) {
 		if req.ThinkingBudget > 0 {
 			// Legacy budget path: max_tokens must exceed budget_tokens.
@@ -244,7 +249,7 @@ func buildAnthropicRequestQ(req *ChatRequest, model string, stream bool, q Quirk
 		}
 		// Thinking rejects modified sampling; the provider default
 		// is the only accepted value.
-		out.Temperature, out.TopP = nil, nil
+		out.Temperature, out.TopP, out.TopK = nil, nil, nil
 	}
 	if out.MaxTokens <= 0 {
 		out.MaxTokens = anthropicDefaultMaxTokens

@@ -194,7 +194,7 @@ func (pc *providerClient) buildChatRequest(req *ChatRequest, model string, strea
 	if err != nil {
 		return nil, "", err
 	}
-	body, err = mergeExtra(body, req.Extra)
+	body, err = mergeExtra(body, req.Extra, pc.cfg.Format == FormatGemini)
 	return body, url, err
 }
 
@@ -248,7 +248,7 @@ var extraReserved = map[string]bool{
 // mergeExtra overlays ChatRequest.Extra onto a marshaled body: top-level
 // keys replace the SDK's own. "stream" is reserved because the SDK's
 // buffered/SSE handling depends on it.
-func mergeExtra(body []byte, extra map[string]any) ([]byte, error) {
+func mergeExtra(body []byte, extra map[string]any, deepGen bool) ([]byte, error) {
 	if len(extra) == 0 {
 		return body, nil
 	}
@@ -264,9 +264,30 @@ func mergeExtra(body []byte, extra map[string]any) ([]byte, error) {
 		if err != nil {
 			return nil, &ConfigError{Msg: fmt.Sprintf("ChatRequest.Extra[%q]: %v", k, err)}
 		}
+		if deepGen && k == "generationConfig" {
+			raw = mergeGenerationConfig(m[k], raw)
+		}
 		m[k] = raw
 	}
 	return json.Marshal(m)
+}
+
+// mergeGenerationConfig sets the Extra object's keys one by one over the
+// SDK's generationConfig object (nested objects are replaced whole). When
+// either side is not a JSON object the Extra value replaces as before.
+func mergeGenerationConfig(sdk, extra json.RawMessage) json.RawMessage {
+	var base, over map[string]json.RawMessage
+	if json.Unmarshal(sdk, &base) != nil || base == nil || json.Unmarshal(extra, &over) != nil || over == nil {
+		return extra
+	}
+	for k, v := range over {
+		base[k] = v
+	}
+	out, err := json.Marshal(base)
+	if err != nil {
+		return extra
+	}
+	return out
 }
 
 // setHeaders applies format-specific authentication headers, then the
