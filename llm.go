@@ -17,20 +17,21 @@ import (
 // environment or is set explicitly; every authenticated provider is usable
 // concurrently through the SDK's shared connection pool.
 type SDK struct {
-	mu        sync.RWMutex
-	providers map[string]*Provider
-	order     []string
-	timeout   time.Duration
-	cacheTTL  time.Duration
-	rt        http.RoundTripper
-	retry     RetryPolicy
-	idle      time.Duration
-	observer  func(LearnEvent)
+	mu         sync.RWMutex
+	providers  map[string]*Provider
+	order      []string
+	timeout    time.Duration
+	cacheTTL   time.Duration
+	rt         http.RoundTripper
+	retry      RetryPolicy
+	idle       time.Duration
+	observer   func(LearnEvent)
+	attemptObs func(AttemptEvent)
 }
 
 // clientOpts snapshots the SDK-level knobs every provider client honors.
 func (s *SDK) clientOpts() clientOpts {
-	return clientOpts{retry: s.retry, idle: s.idle, observer: s.observer}
+	return clientOpts{retry: s.retry, idle: s.idle, observer: s.observer, attempt: s.attemptObs}
 }
 
 // listTimeout is the whole-call budget for model discovery: the configured

@@ -212,10 +212,12 @@ func (pc *providerClient) withRetryN(ctx context.Context, n int, op func() (time
 		}
 		ra, err := op()
 		if err == nil {
+			pc.emitAttempt(ctx, nil, 0)
 			return nil
 		}
 		var te *terminalError
 		if errors.As(err, &te) {
+			pc.emitAttempt(ctx, te.err, 0)
 			return te.err
 		}
 		var ce *ConfigError
@@ -228,12 +230,16 @@ func (pc *providerClient) withRetryN(ctx context.Context, n int, op func() (time
 			// Transport error — retryable.
 			if cerr := ctx.Err(); cerr != nil {
 				// Interrupted by deadline/cancel, not exhaustion.
+				pc.emitAttempt(ctx, err, 0)
 				return cerr
 			}
 			if last {
+				pc.emitAttempt(ctx, err, 0)
 				return fmt.Errorf("llm: retry exhausted (%d attempts): %w", n, err)
 			}
-			if !waitRetry(ctx, pc.retryDelay(0, attempt)) {
+			d := pc.retryDelay(0, attempt)
+			pc.emitAttempt(ctx, err, d)
+			if !waitRetry(ctx, d) {
 				return withBudgetCause(ctx, err)
 			}
 			continue
@@ -242,11 +248,14 @@ func (pc *providerClient) withRetryN(ctx context.Context, n int, op func() (time
 		case apiErr.Status == http.StatusTooManyRequests:
 			if billingExhausted(apiErr) {
 				// Permanent: only a recharge fixes this.
+				pc.emitAttempt(ctx, apiErr, 0)
 				return apiErr
 			}
 			rateErr, rateRA = apiErr, ra
 			if !last {
-				if !waitRetry(ctx, pc.retryDelay(ra, attempt)) {
+				d := pc.retryDelay(ra, attempt)
+				pc.emitAttempt(ctx, apiErr, d)
+				if !waitRetry(ctx, d) {
 					// The wait would outlive (or died with) the context;
 					// still surface the 429 — the caller needs
 					// Status/RetryAfter to plan the retry.
@@ -255,17 +264,21 @@ func (pc *providerClient) withRetryN(ctx context.Context, n int, op func() (time
 				continue
 			}
 		case apiErr.Retryable && !last:
-			if !waitRetry(ctx, pc.retryDelay(ra, attempt)) {
+			d := pc.retryDelay(ra, attempt)
+			pc.emitAttempt(ctx, apiErr, d)
+			if !waitRetry(ctx, d) {
 				return withBudgetCause(ctx, apiErr)
 			}
 			continue
 		case learn != nil && learn(apiErr):
 			// Learn-once fallback engaged: retry immediately.
+			pc.emitAttempt(ctx, apiErr, 0)
 			if !last {
 				continue
 			}
 			return apiErr
 		}
+		pc.emitAttempt(ctx, apiErr, 0)
 		if rateErr != nil && !apiErr.Retryable && apiErr.Status != http.StatusTooManyRequests {
 			// A definitive failure after earlier 429s.
 			return apiErr

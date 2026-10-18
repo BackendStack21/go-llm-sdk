@@ -102,6 +102,7 @@ func (pc *providerClient) speak(ctx context.Context, model string, req SpeakRequ
 	}
 	gemini := pc.cfg.Format == FormatGemini
 
+	ctx = pc.withAttempts(ctx, "speak", model)
 	ctx, cancel := context.WithTimeout(ctx, pc.requestTimeout())
 	defer cancel()
 	var res *SpeakResult
@@ -165,7 +166,7 @@ func (pc *providerClient) postAudio(ctx context.Context, url string, body []byte
 	req.Header.Set("Content-Type", "application/json")
 	pc.setHeaders(req.Header, reqHeadersFrom(ctx))
 
-	resp, err := pc.buffered().Do(req)
+	resp, err := doObserved(ctx, pc.buffered(), req)
 	if err != nil {
 		return nil, "", nil, 0, err
 	}

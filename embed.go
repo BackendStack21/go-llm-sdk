@@ -221,6 +221,7 @@ func (pc *providerClient) embed(ctx context.Context, model string, req EmbedRequ
 	if pc.cfg.Format == FormatGemini {
 		batch = geminiEmbedBatch
 	}
+	ctx = pc.withAttempts(ctx, "embed", model)
 	ctx, cancel := context.WithTimeout(ctx, pc.requestTimeout())
 	defer cancel()
 	res := &EmbedResult{Model: model, Embeddings: make([][]float64, 0, len(req.Inputs))}

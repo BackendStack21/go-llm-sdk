@@ -52,8 +52,9 @@ type providerClient struct {
 // clientOpts carries SDK-level settings into a providerClient.
 type clientOpts struct {
 	retry    RetryPolicy
-	idle     time.Duration    // SSE idle watchdog; 0 = process default
-	observer func(LearnEvent) // learn-once observer; nil = process default
+	idle     time.Duration      // SSE idle watchdog; 0 = process default
+	observer func(LearnEvent)   // learn-once observer; nil = process default
+	attempt  func(AttemptEvent) // per-HTTP-attempt observer; nil = off
 }
 
 // retryDelay picks Retry-After when present, else the policy's capped
@@ -368,7 +369,7 @@ func (pc *providerClient) post(ctx context.Context, client *http.Client, url str
 	req.Header.Set("Accept", "application/json")
 	pc.setHeaders(req.Header, reqHeadersFrom(ctx))
 
-	resp, err := client.Do(req)
+	resp, err := doObserved(ctx, client, req)
 	if err != nil {
 		return nil, nil, 0, err
 	}
@@ -465,6 +466,7 @@ func (pc *providerClient) call(ctx context.Context, req *ChatRequest, model stri
 	if herr != nil {
 		return nil, herr
 	}
+	ctx = pc.withAttempts(ctx, "chat", model)
 	ctx, cancel := context.WithTimeout(ctx, pc.requestTimeout())
 	defer cancel()
 	var res *ChatResult
@@ -564,6 +566,7 @@ func (pc *providerClient) callStream(ctx context.Context, req *ChatRequest, mode
 	if herr != nil {
 		return nil, herr
 	}
+	ctx = pc.withAttempts(ctx, "stream", model)
 	deadlineCtx, cancel := context.WithTimeout(ctx, pc.requestTimeout())
 	defer cancel()
 
@@ -598,17 +601,22 @@ func (pc *providerClient) callStream(ctx context.Context, req *ChatRequest, mode
 			// A successful HTTP response already contains this generation.
 			// Return its buffered parse (including errors) without replacing
 			// it with another generation or resetting the request deadline.
+			pc.emitAttempt(deadlineCtx, out.err, 0)
 			return out.result, out.err
 		case out.success():
+			pc.emitAttempt(deadlineCtx, nil, 0)
 			return out.result, nil
 		case out.abort != nil:
+			pc.emitAttempt(deadlineCtx, out.abort, 0)
 			return out.result, out.abort
 		case out.err != nil && out.result != nil:
 			// Partial output was delivered: never retry, surface with the
 			// partial result (a retry would duplicate user-visible output).
+			pc.emitAttempt(deadlineCtx, out.err, 0)
 			return out.result, out.err
 		case out.learnRetry: // learn-once applied; retry without backoff
 			lastErr = out.apiErr // every learn trigger is a provider 400
+			pc.emitAttempt(deadlineCtx, out.apiErr, 0)
 			if attempt < n-1 {
 				continue
 			}
@@ -620,24 +628,34 @@ func (pc *providerClient) callStream(ctx context.Context, req *ChatRequest, mode
 				rateErr, rateRA = out.apiErr, out.retryAfter
 			}
 			lastErr = out.apiErr
-			if attempt < n-1 && waitRetry(deadlineCtx, pc.retryDelay(out.retryAfter, attempt)) {
-				continue
+			if attempt < n-1 {
+				d := pc.retryDelay(out.retryAfter, attempt)
+				pc.emitAttempt(deadlineCtx, out.apiErr, d)
+				if waitRetry(deadlineCtx, d) {
+					continue
+				}
+			} else {
+				pc.emitAttempt(deadlineCtx, out.apiErr, 0)
 			}
 			if rateErr != nil {
 				return nil, &RateLimitError{APIError: *rateErr, Attempts: attempt + 1, RetryAfter: rateRA}
 			}
 			return nil, out.apiErr
 		case out.apiErr != nil:
+			pc.emitAttempt(deadlineCtx, out.apiErr, 0)
 			return nil, out.apiErr
 		case out.err != nil && attempt < n-1:
 			lastErr = out.err
-			if waitRetry(deadlineCtx, pc.retryDelay(0, attempt)) {
+			d := pc.retryDelay(0, attempt)
+			pc.emitAttempt(deadlineCtx, out.err, d)
+			if waitRetry(deadlineCtx, d) {
 				continue
 			}
 			// Interrupted by (or about to outlive) the deadline/cancel, not
 			// exhaustion: keep the last error retrievable.
 			return nil, withBudgetCause(deadlineCtx, out.err)
 		default:
+			pc.emitAttempt(deadlineCtx, out.err, 0)
 			return nil, out.err
 		}
 	}
@@ -677,7 +695,7 @@ func (pc *providerClient) attemptStream(ctx context.Context, url string, body []
 	req.Header.Set("Accept", "text/event-stream")
 	pc.setHeaders(req.Header, reqHeadersFrom(ctx))
 
-	resp, derr := pc.streamHTTP.Do(req)
+	resp, derr := doObserved(ctx, pc.streamHTTP, req)
 	if derr != nil {
 		return streamOutcome{err: derr} // transport error: retryable
 	}

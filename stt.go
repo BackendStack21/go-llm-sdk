@@ -142,6 +142,7 @@ func (pc *providerClient) transcribe(ctx context.Context, model string, req Tran
 	}
 	ctype := "multipart/form-data; boundary=" + multipartBodyBoundary(body)
 
+	ctx = pc.withAttempts(ctx, "transcribe", model)
 	ctx, cancel := context.WithTimeout(ctx, pc.requestTimeout())
 	defer cancel()
 	var res *TranscribeResult
@@ -227,7 +228,7 @@ func (pc *providerClient) postMultipart(ctx context.Context, url string, body []
 	req.Header.Set("Content-Type", ctype)
 	pc.setHeaders(req.Header, reqHeadersFrom(ctx))
 
-	resp, err := pc.buffered().Do(req)
+	resp, err := doObserved(ctx, pc.buffered(), req)
 	if err != nil {
 		return nil, nil, 0, err
 	}

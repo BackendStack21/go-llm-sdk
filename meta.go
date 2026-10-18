@@ -109,6 +109,7 @@ func validateReqHeaders(h map[string]string) error {
 		names = append(names, k)
 	}
 	sort.Strings(names)
+	seen := make(map[string]bool, len(names))
 	for _, k := range names {
 		if !validHeaderToken(k) {
 			return &ConfigError{Msg: "Headers: invalid header name"}
@@ -116,11 +117,27 @@ func validateReqHeaders(h map[string]string) error {
 		if reservedHeaders[http.CanonicalHeaderKey(k)] {
 			return &ConfigError{Msg: fmt.Sprintf("Headers: %q is a reserved header", http.CanonicalHeaderKey(k))}
 		}
-		if strings.ContainsAny(h[k], "\r\n\x00") {
-			return &ConfigError{Msg: fmt.Sprintf("Headers: invalid value for header %q", http.CanonicalHeaderKey(k))}
+		ck := http.CanonicalHeaderKey(k)
+		if seen[ck] {
+			return &ConfigError{Msg: fmt.Sprintf("Headers: duplicate header %q (names are case-insensitive)", ck)}
+		}
+		seen[ck] = true
+		if badHeaderValue(h[k]) {
+			return &ConfigError{Msg: fmt.Sprintf("Headers: invalid value for header %q", ck)}
 		}
 	}
 	return nil
+}
+
+// badHeaderValue reports any ASCII control byte other than HTAB (CR, LF,
+// NUL, DEL included).
+func badHeaderValue(v string) bool {
+	for i := 0; i < len(v); i++ {
+		if c := v[i]; (c < 0x20 && c != '\t') || c == 0x7f {
+			return true
+		}
+	}
+	return false
 }
 
 func validHeaderToken(s string) bool {

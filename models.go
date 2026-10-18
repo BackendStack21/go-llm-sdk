@@ -25,6 +25,7 @@ const defaultListAttempts = 3
 // when unconfigured); the request timeout is a whole-call budget; Retry-After
 // is honored.
 func (pc *providerClient) listModels(ctx context.Context) ([]Model, error) {
+	ctx = pc.withAttempts(ctx, "models", "")
 	ctx, cancel := context.WithTimeout(ctx, pc.requestTimeout())
 	defer cancel()
 
@@ -98,7 +99,7 @@ func (pc *providerClient) get(ctx context.Context, url string) ([]byte, time.Dur
 	req.Header.Set("Accept", "application/json")
 	pc.setHeaders(req.Header, nil)
 
-	resp, err := pc.buffered().Do(req)
+	resp, err := doObserved(ctx, pc.buffered(), req)
 	if err != nil {
 		return nil, 0, err
 	}
