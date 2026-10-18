@@ -190,14 +190,15 @@ func anthropicJSONToolName(req *ChatRequest) string {
 
 // anthropicToolControls appends the JSON-mode tool when requested and
 // renders tool_choice. thinking reports legacy budget thinking, which rejects
-// forced tool use (adaptive thinking accepts it).
-func anthropicToolControls(req *ChatRequest, out *anRequest, thinking, emulateJSON bool) error {
+// forced tool use (adaptive thinking accepts it). anyThinking (either mode)
+// guards the emulated JSON tool, matching the pre-M4 behaviour.
+func anthropicToolControls(req *ChatRequest, out *anRequest, thinking, anyThinking, emulateJSON bool) error {
 	var choice *anToolChoice
 	if name := anthropicJSONToolName(req); emulateJSON && name != "" {
 		switch {
 		case req.ToolChoice != nil:
 			return &ConfigError{Msg: "Anthropic JSON ResponseFormat forces its own tool; it cannot be combined with ToolChoice"}
-		case thinking:
+		case anyThinking:
 			return &ConfigError{Msg: "Anthropic JSON ResponseFormat forces tool use, which extended thinking rejects"}
 		case len(req.Tools) > 0:
 			// The forced JSON tool would make every user tool uncallable.

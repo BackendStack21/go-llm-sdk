@@ -262,7 +262,7 @@ func buildAnthropicRequestQ(req *ChatRequest, model string, stream bool, q Quirk
 		}
 		out.OutputConfig.Format = &anOutputFormat{Type: "json_schema", Schema: schema}
 	}
-	if err := anthropicToolControls(req, &out, legacyThinking, q.AnthropicToolJSON); err != nil {
+	if err := anthropicToolControls(req, &out, legacyThinking, out.Thinking != nil, q.AnthropicToolJSON); err != nil {
 		return nil, err
 	}
 

@@ -110,6 +110,10 @@ llm.WithProvider("openrouter", llm.WithFormat(llm.FormatOpenAI),
 
 llm.WithProvider("anthropic", llm.WithHeaders(map[string]string{"anthropic-beta": "interleaved-thinking-2025-05-14"}))
 
+// Anthropic-format gateway without output_config: keep the forced-tool JSON emulation.
+llm.WithProvider("gw", llm.WithFormat(llm.FormatAnthropic), llm.WithBaseURL(gwURL), llm.WithAPIKey(key),
+	llm.WithQuirks(llm.Quirks{AnthropicToolJSON: true}))
+
 // api-key gateways (e.g. Azure OpenAI): drop the Bearer header, send api-key.
 llm.WithProvider("azure", llm.WithFormat(llm.FormatOpenAI), llm.WithBaseURL(azureURL), llm.WithAPIKey(key),
 	llm.WithHeaders(map[string]string{"Authorization": "", "api-key": key}))
@@ -409,6 +413,7 @@ v1.0 removes or renames nothing exported. Existing code compiles unchanged unles
 | Gemini truncated streams | A stream ending without `finishReason` was a silent success | It is a premature-close error (retried before the first delta, partial result + error after) | None; this surfaces real truncation |
 | `Delta.ToolIndex` | Anthropic content-block / Responses output index | The call's position in `ChatResult.ToolCalls` on every format | Streaming UIs that grouped fragments by index on Anthropic or Responses |
 | Anthropic thinking | Presets sent `budget_tokens` (5000/1024/8192/16384); unset `MaxTokens` 8192 or budget + 8192; presets clamped to half of `MaxTokens` | Presets send adaptive thinking + `output_config.effort`; unset `MaxTokens` → 16384; `MaxTokens` as-is; `temperature`/`top_p` omitted; forced `ToolChoice` allowed | Set `ThinkingBudget` > 0 for models needing the legacy `budget_tokens` form (Haiku 4.5 and older) |
+| Anthropic JSON mode | Forced synthetic tool folded into `Content`; errors with `Tools`, `ToolChoice`, thinking | Native `output_config.format` (reply text as-is); those combinations are allowed | Gateways lacking `output_config` set `Quirks.AnthropicToolJSON` for the old behaviour (byte-identical, errors included) |
 | Thinking replay | One `ReasoningContent` + `ThinkingSignature` pair | Every block in `ThinkingBlocks` (incl. redacted), Gemini signatures per `ToolCall` | Append `res.AssistantMessage()` instead of copying fields by hand |
 | Redirects | Followed to any host | Cross-host redirects and https-to-http downgrades are not followed (credential leak); they surface as `*APIError` | Point `WithBaseURL` at the final host |
 | Validation | Sent to the provider | DeepSeek `json_schema`, malformed base URLs, control characters in `TranscribeRequest.Filename`/`MIMEType` are `ConfigError`s | — |
