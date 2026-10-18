@@ -72,8 +72,14 @@ type anThinking struct {
 	BudgetTokens int    `json:"budget_tokens,omitempty"`
 }
 
+type anOutputFormat struct {
+	Type   string          `json:"type"`
+	Schema json.RawMessage `json:"schema"`
+}
+
 type anOutputConfig struct {
-	Effort string `json:"effort,omitempty"`
+	Effort string          `json:"effort,omitempty"`
+	Format *anOutputFormat `json:"format,omitempty"`
 }
 
 type anRequest struct {
@@ -157,8 +163,15 @@ func maxInt(a, b int) int {
 	return b
 }
 
-// buildAnthropicRequest renders the canonical request in Anthropic format.
+// buildAnthropicRequest renders the canonical request in Anthropic format
+// with the native (default) quirks.
 func buildAnthropicRequest(req *ChatRequest, model string, stream bool) ([]byte, error) {
+	return buildAnthropicRequestQ(req, model, stream, Quirks{})
+}
+
+// buildAnthropicRequestQ renders the request honouring provider quirks
+// (AnthropicToolJSON selects the forced-tool JSON emulation).
+func buildAnthropicRequestQ(req *ChatRequest, model string, stream bool, q Quirks) ([]byte, error) {
 	out := anRequest{
 		Model:     model,
 		MaxTokens: req.MaxTokens,
@@ -239,7 +252,17 @@ func buildAnthropicRequest(req *ChatRequest, model string, stream bool) ([]byte,
 		}
 		out.Tools = append(out.Tools, tool)
 	}
-	if err := anthropicToolControls(req, &out, legacyThinking); err != nil {
+	if !q.AnthropicToolJSON && req.ResponseFormat.jsonMode() {
+		schema := req.ResponseFormat.Schema
+		if len(schema) == 0 {
+			schema = json.RawMessage(`{"type":"object"}`)
+		}
+		if out.OutputConfig == nil {
+			out.OutputConfig = &anOutputConfig{}
+		}
+		out.OutputConfig.Format = &anOutputFormat{Type: "json_schema", Schema: schema}
+	}
+	if err := anthropicToolControls(req, &out, legacyThinking, q.AnthropicToolJSON); err != nil {
 		return nil, err
 	}
 

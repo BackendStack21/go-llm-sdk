@@ -191,7 +191,7 @@ func (pc *providerClient) buildChatRequest(req *ChatRequest, model string, strea
 func (pc *providerClient) buildFormatBody(req *ChatRequest, model string, stream bool) ([]byte, string, error) {
 	switch pc.cfg.Format {
 	case FormatAnthropic:
-		body, err := buildAnthropicRequest(req, model, stream)
+		body, err := buildAnthropicRequestQ(req, model, stream, pc.cfg.Quirks)
 		return body, pc.base + "/v1/messages", err
 	case FormatGemini:
 		body, err := buildGeminiRequest(req, model, stream)
@@ -505,7 +505,7 @@ func (pc *providerClient) learnFromChatError(req *ChatRequest, apiErr *APIError)
 
 // jsonTool is the Anthropic JSON-mode tool for req ("" elsewhere).
 func (pc *providerClient) jsonTool(req *ChatRequest) string {
-	if pc.cfg.Format != FormatAnthropic {
+	if pc.cfg.Format != FormatAnthropic || !pc.cfg.Quirks.AnthropicToolJSON {
 		return ""
 	}
 	return anthropicJSONToolName(req)

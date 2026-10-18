@@ -1,12 +1,8 @@
 package llm
 
 import (
-	"context"
 	"encoding/json"
 	"errors"
-	"fmt"
-	"net/http"
-	"net/http/httptest"
 	"reflect"
 	"strings"
 	"testing"
@@ -211,20 +207,14 @@ func TestResponseFormat_PerFormat(t *testing.T) {
 		t.Errorf("gemini json_object = %v", gc)
 	}
 
-	// Anthropic: a forced synthetic tool carries the schema.
+	// Anthropic: native output_config.format, no synthetic tool (M4 SL02: Anthropic now supports structured outputs natively).
 	m, _ = buildBody(t, FormatAnthropic, "claude", schemaReq)
-	jsonEq(t, "anthropic tool_choice", m["tool_choice"], `{"type":"tool","name":"answer"}`)
-	tools := m["tools"].([]any)
-	last := tools[len(tools)-1].(map[string]any)
-	if last["name"] != "answer" {
-		t.Fatalf("anthropic json tool = %v", last)
+	jsonEq(t, "anthropic output_config", m["output_config"], `{"format":{"type":"json_schema","schema":`+string(testSchema)+`}}`)
+	if m["tools"] != nil || m["tool_choice"] != nil {
+		t.Errorf("anthropic native JSON must not add tools/tool_choice: %v", m)
 	}
-	jsonEq(t, "anthropic json tool schema", last["input_schema"], string(testSchema))
 	m, _ = buildBody(t, FormatAnthropic, "claude", objReq)
-	tools = m["tools"].([]any)
-	if tools[0].(map[string]any)["name"] != anthropicJSONToolDefault {
-		t.Errorf("anthropic default json tool name = %v", tools[0])
-	}
+	jsonEq(t, "anthropic json_object", m["output_config"], `{"format":{"type":"json_schema","schema":{"type":"object"}}}`)
 
 	// Text is the default: nothing is sent.
 	txt := &ChatRequest{Messages: []Message{{Role: RoleUser, Content: "x"}}, ResponseFormat: &ResponseFormat{Type: ResponseText}}
@@ -236,66 +226,21 @@ func TestResponseFormat_PerFormat(t *testing.T) {
 	}
 }
 
-func TestResponseFormat_AnthropicConflicts(t *testing.T) {
+// Native JSON mode combines with tools, ToolChoice, thinking and non-object
+// schemas (M4 SL02: the provider decides; the emulation-only ConfigErrors
+// return in SL03 behind the AnthropicToolJSON quirk).
+func TestResponseFormat_AnthropicNativeCombinations(t *testing.T) {
 	rf := &ResponseFormat{Type: ResponseJSONSchema, Name: "f", Schema: testSchema}
 	cases := []*ChatRequest{
-		{Tools: []ToolDef{{Name: "f"}}, ResponseFormat: rf},                                                // name collision
-		{Tools: []ToolDef{{Name: "g"}}, ToolChoice: &ToolChoice{Mode: ToolChoiceAuto}, ResponseFormat: rf}, // forced tool vs ToolChoice
-		{Thinking: "low", ThinkingBudget: 2000, ResponseFormat: &ResponseFormat{Type: ResponseJSONObject}}, // forced tool vs thinking
+		{Tools: []ToolDef{{Name: "f"}}, ResponseFormat: rf},
+		{Tools: []ToolDef{{Name: "g"}}, ToolChoice: &ToolChoice{Mode: ToolChoiceAuto}, ResponseFormat: rf},
+		{Thinking: "low", ThinkingBudget: 2000, ResponseFormat: &ResponseFormat{Type: ResponseJSONObject}},
+		{ResponseFormat: &ResponseFormat{Type: ResponseJSONSchema, Schema: json.RawMessage(`{"type":"array"}`)}},
 	}
 	for i, req := range cases {
 		req.Messages = []Message{{Role: RoleUser, Content: "x"}}
-		_, err := buildAnthropicRequest(req, "claude", false)
-		var ce *ConfigError
-		if !errors.As(err, &ce) {
-			t.Errorf("case %d: err = %v, want ConfigError", i, err)
-		}
-	}
-}
-
-// The JSON tool call is folded back into Content on both paths.
-func TestResponseFormat_AnthropicResultFolding(t *testing.T) {
-	srvBody := `{"content":[{"type":"tool_use","id":"t","name":"answer","input":{"a":1}}],"stop_reason":"tool_use","usage":{"input_tokens":1,"output_tokens":2}}`
-	sse := strings.Join([]string{
-		`event: message_start` + "\n" + `data: {"type":"message_start","message":{"usage":{"input_tokens":1}}}`,
-		`data: {"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"t","name":"answer"}}`,
-		`data: {"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{\"a\":"}}`,
-		`data: {"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"1}"}}`,
-		`data: {"type":"message_delta","delta":{"stop_reason":"tool_use"},"usage":{"output_tokens":2}}`,
-		`data: {"type":"message_stop"}`,
-	}, "\n\n") + "\n\n"
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if strings.Contains(r.Header.Get("Accept"), "event-stream") {
-			w.Header().Set("Content-Type", "text/event-stream")
-			_, _ = fmt.Fprint(w, sse)
-			return
-		}
-		_, _ = fmt.Fprint(w, srvBody)
-	}))
-	t.Cleanup(srv.Close)
-	c := newTestClient(t, ProviderConfig{ID: "anthropic", Format: FormatAnthropic, BaseURL: srv.URL}, srv)
-	req := &ChatRequest{Messages: []Message{{Role: RoleUser, Content: "x"}},
-		ResponseFormat: &ResponseFormat{Type: ResponseJSONSchema, Name: "answer", Schema: testSchema}}
-
-	res, err := c.Call(context.Background(), req)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if res.Content != `{"a":1}` || len(res.ToolCalls) != 0 || res.FinishReason != FinishStop {
-		t.Errorf("buffered = %+v", res)
-	}
-
-	var deltas []Delta
-	res, err = c.CallStream(context.Background(), req, func(d Delta) error { deltas = append(deltas, d); return nil })
-	if err != nil {
-		t.Fatal(err)
-	}
-	if res.Content != `{"a":1}` || len(res.ToolCalls) != 0 || res.FinishReason != FinishStop {
-		t.Errorf("stream = %+v", res)
-	}
-	for _, d := range deltas {
-		if d.Kind != DeltaContent {
-			t.Errorf("JSON mode must stream content deltas only, got %+v", d)
+		if _, err := buildAnthropicRequest(req, "claude", false); err != nil {
+			t.Errorf("case %d: err = %v, want native build", i, err)
 		}
 	}
 }

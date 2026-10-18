@@ -52,19 +52,16 @@ func TestM2_AnthropicNoArgToolArgumentsNormalized(t *testing.T) {
 	}
 }
 
-// Bug 5 (JSON mode): an empty JSON-mode tool input folds to "{}" in
-// Content, buffered and streaming alike.
+// Bug 5 (JSON mode, native since M4 SL02): the reply text is returned
+// unchanged as Content, buffered and streaming alike. (The empty-input
+// tool folding to "{}" returns in SL03 behind the AnthropicToolJSON quirk.)
 func TestM2_AnthropicJSONModeEmptyInputContent(t *testing.T) {
 	req := &ChatRequest{
 		Messages:       []Message{{Role: RoleUser, Content: "hi"}},
 		ResponseFormat: &ResponseFormat{Type: ResponseJSONObject},
 	}
-	buffered := `{"content":[{"type":"tool_use","id":"tu1","name":"` + anthropicJSONToolDefault + `","input":{}}],"stop_reason":"tool_use","usage":{"input_tokens":3,"output_tokens":2}}`
 	for _, stream := range []bool{false, true} {
-		body := buffered
-		if stream {
-			body = m2AnthropicStreamBody(anthropicJSONToolDefault)
-		}
+		body := m4TextReply(`{}`, stream)
 		c := m2Client(t, FormatAnthropic, "anthropic", body, stream)
 		res, _ := m2Run(t, c, req, stream)
 		if res.Content != "{}" {

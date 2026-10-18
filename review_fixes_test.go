@@ -75,18 +75,16 @@ func TestAnthropic_ControlEdges(t *testing.T) {
 	m, _ := buildBody(t, FormatAnthropic, "claude", req)
 	jsonEq(t, "none choice", m["tool_choice"], `{"type":"none"}`)
 
-	var ce *ConfigError
-	// JSON mode forces its own tool, so user tools could never be called.
+	// Native JSON mode (M4 SL02) builds alongside tools and non-object schemas.
 	withTools := toolReq(nil)
 	withTools.ResponseFormat = &ResponseFormat{Type: ResponseJSONObject}
-	if _, err := buildAnthropicRequest(withTools, "claude", false); !errors.As(err, &ce) {
-		t.Errorf("JSON mode + tools: err = %v", err)
+	if _, err := buildAnthropicRequest(withTools, "claude", false); err != nil {
+		t.Errorf("JSON mode + tools must build natively: %v", err)
 	}
-	// Anthropic input_schema must be an object schema.
 	arr := &ChatRequest{Messages: []Message{{Role: RoleUser, Content: "x"}},
 		ResponseFormat: &ResponseFormat{Type: ResponseJSONSchema, Schema: json.RawMessage(`{"type":"array"}`)}}
-	if _, err := buildAnthropicRequest(arr, "claude", false); !errors.As(err, &ce) {
-		t.Errorf("non-object schema: err = %v", err)
+	if _, err := buildAnthropicRequest(arr, "claude", false); err != nil {
+		t.Errorf("non-object schema must build natively: %v", err)
 	}
 }
 
