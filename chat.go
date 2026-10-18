@@ -856,3 +856,25 @@ func (a *streamAccum) result() *ChatResult {
 	}
 	return res
 }
+
+// streamErrorMessage interprets the "error" field of a stream chunk. Only a
+// non-empty JSON object counts as a provider error (its message, or a
+// generic one when it has none); null, "", false, 0 and {} are ignored.
+func streamErrorMessage(raw json.RawMessage) (string, bool) {
+	raw = bytes.TrimSpace(raw)
+	if len(raw) == 0 || raw[0] != '{' {
+		return "", false
+	}
+	var obj map[string]json.RawMessage
+	if json.Unmarshal(raw, &obj) != nil || len(obj) == 0 {
+		return "", false
+	}
+	var msg string
+	if m, ok := obj["message"]; ok {
+		_ = json.Unmarshal(m, &msg)
+	}
+	if msg == "" {
+		msg = "stream error"
+	}
+	return msg, true
+}

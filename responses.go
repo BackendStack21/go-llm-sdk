@@ -1,6 +1,7 @@
 package llm
 
 import (
+	"bytes"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
@@ -308,6 +309,16 @@ type rsUsage struct {
 type rsErrorBody struct {
 	Message string `json:"message"`
 	Code    string `json:"code"`
+}
+
+// UnmarshalJSON tolerates a non-object "error" value ("", false, 0): it is
+// not a provider error and must not fail an otherwise-good response.
+func (e *rsErrorBody) UnmarshalJSON(b []byte) error {
+	if b = bytes.TrimSpace(b); len(b) == 0 || b[0] != '{' {
+		return nil
+	}
+	type plain rsErrorBody
+	return json.Unmarshal(b, (*plain)(e))
 }
 
 type rsResponse struct {

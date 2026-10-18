@@ -441,10 +441,7 @@ type anStreamEvent struct {
 	// message_delta usage (top-level sibling of delta)
 	Usage anUsage `json:"usage"` // message_delta: cumulative counts
 	// error
-	Error *struct {
-		Type    string `json:"type"`
-		Message string `json:"message"`
-	} `json:"error"`
+	Error json.RawMessage `json:"error"` // see streamErrorMessage
 }
 
 // mapAnthropicStreamEvent folds one Anthropic SSE payload into acc.
@@ -538,8 +535,8 @@ func mapAnthropicStreamEvent(data []byte, acc *streamAccum) ([]Delta, bool, erro
 		return deltas, true, nil
 	case "error":
 		msg := "provider stream error"
-		if ev.Error != nil && ev.Error.Message != "" {
-			msg = ev.Error.Message
+		if m, ok := streamErrorMessage(ev.Error); ok && m != "stream error" {
+			msg = m
 		}
 		return deltas, false, fmt.Errorf("llm: %s", msg)
 	case "ping", "content_block_stop":
