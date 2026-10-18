@@ -27,7 +27,8 @@ func TestResponsesFinishReason_Table(t *testing.T) {
 		{"max output", inc("max_output_tokens"), true, FinishLength},
 		{"content filter", inc("content_filter"), false, FinishContentFilter},
 		{"content filter with tools", inc("content_filter"), true, FinishContentFilter},
-		{"incomplete unknown, tools", inc("other"), true, FinishToolCalls},
+		// Unrecognised incomplete reasons are unmapped: "" (AGENTS.md invariant 1).
+		{"incomplete unknown, tools", inc("other"), true, ""},
 		{"incomplete no details", inc(""), false, FinishLength},
 		{"failed", &rsResponse{Status: "failed"}, true, ""},
 		{"cancelled", &rsResponse{Status: "cancelled"}, false, ""},

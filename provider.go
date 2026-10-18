@@ -33,6 +33,11 @@ type Quirks struct {
 	// in the thinking mode must be passed back to the API" — which poisons
 	// every later request in the tool loop, not just the offending one.
 	EchoReasoningWithTools bool
+	// AnthropicToolJSON: the Anthropic-format endpoint lacks
+	// output_config.format, so JSON ResponseFormat is emulated with a forced
+	// synthetic tool folded back into Content. Off for the built-in anthropic
+	// provider (native structured outputs).
+	AnthropicToolJSON bool
 	// ReasoningEffort: provider accepts reasoning_effort (OpenAI, GLM-5.3+).
 	ReasoningEffort bool
 	// IncludeReasoning: the provider needs the explicit reasoning opt-in

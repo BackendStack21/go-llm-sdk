@@ -30,12 +30,13 @@ const maxTranscribeAudioBytes = 25 << 20
 
 // TranscribeRequest describes one speech-to-text conversion.
 type TranscribeRequest struct {
-	Audio    []byte // required, non-empty: raw audio bytes (caller-owned)
-	Filename string // file part name for the audio (default "audio.wav")
-	MIMEType string // optional content type for the audio part
-	Language string // optional ISO-639-1 hint, OpenAI-compat only
-	Prompt   string // optional conditioning text, OpenAI-compat only
-	Format   string // optional response_format (provider default when empty)
+	Headers  map[string]string // per-request headers (SL03)
+	Audio    []byte            // required, non-empty: raw audio bytes (caller-owned)
+	Filename string            // file part name for the audio (default "audio.wav")
+	MIMEType string            // optional content type for the audio part
+	Language string            // optional ISO-639-1 hint, OpenAI-compat only
+	Prompt   string            // optional conditioning text, OpenAI-compat only
+	Format   string            // optional response_format (provider default when empty)
 }
 
 // TranscribeResult carries the recognized text. Fields the provider
@@ -45,6 +46,7 @@ type TranscribeResult struct {
 	Model       string
 	Language    string
 	DurationSec float64
+	Meta        ResponseMeta
 }
 
 // Transcribe converts speech to text with the named provider and
@@ -130,21 +132,26 @@ func (pc *providerClient) buildTranscribeRequest(model string, req TranscribeReq
 // transcribe runs the STT request against one provider with the shared
 // retry ladder and whole-call budget of the buffered chat path.
 func (pc *providerClient) transcribe(ctx context.Context, model string, req TranscribeRequest) (*TranscribeResult, error) {
+	ctx, herr := withReqHeaders(ctx, req.Headers)
+	if herr != nil {
+		return nil, herr
+	}
 	body, url, err := pc.buildTranscribeRequest(model, req)
 	if err != nil {
 		return nil, err
 	}
 	ctype := "multipart/form-data; boundary=" + multipartBodyBoundary(body)
 
+	ctx = pc.withAttempts(ctx, "transcribe", model)
 	ctx, cancel := context.WithTimeout(ctx, pc.requestTimeout())
 	defer cancel()
 	var res *TranscribeResult
 	err = pc.withRetry(ctx, func() (time.Duration, error) {
-		data, ra, err := pc.postMultipart(ctx, url, body, ctype)
+		data, hdr, ra, err := pc.postMultipart(ctx, url, body, ctype)
 		if err != nil {
 			return ra, err
 		}
-		r, perr := parseTranscribeResponse(data)
+		r, perr := parseTranscribeBody(data, req.Format)
 		if perr != nil {
 			// 2xx with an undecodable body is a provider protocol
 			// failure — surface it through the typed error taxonomy
@@ -156,6 +163,7 @@ func (pc *providerClient) transcribe(ctx context.Context, model string, req Tran
 			})
 		}
 		r.Model = model
+		r.Meta = parseResponseMeta(hdr)
 		res = r
 		return 0, nil
 	}, nil)
@@ -185,6 +193,16 @@ type transcribeResponse struct {
 	Duration float64 `json:"duration"`
 }
 
+// parseTranscribeBody maps a 2xx body to a result. The text, srt and vtt
+// response formats are not JSON: the raw body is the transcription.
+func parseTranscribeBody(data []byte, format string) (*TranscribeResult, error) {
+	switch strings.ToLower(format) {
+	case "text", "srt", "vtt":
+		return &TranscribeResult{Text: string(data)}, nil
+	}
+	return parseTranscribeResponse(data)
+}
+
 // parseTranscribeResponse decodes a buffered transcription response.
 // Both plain json ({text}) and verbose_json ({text,language,duration})
 // decode through the same struct — fields the provider omits stay zero.
@@ -202,29 +220,29 @@ func parseTranscribeResponse(data []byte) (*TranscribeResult, error) {
 
 // postMultipart sends one transcription request and reads the full JSON
 // body (capped). Mirrors postAudio but with the multipart content type.
-func (pc *providerClient) postMultipart(ctx context.Context, url string, body []byte, ctype string) (data []byte, ra time.Duration, err error) {
+func (pc *providerClient) postMultipart(ctx context.Context, url string, body []byte, ctype string) (data []byte, hdr http.Header, ra time.Duration, err error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body))
 	if err != nil {
-		return nil, 0, &ConfigError{Msg: "build request: " + err.Error()}
+		return nil, nil, 0, &ConfigError{Msg: "build request: " + err.Error()}
 	}
 	req.Header.Set("Content-Type", ctype)
-	pc.setHeaders(req.Header)
+	pc.setHeaders(req.Header, reqHeadersFrom(ctx))
 
-	resp, err := pc.buffered().Do(req)
+	resp, err := doObserved(ctx, pc.buffered(), req)
 	if err != nil {
-		return nil, 0, err
+		return nil, nil, 0, err
 	}
 	defer func() { _ = resp.Body.Close() }()
 	data, err = io.ReadAll(io.LimitReader(resp.Body, maxResponseSize+1))
 	if err != nil {
-		return nil, 0, err
+		return nil, nil, 0, err
 	}
 	if len(data) > maxResponseSize {
-		return nil, 0, fmt.Errorf("llm: response exceeds %d bytes", maxResponseSize)
+		return nil, nil, 0, terminal(fmt.Errorf("llm: response exceeds %d bytes", maxResponseSize))
 	}
 	ra = parseRetryAfter(resp.Header.Get("Retry-After"), time.Now())
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return nil, ra, pc.httpError(resp.StatusCode, data)
+		return nil, nil, ra, pc.httpError(resp.StatusCode, data)
 	}
-	return data, ra, nil
+	return data, resp.Header, ra, nil
 }

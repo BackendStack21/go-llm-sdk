@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 )
 
@@ -158,24 +159,42 @@ func TestBuildAnthropicRequest_EmptyAssistantPlaceholder(t *testing.T) {
 	body, _ := buildAnthropicRequest(req, "claude", false)
 	var m map[string]any
 	json.Unmarshal(body, &m)
+	// Anthropic rejects empty and whitespace-only text blocks: the empty
+	// assistant turn is dropped and the user turns around it merge.
 	msgs := m["messages"].([]any)
-	asst := msgs[1].(map[string]any)
-	blocks := asst["content"].([]any)
-	if len(blocks) != 1 || blocks[0].(map[string]any)["type"] != "text" {
-		t.Fatalf("empty assistant blocks = %v, want one placeholder text", blocks)
+	if len(msgs) != 1 || msgs[0].(map[string]any)["role"] != "user" {
+		t.Fatalf("messages = %v, want one merged user turn", msgs)
+	}
+	if blocks := msgs[0].(map[string]any)["content"].([]any); len(blocks) != 2 {
+		t.Fatalf("merged blocks = %v, want 2 text blocks", blocks)
+	}
+	if strings.Contains(string(body), `"text":" "`) {
+		t.Fatalf("whitespace-only block on wire: %s", body)
 	}
 }
 
 func TestBuildAnthropicRequest_ThinkingLevels(t *testing.T) {
-	cases := map[string]int{"low": 1024, "medium": 8192, "high": 16384, "max": 16384}
-	for level, want := range cases {
+	// Presets map to adaptive thinking + output_config.effort (AC-1); "enabled" carries no effort.
+	cases := map[string]string{"enabled": "", "low": "low", "medium": "medium", "high": "high", "max": "max"}
+	for level, wantEffort := range cases {
 		req := &ChatRequest{Messages: []Message{{Role: RoleUser, Content: "x"}}, Thinking: level}
 		body, _ := buildAnthropicRequest(req, "claude", false)
 		var m map[string]any
 		json.Unmarshal(body, &m)
 		th := m["thinking"].(map[string]any)
-		if th["budget_tokens"].(float64) != float64(want) {
-			t.Errorf("%s budget = %v, want %d", level, th["budget_tokens"], want)
+		if th["type"] != "adaptive" {
+			t.Errorf("%s thinking.type = %v, want adaptive", level, th["type"])
+		}
+		if _, ok := th["budget_tokens"]; ok {
+			t.Errorf("%s: adaptive thinking must not carry budget_tokens", level)
+		}
+		oc, hasOC := m["output_config"].(map[string]any)
+		if wantEffort == "" {
+			if hasOC {
+				t.Errorf("%s: output_config must be absent, got %v", level, oc)
+			}
+		} else if oc["effort"] != wantEffort {
+			t.Errorf("%s effort = %v, want %s", level, oc["effort"], wantEffort)
 		}
 	}
 	// disabled → no thinking field

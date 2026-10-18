@@ -20,39 +20,48 @@ func decodeAnthropicBody(t *testing.T, req *ChatRequest) map[string]any {
 	return m
 }
 
-// Anthropic requires max_tokens > thinking.budget_tokens. An unset
-// MaxTokens must leave room for the budget plus visible output.
-func TestBuildAnthropicRequest_ThinkingDefaultMaxTokensExceedsBudget(t *testing.T) {
+// Adaptive presets default max_tokens to 16384 (AC-3); the legacy explicit
+// budget path keeps budget + visible-output room (AC-2).
+func TestBuildAnthropicRequest_ThinkingDefaultMaxTokens(t *testing.T) {
 	for _, level := range []string{"enabled", "low", "medium", "high", "max"} {
 		m := decodeAnthropicBody(t, &ChatRequest{Thinking: level, Messages: []Message{{Role: RoleUser, Content: "x"}}})
-		budget := m["thinking"].(map[string]any)["budget_tokens"].(float64)
-		maxTok := m["max_tokens"].(float64)
-		if maxTok <= budget {
-			t.Errorf("%s: max_tokens %v must exceed budget_tokens %v", level, maxTok, budget)
+		if maxTok := m["max_tokens"].(float64); maxTok != 16384 {
+			t.Errorf("%s: max_tokens = %v, want 16384", level, maxTok)
 		}
-		if maxTok != budget+anthropicDefaultMaxTokens {
-			t.Errorf("%s: max_tokens = %v, want budget+%d", level, maxTok, anthropicDefaultMaxTokens)
+	}
+	m := decodeAnthropicBody(t, &ChatRequest{Thinking: "high", ThinkingBudget: 3000, Messages: []Message{{Role: RoleUser, Content: "x"}}})
+	if maxTok := m["max_tokens"].(float64); maxTok != 3000+anthropicDefaultMaxTokens {
+		t.Errorf("budget path: max_tokens = %v, want budget+%d", maxTok, anthropicDefaultMaxTokens)
+	}
+	m = decodeAnthropicBody(t, &ChatRequest{Messages: []Message{{Role: RoleUser, Content: "x"}}})
+	if maxTok := m["max_tokens"].(float64); maxTok != anthropicDefaultMaxTokens {
+		t.Errorf("no thinking: max_tokens = %v, want %d", maxTok, anthropicDefaultMaxTokens)
+	}
+}
+
+// Under adaptive thinking an explicit MaxTokens is sent as-is: no clamping,
+// no ConfigError (AC-3). Replaces the preset-clamp expectations.
+func TestBuildAnthropicRequest_AdaptiveMaxTokensAsIs(t *testing.T) {
+	for _, mt := range []int{1024, 1500, 4000} {
+		m := decodeAnthropicBody(t, &ChatRequest{Thinking: "high", MaxTokens: mt, Messages: []Message{{Role: RoleUser, Content: "x"}}})
+		if m["max_tokens"].(float64) != float64(mt) {
+			t.Errorf("max_tokens = %v, want %d as-is", m["max_tokens"], mt)
+		}
+		if th := m["thinking"].(map[string]any); th["type"] != "adaptive" {
+			t.Errorf("thinking = %v, want adaptive", th)
 		}
 	}
 }
 
-// A preset level larger than an explicit MaxTokens is clamped below it.
-func TestBuildAnthropicRequest_ThinkingPresetClampedBelowMaxTokens(t *testing.T) {
-	m := decodeAnthropicBody(t, &ChatRequest{Thinking: "high", MaxTokens: 4000, Messages: []Message{{Role: RoleUser, Content: "x"}}})
-	if m["max_tokens"].(float64) != 4000 {
-		t.Errorf("explicit max_tokens must be honored, got %v", m["max_tokens"])
+// The explicit-budget path is unchanged: N >= 1024, max_tokens > N (AC-2).
+func TestBuildAnthropicRequest_ExplicitBudgetPath(t *testing.T) {
+	m := decodeAnthropicBody(t, &ChatRequest{Thinking: "medium", ThinkingBudget: 500, Messages: []Message{{Role: RoleUser, Content: "x"}}})
+	th := m["thinking"].(map[string]any)
+	if th["type"] != "enabled" || th["budget_tokens"].(float64) != 1024 {
+		t.Errorf("thinking = %v, want enabled/1024 floor", th)
 	}
-	// Half the cap stays for visible output (never a one-token answer).
-	if b := m["thinking"].(map[string]any)["budget_tokens"].(float64); b != 2000 {
-		t.Errorf("budget_tokens = %v, want 2000 (half of max_tokens)", b)
-	}
-	m = decodeAnthropicBody(t, &ChatRequest{Thinking: "high", MaxTokens: 1500, Messages: []Message{{Role: RoleUser, Content: "x"}}})
-	if b := m["thinking"].(map[string]any)["budget_tokens"].(float64); b != 1024 {
-		t.Errorf("small cap: budget_tokens = %v, want the 1024 minimum", b)
-	}
-	m = decodeAnthropicBody(t, &ChatRequest{Thinking: "low", MaxTokens: 1500, Messages: []Message{{Role: RoleUser, Content: "x"}}})
-	if b := m["thinking"].(map[string]any)["budget_tokens"].(float64); b != 1024 {
-		t.Errorf("preset below cap is kept: budget_tokens = %v", b)
+	if _, ok := m["output_config"]; ok {
+		t.Errorf("budget path must not emit output_config.effort: %v", m["output_config"])
 	}
 }
 
@@ -61,7 +70,7 @@ func TestBuildAnthropicRequest_ThinkingBudgetConflicts(t *testing.T) {
 	cases := []ChatRequest{
 		{Thinking: "enabled", ThinkingBudget: 8000, MaxTokens: 8000},
 		{Thinking: "enabled", ThinkingBudget: 2000, MaxTokens: 1500},
-		{Thinking: "low", MaxTokens: 1024}, // cannot clamp below the 1024 minimum
+		{Thinking: "low", ThinkingBudget: 1024, MaxTokens: 1024}, // explicit budget cannot fit under the cap
 	}
 	for i, req := range cases {
 		req.Messages = []Message{{Role: RoleUser, Content: "x"}}
@@ -75,14 +84,18 @@ func TestBuildAnthropicRequest_ThinkingBudgetConflicts(t *testing.T) {
 
 // Extended thinking rejects modified temperature / top_p.
 func TestBuildAnthropicRequest_ThinkingOmitsSampling(t *testing.T) {
-	m := decodeAnthropicBody(t, &ChatRequest{Thinking: "low", Temperature: 0.3, TopP: 0.5, Messages: []Message{{Role: RoleUser, Content: "x"}}})
-	if _, ok := m["temperature"]; ok {
-		t.Error("temperature must be omitted with thinking")
+	for _, req := range []ChatRequest{{Thinking: "low"}, {Thinking: "low", ThinkingBudget: 2000}} { // adaptive and budget
+		req.Temperature, req.TopP = 0.3, 0.5
+		req.Messages = []Message{{Role: RoleUser, Content: "x"}}
+		m := decodeAnthropicBody(t, &req)
+		if _, ok := m["temperature"]; ok {
+			t.Errorf("%+v: temperature must be omitted with thinking", req.Thinking)
+		}
+		if _, ok := m["top_p"]; ok {
+			t.Error("top_p must be omitted with thinking")
+		}
 	}
-	if _, ok := m["top_p"]; ok {
-		t.Error("top_p must be omitted with thinking")
-	}
-	m = decodeAnthropicBody(t, &ChatRequest{Temperature: 0.3, Messages: []Message{{Role: RoleUser, Content: "x"}}})
+	m := decodeAnthropicBody(t, &ChatRequest{Temperature: 0.3, Messages: []Message{{Role: RoleUser, Content: "x"}}})
 	if m["temperature"].(float64) != 0.3 {
 		t.Error("temperature must survive without thinking")
 	}

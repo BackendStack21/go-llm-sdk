@@ -50,6 +50,9 @@ func parseRetryAfter(v string, now time.Time) time.Duration {
 		if secs < 0 {
 			return 0
 		}
+		if secs > int(maxRetryAfter/time.Second) {
+			return maxRetryAfter
+		}
 		d = time.Duration(secs) * time.Second
 	} else if t, err := http.ParseTime(v); err == nil {
 		if delta := t.Sub(now); delta > 0 {
@@ -116,6 +119,30 @@ func retrySleep(ctx context.Context, d time.Duration) bool {
 	}
 }
 
+// waitRetry sleeps d before the next attempt unless d cannot fit in the
+// context's remaining budget, in which case it returns false immediately
+// instead of sleeping to the deadline. It also returns false when the
+// context ends during the wait.
+func waitRetry(ctx context.Context, d time.Duration) bool {
+	if dl, ok := ctx.Deadline(); ok && time.Until(dl) <= d {
+		return false
+	}
+	return retrySleep(ctx, d)
+}
+
+// withBudgetCause returns last (the final provider or transport error)
+// annotated with why the ladder stopped, so the cause stays retrievable via
+// errors.As while errors.Is(err, context.DeadlineExceeded/Canceled) still
+// holds. When the wait was skipped because it exceeds the remaining
+// budget, the deadline is reported.
+func withBudgetCause(ctx context.Context, last error) error {
+	cause := ctx.Err()
+	if cause == nil {
+		cause = context.DeadlineExceeded
+	}
+	return fmt.Errorf("%w (%w)", last, cause)
+}
+
 // RetryPolicy configures the retry ladder shared by chat (buffered and
 // streaming), speech, transcription and embeddings. Zero fields keep the
 // defaults.
@@ -170,7 +197,11 @@ func terminal(err error) error {
 // retryable statuses and transport errors back off; anything else (and any
 // terminal error) is returned as is.
 func (pc *providerClient) withRetry(ctx context.Context, op func() (time.Duration, error), learn func(*APIError) bool) error {
-	n := pc.opts.retry.attempts()
+	return pc.withRetryN(ctx, pc.opts.retry.attempts(), op, learn)
+}
+
+// withRetryN is withRetry with an explicit attempt budget (n >= 1).
+func (pc *providerClient) withRetryN(ctx context.Context, n int, op func() (time.Duration, error), learn func(*APIError) bool) error {
 	var (
 		rateErr *APIError // last 429
 		rateRA  time.Duration
@@ -181,10 +212,12 @@ func (pc *providerClient) withRetry(ctx context.Context, op func() (time.Duratio
 		}
 		ra, err := op()
 		if err == nil {
+			pc.emitAttempt(ctx, nil, 0)
 			return nil
 		}
 		var te *terminalError
 		if errors.As(err, &te) {
+			pc.emitAttempt(ctx, te.err, 0)
 			return te.err
 		}
 		var ce *ConfigError
@@ -197,13 +230,17 @@ func (pc *providerClient) withRetry(ctx context.Context, op func() (time.Duratio
 			// Transport error — retryable.
 			if cerr := ctx.Err(); cerr != nil {
 				// Interrupted by deadline/cancel, not exhaustion.
+				pc.emitAttempt(ctx, err, 0)
 				return cerr
 			}
 			if last {
+				pc.emitAttempt(ctx, err, 0)
 				return fmt.Errorf("llm: retry exhausted (%d attempts): %w", n, err)
 			}
-			if !retrySleep(ctx, pc.retryDelay(0, attempt)) {
-				return ctx.Err()
+			d := pc.retryDelay(0, attempt)
+			pc.emitAttempt(ctx, err, d)
+			if !waitRetry(ctx, d) {
+				return withBudgetCause(ctx, err)
 			}
 			continue
 		}
@@ -211,12 +248,15 @@ func (pc *providerClient) withRetry(ctx context.Context, op func() (time.Duratio
 		case apiErr.Status == http.StatusTooManyRequests:
 			if billingExhausted(apiErr) {
 				// Permanent: only a recharge fixes this.
+				pc.emitAttempt(ctx, apiErr, 0)
 				return apiErr
 			}
 			rateErr, rateRA = apiErr, ra
 			if !last {
-				if !retrySleep(ctx, pc.retryDelay(ra, attempt)) {
-					// The sleep died with the context (deadline or cancel);
+				d := pc.retryDelay(ra, attempt)
+				pc.emitAttempt(ctx, apiErr, d)
+				if !waitRetry(ctx, d) {
+					// The wait would outlive (or died with) the context;
 					// still surface the 429 — the caller needs
 					// Status/RetryAfter to plan the retry.
 					return &RateLimitError{APIError: *rateErr, Attempts: attempt + 1, RetryAfter: rateRA}
@@ -224,17 +264,21 @@ func (pc *providerClient) withRetry(ctx context.Context, op func() (time.Duratio
 				continue
 			}
 		case apiErr.Retryable && !last:
-			if !retrySleep(ctx, pc.retryDelay(ra, attempt)) {
-				return ctx.Err()
+			d := pc.retryDelay(ra, attempt)
+			pc.emitAttempt(ctx, apiErr, d)
+			if !waitRetry(ctx, d) {
+				return withBudgetCause(ctx, apiErr)
 			}
 			continue
 		case learn != nil && learn(apiErr):
 			// Learn-once fallback engaged: retry immediately.
+			pc.emitAttempt(ctx, apiErr, 0)
 			if !last {
 				continue
 			}
 			return apiErr
 		}
+		pc.emitAttempt(ctx, apiErr, 0)
 		if rateErr != nil && !apiErr.Retryable && apiErr.Status != http.StatusTooManyRequests {
 			// A definitive failure after earlier 429s.
 			return apiErr

@@ -8,7 +8,6 @@ import (
 	"fmt"
 	"io"
 	"net/http"
-	neturl "net/url"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -53,8 +52,9 @@ type providerClient struct {
 // clientOpts carries SDK-level settings into a providerClient.
 type clientOpts struct {
 	retry    RetryPolicy
-	idle     time.Duration    // SSE idle watchdog; 0 = process default
-	observer func(LearnEvent) // learn-once observer; nil = process default
+	idle     time.Duration      // SSE idle watchdog; 0 = process default
+	observer func(LearnEvent)   // learn-once observer; nil = process default
+	attempt  func(AttemptEvent) // per-HTTP-attempt observer; nil = off
 }
 
 // retryDelay picks Retry-After when present, else the policy's capped
@@ -153,11 +153,11 @@ func (pc *providerClient) requestTimeout() time.Duration {
 
 // ── request assembly ─────────────────────────────────────────────────────
 
-// buildChatRequest dispatches format-specific serialization. stream=false
-// yields the buffered request; stream=true the SSE request.
-func (pc *providerClient) buildChatRequest(req *ChatRequest, model string, stream bool) ([]byte, string, error) {
+// validateChatRequest applies the boundary validation shared by chat and
+// token counting and returns the effective model.
+func validateChatRequest(req *ChatRequest, model string) (string, error) {
 	if req == nil {
-		return nil, "", &ConfigError{Msg: "chat request is nil"}
+		return "", &ConfigError{Msg: "chat request is nil"}
 	}
 	// Reject unknown roles loudly: OpenAI would silently send them as user
 	// messages and Anthropic/Gemini would silently drop them.
@@ -165,26 +165,36 @@ func (pc *providerClient) buildChatRequest(req *ChatRequest, model string, strea
 		switch m.Role {
 		case RoleUser, RoleAssistant, RoleSystem, RoleTool:
 		default:
-			return nil, "", &ConfigError{Msg: fmt.Sprintf("message %d: unknown role %q", i, string(m.Role))}
+			return "", &ConfigError{Msg: fmt.Sprintf("message %d: unknown role %q", i, string(m.Role))}
 		}
 	}
 	if err := validateRequestContent(req.Messages); err != nil {
-		return nil, "", err
+		return "", err
 	}
 	if err := validateRequestControls(req); err != nil {
-		return nil, "", err
+		return "", err
 	}
 	if model == "" {
 		model = req.Model
 	}
 	if model == "" {
-		return nil, "", &ConfigError{Msg: "no model set (ChatRequest.Model empty and no ChatClient model)"}
+		return "", &ConfigError{Msg: "no model set (ChatRequest.Model empty and no ChatClient model)"}
+	}
+	return model, nil
+}
+
+// buildChatRequest dispatches format-specific serialization. stream=false
+// yields the buffered request; stream=true the SSE request.
+func (pc *providerClient) buildChatRequest(req *ChatRequest, model string, stream bool) ([]byte, string, error) {
+	model, err := validateChatRequest(req, model)
+	if err != nil {
+		return nil, "", err
 	}
 	body, url, err := pc.buildFormatBody(req, model, stream)
 	if err != nil {
 		return nil, "", err
 	}
-	body, err = mergeExtra(body, req.Extra)
+	body, err = mergeExtra(body, req.Extra, pc.cfg.Format == FormatGemini)
 	return body, url, err
 }
 
@@ -192,13 +202,13 @@ func (pc *providerClient) buildChatRequest(req *ChatRequest, model string, strea
 func (pc *providerClient) buildFormatBody(req *ChatRequest, model string, stream bool) ([]byte, string, error) {
 	switch pc.cfg.Format {
 	case FormatAnthropic:
-		body, err := buildAnthropicRequest(req, model, stream)
+		body, err := buildAnthropicRequestQ(req, model, stream, pc.cfg.Quirks)
 		return body, pc.base + "/v1/messages", err
 	case FormatGemini:
 		body, err := buildGeminiRequest(req, model, stream)
 		// The model rides the URL path: escape it so a model id can never
 		// rewrite the path or smuggle a query.
-		m := neturl.PathEscape(model)
+		m := geminiModelPath(model)
 		if stream {
 			return body, fmt.Sprintf("%s/v1beta/models/%s:streamGenerateContent?alt=sse", pc.base, m), err
 		}
@@ -207,7 +217,11 @@ func (pc *providerClient) buildFormatBody(req *ChatRequest, model string, stream
 		if pc.cfg.Quirks.NoJSONSchema && req.ResponseFormat != nil && req.ResponseFormat.Type == ResponseJSONSchema {
 			return nil, "", &ConfigError{Msg: pc.cfg.ID + " supports ResponseFormat json_object only, not json_schema"}
 		}
-		if useResponsesAPI(pc.learn, pc.cfg.Format, model, req) {
+		useRS := useResponsesAPI(pc.learn, pc.cfg.Format, model, req)
+		if err := validateOpenAIFormatParts(req.Messages, useRS); err != nil {
+			return nil, "", err
+		}
+		if useRS {
 			body, err := json.Marshal(buildResponsesRequest(req, model, stream))
 			return body, pc.base + "/responses", err
 		}
@@ -234,7 +248,7 @@ var extraReserved = map[string]bool{
 // mergeExtra overlays ChatRequest.Extra onto a marshaled body: top-level
 // keys replace the SDK's own. "stream" is reserved because the SDK's
 // buffered/SSE handling depends on it.
-func mergeExtra(body []byte, extra map[string]any) ([]byte, error) {
+func mergeExtra(body []byte, extra map[string]any, deepGen bool) ([]byte, error) {
 	if len(extra) == 0 {
 		return body, nil
 	}
@@ -250,22 +264,45 @@ func mergeExtra(body []byte, extra map[string]any) ([]byte, error) {
 		if err != nil {
 			return nil, &ConfigError{Msg: fmt.Sprintf("ChatRequest.Extra[%q]: %v", k, err)}
 		}
+		if deepGen && k == "generationConfig" {
+			raw = mergeGenerationConfig(m[k], raw)
+		}
 		m[k] = raw
 	}
 	return json.Marshal(m)
 }
 
+// mergeGenerationConfig sets the Extra object's keys one by one over the
+// SDK's generationConfig object (nested objects are replaced whole). When
+// either side is not a JSON object the Extra value replaces as before.
+func mergeGenerationConfig(sdk, extra json.RawMessage) json.RawMessage {
+	var base, over map[string]json.RawMessage
+	if json.Unmarshal(sdk, &base) != nil || base == nil || json.Unmarshal(extra, &over) != nil || over == nil {
+		return extra
+	}
+	for k, v := range over {
+		base[k] = v
+	}
+	out, err := json.Marshal(base)
+	if err != nil {
+		return extra
+	}
+	return out
+}
+
 // setHeaders applies format-specific authentication headers, then the
 // provider's custom Headers (last, so they can override; an empty value
 // removes the header). Keys and header values are never logged.
-func (pc *providerClient) setHeaders(h http.Header) {
+func (pc *providerClient) setHeaders(h http.Header, perReq map[string]string) {
 	pc.setAuthHeaders(h)
-	for k, v := range pc.cfg.Headers {
-		if v == "" {
-			h.Del(k)
-			continue
+	for _, m := range []map[string]string{pc.cfg.Headers, perReq} {
+		for k, v := range m {
+			if v == "" {
+				h.Del(k)
+				continue
+			}
+			h.Set(k, v)
 		}
-		h.Set(k, v)
 	}
 }
 
@@ -358,32 +395,32 @@ func (pc *providerClient) httpError(status int, body []byte) *APIError {
 
 // post sends one HTTP request and reads the full body (capped). Non-2xx
 // responses return an *APIError with the Retry-After hint alongside.
-func (pc *providerClient) post(ctx context.Context, client *http.Client, url string, body []byte) (data []byte, ra time.Duration, err error) {
+func (pc *providerClient) post(ctx context.Context, client *http.Client, url string, body []byte) (data []byte, hdr http.Header, ra time.Duration, err error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body))
 	if err != nil {
-		return nil, 0, &ConfigError{Msg: "build request: " + err.Error()}
+		return nil, nil, 0, &ConfigError{Msg: "build request: " + err.Error()}
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Accept", "application/json")
-	pc.setHeaders(req.Header)
+	pc.setHeaders(req.Header, reqHeadersFrom(ctx))
 
-	resp, err := client.Do(req)
+	resp, err := doObserved(ctx, client, req)
 	if err != nil {
-		return nil, 0, err
+		return nil, nil, 0, err
 	}
 	defer func() { _ = resp.Body.Close() }()
 	data, err = io.ReadAll(io.LimitReader(resp.Body, maxResponseSize+1))
 	if err != nil {
-		return nil, 0, err
+		return nil, nil, 0, err
 	}
 	if len(data) > maxResponseSize {
-		return nil, 0, fmt.Errorf("llm: response exceeds %d bytes", maxResponseSize)
+		return nil, nil, 0, terminal(fmt.Errorf("llm: response exceeds %d bytes", maxResponseSize))
 	}
 	ra = parseRetryAfter(resp.Header.Get("Retry-After"), time.Now())
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return data, ra, pc.httpError(resp.StatusCode, data)
+		return data, resp.Header, ra, pc.httpError(resp.StatusCode, data)
 	}
-	return data, ra, nil
+	return data, resp.Header, ra, nil
 }
 
 // ── error classification helpers ─────────────────────────────────────────
@@ -460,6 +497,11 @@ func billingExhausted(e *APIError) bool {
 // contract as streaming — so a failing provider can never hold a caller for
 // timeout × attempts.
 func (pc *providerClient) call(ctx context.Context, req *ChatRequest, model string) (*ChatResult, error) {
+	ctx, herr := withReqHeaders(ctx, chatReqHeaders(req))
+	if herr != nil {
+		return nil, herr
+	}
+	ctx = pc.withAttempts(ctx, "chat", model)
 	ctx, cancel := context.WithTimeout(ctx, pc.requestTimeout())
 	defer cancel()
 	var res *ChatResult
@@ -468,11 +510,12 @@ func (pc *providerClient) call(ctx context.Context, req *ChatRequest, model stri
 		if err != nil {
 			return 0, terminal(err)
 		}
-		data, ra, err := pc.post(ctx, pc.buffered(), url, body)
+		data, hdr, ra, err := pc.post(ctx, pc.buffered(), url, body)
 		if err != nil {
 			return ra, err
 		}
 		res, err = pc.parseResponse(data, url, pc.jsonTool(req))
+		res.withHeaderMeta(hdr)
 		return 0, terminal(err)
 	}, func(apiErr *APIError) bool {
 		return pc.learnFromChatError(req, apiErr)
@@ -506,7 +549,7 @@ func (pc *providerClient) learnFromChatError(req *ChatRequest, apiErr *APIError)
 
 // jsonTool is the Anthropic JSON-mode tool for req ("" elsewhere).
 func (pc *providerClient) jsonTool(req *ChatRequest) string {
-	if pc.cfg.Format != FormatAnthropic {
+	if pc.cfg.Format != FormatAnthropic || !pc.cfg.Quirks.AnthropicToolJSON {
 		return ""
 	}
 	return anthropicJSONToolName(req)
@@ -554,6 +597,11 @@ func (pc *providerClient) callStream(ctx context.Context, req *ChatRequest, mode
 	if pc.learn.forceBuffered.Load() {
 		return pc.call(ctx, req, model)
 	}
+	ctx, herr := withReqHeaders(ctx, chatReqHeaders(req))
+	if herr != nil {
+		return nil, herr
+	}
+	ctx = pc.withAttempts(ctx, "stream", model)
 	deadlineCtx, cancel := context.WithTimeout(ctx, pc.requestTimeout())
 	defer cancel()
 
@@ -588,17 +636,22 @@ func (pc *providerClient) callStream(ctx context.Context, req *ChatRequest, mode
 			// A successful HTTP response already contains this generation.
 			// Return its buffered parse (including errors) without replacing
 			// it with another generation or resetting the request deadline.
+			pc.emitAttempt(deadlineCtx, out.err, 0)
 			return out.result, out.err
 		case out.success():
+			pc.emitAttempt(deadlineCtx, nil, 0)
 			return out.result, nil
 		case out.abort != nil:
+			pc.emitAttempt(deadlineCtx, out.abort, 0)
 			return out.result, out.abort
 		case out.err != nil && out.result != nil:
 			// Partial output was delivered: never retry, surface with the
 			// partial result (a retry would duplicate user-visible output).
+			pc.emitAttempt(deadlineCtx, out.err, 0)
 			return out.result, out.err
 		case out.learnRetry: // learn-once applied; retry without backoff
 			lastErr = out.apiErr // every learn trigger is a provider 400
+			pc.emitAttempt(deadlineCtx, out.apiErr, 0)
 			if attempt < n-1 {
 				continue
 			}
@@ -610,22 +663,34 @@ func (pc *providerClient) callStream(ctx context.Context, req *ChatRequest, mode
 				rateErr, rateRA = out.apiErr, out.retryAfter
 			}
 			lastErr = out.apiErr
-			if attempt < n-1 && retrySleep(deadlineCtx, pc.retryDelay(out.retryAfter, attempt)) {
-				continue
+			if attempt < n-1 {
+				d := pc.retryDelay(out.retryAfter, attempt)
+				pc.emitAttempt(deadlineCtx, out.apiErr, d)
+				if waitRetry(deadlineCtx, d) {
+					continue
+				}
+			} else {
+				pc.emitAttempt(deadlineCtx, out.apiErr, 0)
 			}
 			if rateErr != nil {
 				return nil, &RateLimitError{APIError: *rateErr, Attempts: attempt + 1, RetryAfter: rateRA}
 			}
 			return nil, out.apiErr
 		case out.apiErr != nil:
+			pc.emitAttempt(deadlineCtx, out.apiErr, 0)
 			return nil, out.apiErr
 		case out.err != nil && attempt < n-1:
 			lastErr = out.err
-			if retrySleep(deadlineCtx, pc.retryDelay(0, attempt)) {
+			d := pc.retryDelay(0, attempt)
+			pc.emitAttempt(deadlineCtx, out.err, d)
+			if waitRetry(deadlineCtx, d) {
 				continue
 			}
-			return nil, deadlineCtx.Err() // interrupted by deadline/cancel, not exhaustion
+			// Interrupted by (or about to outlive) the deadline/cancel, not
+			// exhaustion: keep the last error retrievable.
+			return nil, withBudgetCause(deadlineCtx, out.err)
 		default:
+			pc.emitAttempt(deadlineCtx, out.err, 0)
 			return nil, out.err
 		}
 	}
@@ -663,9 +728,9 @@ func (pc *providerClient) attemptStream(ctx context.Context, url string, body []
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Accept", "text/event-stream")
-	pc.setHeaders(req.Header)
+	pc.setHeaders(req.Header, reqHeadersFrom(ctx))
 
-	resp, derr := pc.streamHTTP.Do(req)
+	resp, derr := doObserved(ctx, pc.streamHTTP, req)
 	if derr != nil {
 		return streamOutcome{err: derr} // transport error: retryable
 	}
@@ -705,6 +770,7 @@ func (pc *providerClient) attemptStream(ctx context.Context, url string, body []
 			return streamOutcome{bufferedResponse: true, err: fmt.Errorf("llm: response exceeds %d bytes", maxResponseSize)}
 		}
 		result, err := pc.parseResponse(data, url, jsonTool)
+		result.withHeaderMeta(resp.Header)
 		return streamOutcome{bufferedResponse: true, result: result, err: err}
 	}
 
@@ -732,24 +798,27 @@ func (pc *providerClient) attemptStream(ctx context.Context, url string, body []
 
 	switch {
 	case perr == nil, errors.Is(perr, errStreamStop):
-		if perr == nil && !acc.sawFinish {
+		// A bare [DONE] (nothing emitted, no finish) is an empty premature
+		// close, never a silent empty success. [DONE] after content is
+		// tolerated: some gateways omit finish_reason.
+		if !acc.sawFinish && (perr == nil || !acc.emitted) {
 			// Every format sends an explicit completion signal ([DONE],
 			// finish_reason, message_stop, finishReason, response.completed)
 			// before EOF. It never arrived: the provider dropped the stream.
 			// Never surface this as a silent (partial or empty) success.
 			if acc.emitted {
 				return streamOutcome{
-					result: acc.result(),
+					result: acc.resultWith(resp.Header),
 					err:    fmt.Errorf("llm: stream closed before completion: %w", errPrematureClose),
 				}
 			}
 			return streamOutcome{err: errPrematureClose}
 		}
-		return streamOutcome{result: acc.result()}
+		return streamOutcome{result: acc.resultWith(resp.Header)}
 	default:
 		var ca *consumerAbort
 		if errors.As(perr, &ca) {
-			return streamOutcome{result: acc.result(), abort: &StreamAbortedError{Reason: ca.err}}
+			return streamOutcome{result: acc.resultWith(resp.Header), abort: &StreamAbortedError{Reason: ca.err}}
 		}
 		if !acc.emitted {
 			// No output delivered yet: a full retry duplicates nothing.
@@ -759,7 +828,7 @@ func (pc *providerClient) attemptStream(ctx context.Context, url string, body []
 		}
 		// Partial output was delivered: never retry, surface with partial.
 		return streamOutcome{
-			result: acc.result(),
+			result: acc.resultWith(resp.Header),
 			err:    fmt.Errorf("llm: stream failed after partial output: %w", perr),
 		}
 	}
@@ -790,6 +859,7 @@ type thinkingAccum struct {
 type streamAccum struct {
 	content           strings.Builder
 	reasoning         strings.Builder
+	refusal           strings.Builder
 	calls             []*toolCallAccum
 	callIndex         map[int]*toolCallAccum
 	thinking          []*thinkingAccum
@@ -801,6 +871,9 @@ type streamAccum struct {
 	thinkingSignature string // legacy single signature (last block's)
 	jsonTool          string // Anthropic JSON-mode synthetic tool name ("" = off)
 	jsonBlock         int    // content-block index of the JSON-mode tool_use (-1 = none)
+	jsonWritten       bool   // JSON-mode tool input produced any content
+	lastToolKey       int    // OpenAI-format: provider key of the most recent tool-call delta
+	metaID, metaModel string // provider-reported response id / model
 }
 
 func newStreamAccum() *streamAccum {
@@ -809,6 +882,29 @@ func newStreamAccum() *streamAccum {
 		thinkingIndex: make(map[int]*thinkingAccum),
 		jsonBlock:     -1,
 	}
+}
+
+// openAIToolKey resolves the provider key of an OpenAI-format streamed
+// tool-call delta. An explicit index wins. Without one (some gateways omit
+// it), a delta continues the most recent call unless it carries a
+// different non-empty id, which starts a new call.
+func (a *streamAccum) openAIToolKey(index *int, id string) int {
+	key := a.lastToolKey
+	switch {
+	case index != nil:
+		key = *index
+	case id != "" && len(a.calls) > 0:
+		if cur, ok := a.callIndex[key]; ok && cur.id != "" && cur.id != id {
+			key = 0
+			for k := range a.callIndex {
+				if k >= key {
+					key = k + 1
+				}
+			}
+		}
+	}
+	a.lastToolKey = key
+	return key
 }
 
 // call returns the accumulator for provider index idx, creating it in
@@ -835,6 +931,23 @@ func (a *streamAccum) block(idx int) *thinkingAccum {
 	return b
 }
 
+// noteMeta records the first non-empty provider id/model seen.
+func (a *streamAccum) noteMeta(id, model string) {
+	if a.metaID == "" {
+		a.metaID = id
+	}
+	if a.metaModel == "" {
+		a.metaModel = model
+	}
+}
+
+// resultWith is result() plus the response-header metadata.
+func (a *streamAccum) resultWith(h http.Header) *ChatResult {
+	res := a.result()
+	res.withHeaderMeta(h)
+	return res
+}
+
 func (a *streamAccum) result() *ChatResult {
 	res := &ChatResult{
 		Content:           a.content.String(),
@@ -842,12 +955,61 @@ func (a *streamAccum) result() *ChatResult {
 		ThinkingSignature: a.thinkingSignature,
 		FinishReason:      a.finishReason,
 		Usage:             a.usage,
+		Refusal:           a.refusal.String(),
+		Meta:              ResponseMeta{ID: a.metaID, Model: a.metaModel},
 	}
+	res.FinishReason = refusalFinish(res.FinishReason, res.Refusal)
 	for _, b := range a.thinking {
 		res.ThinkingBlocks = append(res.ThinkingBlocks, ThinkingBlock{Text: b.text.String(), Signature: b.sig, Redacted: b.redacted})
 	}
+	if a.jsonBlock >= 0 && !a.jsonWritten {
+		res.Content += "{}" // JSON-mode tool with empty input, as buffered
+	}
 	for _, c := range a.calls {
-		res.ToolCalls = append(res.ToolCalls, ToolCall{ID: c.id, Name: c.name, Arguments: c.args.String(), Signature: c.sig})
+		args := c.args.String()
+		if args == "" {
+			args = "{}" // a no-argument call is an empty object on every format
+		}
+		res.ToolCalls = append(res.ToolCalls, ToolCall{ID: c.id, Name: c.name, Arguments: args, Signature: c.sig})
 	}
 	return res
+}
+
+// refusalFinish maps a refusal that finished "stop" (or unmapped) to
+// content_filter; length and tool_calls stay as the provider sent them.
+func refusalFinish(finish, refusal string) string {
+	if refusal != "" && (finish == FinishStop || finish == "") {
+		return FinishContentFilter
+	}
+	return finish
+}
+
+// streamErrorMessage interprets the "error" field of a stream chunk. Only a
+// non-empty JSON object counts as a provider error (its message, or a
+// generic one when it has none); null, "", false, 0 and {} are ignored.
+func streamErrorMessage(raw json.RawMessage) (string, bool) {
+	raw = bytes.TrimSpace(raw)
+	if len(raw) == 0 || raw[0] != '{' {
+		return "", false
+	}
+	var obj map[string]json.RawMessage
+	if json.Unmarshal(raw, &obj) != nil || len(obj) == 0 {
+		return "", false
+	}
+	var msg string
+	if m, ok := obj["message"]; ok {
+		_ = json.Unmarshal(m, &msg)
+	}
+	if msg == "" {
+		msg = "stream error"
+	}
+	return msg, true
+}
+
+// chatReqHeaders returns req.Headers, tolerating a nil request (rejected later).
+func chatReqHeaders(req *ChatRequest) map[string]string {
+	if req == nil {
+		return nil
+	}
+	return req.Headers
 }

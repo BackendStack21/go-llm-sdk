@@ -383,7 +383,7 @@ func TestModelsGetOversizedBody(t *testing.T) {
 func TestBufferedCallPostBuildError(t *testing.T) {
 	pc := newProviderClient(ProviderConfig{ID: "x", Format: FormatOpenAI, BaseURL: "http://127.0.0.1:1", APIKey: "k"}, nil, nil)
 	// NUL is rejected by net/url at request-build time, before any dial.
-	_, _, err := pc.post(context.Background(), pc.buffered(), "http://127.0.0.1:1/\x00chat", nil)
+	_, _, _, err := pc.post(context.Background(), pc.buffered(), "http://127.0.0.1:1/\x00chat", nil)
 	var ce *ConfigError
 	if !errors.As(err, &ce) {
 		t.Fatalf("err = %v (%T), want request-build ConfigError", err, err)
@@ -695,7 +695,7 @@ func TestBuildAnthropicRequestArmsTail(t *testing.T) {
 			{Role: RoleUser, Content: "q"},
 			{Role: RoleAssistant, ToolCalls: []ToolCall{{ID: "tu_1", Name: "f"}}}, // empty args → {}
 		},
-		Thinking: "enabled", // no explicit budget → 5000 default
+		Thinking: "enabled", ThinkingBudget: 5000, // explicit budget: presets are adaptive now
 	}
 	b, err := buildAnthropicRequest(req, "claude-x", false)
 	if err != nil {

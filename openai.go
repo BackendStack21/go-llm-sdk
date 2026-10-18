@@ -60,15 +60,26 @@ type oaContentPart struct {
 	Type     string      `json:"type"`
 	Text     string      `json:"text,omitempty"`
 	ImageURL *oaImageURL `json:"image_url,omitempty"`
+	File     *oaFile     `json:"file,omitempty"`
+}
+
+type oaFile struct {
+	Filename string `json:"filename"`
+	FileData string `json:"file_data"`
 }
 
 // openAIContent renders ordered content parts as chat-completions parts.
 func openAIContent(m Message) []oaContentPart {
 	parts := make([]oaContentPart, 0, len(m.Parts))
 	for _, p := range m.Parts {
-		if p.Type == ContentPartImage {
+		switch p.Type {
+		case ContentPartImage:
 			parts = append(parts, oaContentPart{Type: "image_url", ImageURL: &oaImageURL{URL: "data:" + wireMIME(p.MIMEType) + ";base64," + base64.StdEncoding.EncodeToString(p.Image)}})
-		} else {
+		case ContentPartImageURL:
+			parts = append(parts, oaContentPart{Type: "image_url", ImageURL: &oaImageURL{URL: p.URL}})
+		case ContentPartDocument:
+			parts = append(parts, oaContentPart{Type: "file", File: &oaFile{Filename: documentName(p), FileData: "data:application/pdf;base64," + base64.StdEncoding.EncodeToString(p.Data)}})
+		default:
 			parts = append(parts, oaContentPart{Type: "text", Text: p.Text})
 		}
 	}
@@ -165,7 +176,7 @@ func buildOpenAIRequest(cfg ProviderConfig, req *ChatRequest, model string, stre
 				c = "(image result attached below)" // some providers reject empty tool content
 			}
 			msgs = append(msgs, oaMessage{Role: "tool", Content: &c, ToolCallID: m.ToolCallID})
-			if imgs := imageParts(m); len(imgs) > 0 {
+			if imgs := imageLikeParts(m); len(imgs) > 0 {
 				toolImages = append(toolImages, TextPart("Images returned by tool call "+m.ToolCallID+":"))
 				toolImages = append(toolImages, imgs...)
 			}
@@ -349,6 +360,7 @@ func (s *oaFlexString) UnmarshalJSON(b []byte) error {
 type oaRespMessage struct {
 	Role             string              `json:"role"`
 	Content          string              `json:"content"`
+	Refusal          string              `json:"refusal"`
 	ReasoningContent oaFlexString        `json:"reasoning_content"`
 	Reasoning        oaFlexString        `json:"reasoning"`
 	ReasoningDetails []oaReasoningDetail `json:"reasoning_details"`
@@ -475,6 +487,8 @@ func usageFromOpenAI(u *oaRespUsage) Usage {
 }
 
 type oaResponse struct {
+	ID      string         `json:"id"`
+	Model   string         `json:"model"`
 	Choices []oaRespChoice `json:"choices"`
 	Usage   *oaRespUsage   `json:"usage"`
 	Error   *oaErrorBody   `json:"error"`
@@ -522,14 +536,25 @@ func parseOpenAIResponse(body []byte) (*ChatResult, error) {
 		Content:          ch.Message.Content,
 		ReasoningContent: foldReasoning(string(ch.Message.ReasoningContent), string(ch.Message.Reasoning), ch.Message.ReasoningDetails),
 		FinishReason:     mapOpenAIFinishReason(ch.FinishReason),
+		Refusal:          ch.Message.Refusal,
+		Meta:             ResponseMeta{ID: r.ID, Model: r.Model},
 	}
 	for _, tc := range ch.Message.ToolCalls {
+		args := tc.Function.Arguments
+		if args == "" {
+			args = "{}"
+		}
 		res.ToolCalls = append(res.ToolCalls, ToolCall{
 			ID:        tc.ID,
 			Name:      tc.Function.Name,
-			Arguments: tc.Function.Arguments,
+			Arguments: args,
 		})
 	}
+	// Named tool_choice (and many gateways) report "stop" for a tool turn.
+	if res.FinishReason == FinishStop && len(res.ToolCalls) > 0 {
+		res.FinishReason = FinishToolCalls
+	}
+	res.FinishReason = refusalFinish(res.FinishReason, res.Refusal)
 	if r.Usage != nil {
 		res.Usage = usageFromOpenAI(r.Usage)
 	}
@@ -540,6 +565,7 @@ func parseOpenAIResponse(body []byte) (*ChatResult, error) {
 
 type oaStreamDelta struct {
 	Content          string              `json:"content"`
+	Refusal          string              `json:"refusal"`
 	ReasoningContent oaFlexString        `json:"reasoning_content"`
 	Reasoning        oaFlexString        `json:"reasoning"`
 	ReasoningDetails []oaReasoningDetail `json:"reasoning_details"`
@@ -561,8 +587,11 @@ type oaStreamChoice struct {
 }
 
 type oaStreamChunk struct {
+	ID      string           `json:"id"`
+	Model   string           `json:"model"`
 	Choices []oaStreamChoice `json:"choices"`
 	Usage   *oaRespUsage     `json:"usage"`
+	Error   json.RawMessage  `json:"error"` // see streamErrorMessage
 }
 
 // mapOpenAIStreamEvent folds one SSE data payload into the accumulator and
@@ -572,6 +601,10 @@ func mapOpenAIStreamEvent(data []byte, acc *streamAccum) (deltas []Delta, done b
 	if err := json.Unmarshal(data, &c); err != nil {
 		return nil, false, fmt.Errorf("llm: parse stream chunk: %w", err)
 	}
+	if msg, ok := streamErrorMessage(c.Error); ok {
+		return nil, false, fmt.Errorf("llm: provider error: %s", msg)
+	}
+	acc.noteMeta(c.ID, c.Model)
 	if c.Usage != nil {
 		acc.usage = usageFromOpenAI(c.Usage)
 	}
@@ -585,11 +618,12 @@ func mapOpenAIStreamEvent(data []byte, acc *streamAccum) (deltas []Delta, done b
 			acc.content.WriteString(d.Content)
 			deltas = append(deltas, Delta{Kind: DeltaContent, Text: d.Content})
 		}
+		if d.Refusal != "" {
+			acc.refusal.WriteString(d.Refusal)
+			deltas = append(deltas, Delta{Kind: DeltaRefusal, Text: d.Refusal})
+		}
 		for _, tc := range d.ToolCalls {
-			idx := 0
-			if tc.Index != nil {
-				idx = *tc.Index
-			}
+			idx := acc.openAIToolKey(tc.Index, tc.ID)
 			call := acc.call(idx)
 			if tc.ID != "" {
 				call.id = tc.ID
@@ -603,6 +637,9 @@ func mapOpenAIStreamEvent(data []byte, acc *streamAccum) (deltas []Delta, done b
 		}
 		if ch.FinishReason != "" {
 			acc.finishReason = mapOpenAIFinishReason(ch.FinishReason)
+			if acc.finishReason == FinishStop && len(acc.calls) > 0 {
+				acc.finishReason = FinishToolCalls
+			}
 			acc.sawFinish = true
 		}
 	}

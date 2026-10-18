@@ -28,6 +28,10 @@ type ContentPartType string
 const (
 	ContentPartText  ContentPartType = "text"
 	ContentPartImage ContentPartType = "image"
+	// ContentPartDocument is an inline document (PDF or plain text).
+	ContentPartDocument ContentPartType = "document"
+	// ContentPartImageURL is an image the provider fetches by URL.
+	ContentPartImageURL ContentPartType = "image_url"
 )
 
 // ContentPart is one ordered text or inline-image segment in a message.
@@ -39,16 +43,41 @@ type ContentPart struct {
 	Text     string
 	Image    []byte
 	MIMEType string
+	// Data is the document payload (ContentPartDocument).
+	Data []byte
+	// Name is the optional document filename.
+	Name string
+	// URL is the remote image location (ContentPartImageURL).
+	URL string
 }
 
 const MaxImageBytes = 10 << 20
 
-// TextPart creates an ordered text content part.
-func TextPart(text string) ContentPart { return ContentPart{Type: ContentPartText, Text: text} }
+// MaxDocumentBytes bounds one inline document part.
+const MaxDocumentBytes = 20 << 20
 
-// ImagePart creates an ordered inline-image content part.
-func ImagePart(mimeType string, data []byte) ContentPart {
-	return ContentPart{Type: ContentPartImage, Image: data, MIMEType: mimeType}
+// DocumentPart creates an inline document part (application/pdf or
+// text/plain). Name is an optional filename.
+func DocumentPart(mimeType string, data []byte, name string) ContentPart {
+	return ContentPart{Type: ContentPartDocument, MIMEType: mimeType, Data: data, Name: name}
+}
+
+// ImageURLPart creates a part referencing a remote http(s) image. The SDK
+// never fetches it; the provider does. Gemini needs a MIME type: use
+// ImageURLPartMIME or WithMIME.
+func ImageURLPart(url string) ContentPart {
+	return ContentPart{Type: ContentPartImageURL, URL: url}
+}
+
+// ImageURLPartMIME creates a remote-image part with a MIME type hint.
+func ImageURLPartMIME(url, mime string) ContentPart {
+	return ContentPart{Type: ContentPartImageURL, URL: url, MIMEType: mime}
+}
+
+// WithMIME returns a copy of p with MIMEType set.
+func (p ContentPart) WithMIME(mime string) ContentPart {
+	p.MIMEType = mime
+	return p
 }
 
 const (
@@ -231,6 +260,8 @@ type ResponseFormat struct {
 // OpenAI Responses API has none, so it is not sent on requests diverted
 // there).
 type ChatRequest struct {
+	// Headers are per-request HTTP headers (stub; behaviour lands with SL03).
+	Headers        map[string]string
 	Model          string
 	Messages       []Message
 	System         []SystemBlock
@@ -240,7 +271,12 @@ type ChatRequest struct {
 	MaxTokens      int
 	Temperature    float64
 	TopP           float64
-	Stop           []string
+	// TopK limits sampling to the K most likely tokens (0 = provider
+	// default; negative is a ConfigError). Anthropic top_k (omitted when
+	// thinking is on) and Gemini generationConfig.topK; OpenAI chat and
+	// Responses ignore it.
+	TopK int
+	Stop []string
 	// ToolChoice constrains tool use (nil = provider default). It requires
 	// Tools.
 	ToolChoice *ToolChoice
@@ -256,8 +292,9 @@ type ChatRequest struct {
 	// Extra holds provider-specific top-level body fields merged into the
 	// request JSON after the SDK's own (so they override them): an escape
 	// hatch for parameters the canonical shape does not model yet. The merge
-	// is shallow: an object value replaces the SDK's whole object (e.g.
-	// Gemini generationConfig). Keys go to whichever endpoint the request
+	// is shallow: an object value replaces the SDK's whole object, except
+	// Gemini generationConfig, whose keys are set one by one over the SDK's
+	// (nested objects such as thinkingConfig are replaced whole). Keys go to whichever endpoint the request
 	// is sent to, including /responses when an OpenAI request is diverted
 	// there. Reserved (ConfigError): "stream" (use Call vs CallStream) and
 	// the keys the SDK validates — model, messages/contents/input,
@@ -279,6 +316,11 @@ type ChatResult struct {
 	ToolCalls      []ToolCall
 	FinishReason   string
 	Usage          Usage
+	// Refusal is the provider's refusal text when it signals one; empty
+	// otherwise. Content is never altered.
+	Refusal string
+	// Meta is provider-reported response metadata (zero when unreported).
+	Meta ResponseMeta
 }
 
 // DeltaKind discriminates streamed fragments.
@@ -292,6 +334,8 @@ const (
 	// DeltaToolArgs is a tool-call argument fragment (partial JSON). ToolIndex
 	// and, on the first fragment of a call, ToolID/ToolName identify the call.
 	DeltaToolArgs
+	// DeltaRefusal is a refusal-text fragment carried in Delta.Text.
+	DeltaRefusal
 )
 
 // Delta is one streamed fragment. Text is the fragment for this event, not
@@ -334,4 +378,12 @@ func (r *ChatResult) AssistantMessage() Message {
 		m.ToolCalls = append([]ToolCall(nil), r.ToolCalls...)
 	}
 	return m
+}
+
+// TextPart creates an ordered text content part.
+func TextPart(text string) ContentPart { return ContentPart{Type: ContentPartText, Text: text} }
+
+// ImagePart creates an ordered inline-image content part.
+func ImagePart(mimeType string, data []byte) ContentPart {
+	return ContentPart{Type: ContentPartImage, Image: data, MIMEType: mimeType}
 }

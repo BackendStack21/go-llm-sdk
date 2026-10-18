@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	neturl "net/url"
 	"strings"
@@ -31,6 +32,7 @@ type anBlock struct {
 	Type   string         `json:"type"` // "text" | "tool_use" | "tool_result"
 	Text   string         `json:"text,omitempty"`
 	Source *anImageSource `json:"source,omitempty"`
+	Title  string         `json:"title,omitempty"` // document
 	// CacheControl is set on user text blocks when Message.Cache is true.
 	CacheControl *anCacheControl `json:"cache_control,omitempty"`
 	// thinking / redacted_thinking (replayed assistant turns; they go
@@ -51,8 +53,9 @@ type anBlock struct {
 
 type anImageSource struct {
 	Type      string `json:"type"`
-	MediaType string `json:"media_type"`
-	Data      string `json:"data"`
+	MediaType string `json:"media_type,omitempty"`
+	Data      string `json:"data,omitempty"`
+	URL       string `json:"url,omitempty"`
 }
 
 type anMessage struct {
@@ -68,22 +71,34 @@ type anTool struct {
 }
 
 type anThinking struct {
-	Type         string `json:"type"` // "enabled"
+	Type         string `json:"type"` // "enabled" (budget) or "adaptive"
 	BudgetTokens int    `json:"budget_tokens,omitempty"`
 }
 
+type anOutputFormat struct {
+	Type   string          `json:"type"`
+	Schema json.RawMessage `json:"schema"`
+}
+
+type anOutputConfig struct {
+	Effort string          `json:"effort,omitempty"`
+	Format *anOutputFormat `json:"format,omitempty"`
+}
+
 type anRequest struct {
-	Model       string        `json:"model"`
-	MaxTokens   int           `json:"max_tokens"`
-	Messages    []anMessage   `json:"messages"`
-	System      []anSysBlock  `json:"system,omitempty"`
-	Tools       []anTool      `json:"tools,omitempty"`
-	Temperature *float64      `json:"temperature,omitempty"`
-	TopP        *float64      `json:"top_p,omitempty"`
-	Stop        []string      `json:"stop_sequences,omitempty"`
-	Stream      bool          `json:"stream,omitempty"`
-	Thinking    *anThinking   `json:"thinking,omitempty"`
-	ToolChoice  *anToolChoice `json:"tool_choice,omitempty"`
+	Model        string          `json:"model"`
+	MaxTokens    int             `json:"max_tokens"`
+	Messages     []anMessage     `json:"messages"`
+	System       []anSysBlock    `json:"system,omitempty"`
+	Tools        []anTool        `json:"tools,omitempty"`
+	Temperature  *float64        `json:"temperature,omitempty"`
+	TopP         *float64        `json:"top_p,omitempty"`
+	TopK         *int            `json:"top_k,omitempty"`
+	Stop         []string        `json:"stop_sequences,omitempty"`
+	Stream       bool            `json:"stream,omitempty"`
+	Thinking     *anThinking     `json:"thinking,omitempty"`
+	ToolChoice   *anToolChoice   `json:"tool_choice,omitempty"`
+	OutputConfig *anOutputConfig `json:"output_config,omitempty"`
 }
 
 const anthropicDefaultMaxTokens = 8192
@@ -91,35 +106,36 @@ const anthropicDefaultMaxTokens = 8192
 // anthropicMinThinkingBudget is Anthropic's minimum budget_tokens.
 const anthropicMinThinkingBudget = 1024
 
-// anthropicThinkingBudget maps canonical thinking levels to budgets.
-// Anthropic requires budget_tokens >= 1024.
-func anthropicThinkingBudget(level string, explicit int) (int, bool) {
-	var budget int
+// anthropicThinkingOn reports whether a canonical thinking level enables
+// thinking ("" and "disabled" do not).
+func anthropicThinkingOn(level string) bool {
 	switch level {
-	case "enabled":
-		budget = 5000
-	case "low":
-		budget = 1024
-	case "medium":
-		budget = 8192
-	case "high", "max":
-		budget = 16384
-	default: // "", "disabled"
-		return 0, false
+	case "enabled", "low", "medium", "high", "max":
+		return true
 	}
-	if explicit > 0 {
-		budget = maxInt(explicit, anthropicMinThinkingBudget)
-	}
-	return budget, true
+	return false
 }
+
+// anthropicAdaptiveMaxTokens is the max_tokens default under adaptive
+// thinking, leaving room for thinking plus the visible answer.
+const anthropicAdaptiveMaxTokens = 16384
 
 // anthropicPartBlocks renders ordered content parts as text/image blocks.
 func anthropicPartBlocks(parts []ContentPart) []anBlock {
 	blocks := make([]anBlock, 0, len(parts))
 	for _, p := range parts {
-		if p.Type == ContentPartImage {
+		switch p.Type {
+		case ContentPartImage:
 			blocks = append(blocks, anBlock{Type: "image", Source: &anImageSource{Type: "base64", MediaType: wireMIME(p.MIMEType), Data: base64.StdEncoding.EncodeToString(p.Image)}})
-		} else {
+		case ContentPartImageURL:
+			blocks = append(blocks, anBlock{Type: "image", Source: &anImageSource{Type: "url", URL: p.URL}})
+		case ContentPartDocument:
+			src := &anImageSource{Type: "base64", MediaType: canonMIME(p.MIMEType), Data: base64.StdEncoding.EncodeToString(p.Data)}
+			if canonMIME(p.MIMEType) == "text/plain" {
+				src = &anImageSource{Type: "text", MediaType: "text/plain", Data: string(p.Data)}
+			}
+			blocks = append(blocks, anBlock{Type: "document", Source: src, Title: p.Name})
+		default:
 			blocks = append(blocks, anBlock{Type: "text", Text: p.Text})
 		}
 	}
@@ -160,8 +176,15 @@ func maxInt(a, b int) int {
 	return b
 }
 
-// buildAnthropicRequest renders the canonical request in Anthropic format.
+// buildAnthropicRequest renders the canonical request in Anthropic format
+// with the native (default) quirks.
 func buildAnthropicRequest(req *ChatRequest, model string, stream bool) ([]byte, error) {
+	return buildAnthropicRequestQ(req, model, stream, Quirks{})
+}
+
+// buildAnthropicRequestQ renders the request honouring provider quirks
+// (AnthropicToolJSON selects the forced-tool JSON emulation).
+func buildAnthropicRequestQ(req *ChatRequest, model string, stream bool, q Quirks) ([]byte, error) {
 	out := anRequest{
 		Model:     model,
 		MaxTokens: req.MaxTokens,
@@ -169,9 +192,14 @@ func buildAnthropicRequest(req *ChatRequest, model string, stream bool) ([]byte,
 		Stream:    stream,
 	}
 
+	legacyThinking := false
+
 	// System: canonical blocks (with cache markers) + in-band system
 	// messages become the top-level system field.
 	for _, b := range req.System {
+		if b.Text == "" { // Anthropic rejects empty text blocks
+			continue
+		}
 		sb := anSysBlock{Type: "text", Text: b.Text}
 		if b.Cache {
 			sb.CacheControl = &anCacheControl{Type: "ephemeral"}
@@ -193,31 +221,35 @@ func buildAnthropicRequest(req *ChatRequest, model string, stream bool) ([]byte,
 		}
 		out.TopP = &p
 	}
-	if budget, ok := anthropicThinkingBudget(req.Thinking, req.ThinkingBudget); ok {
-		// Anthropic requires max_tokens > budget_tokens, and the budget
-		// counts against max_tokens. An unset MaxTokens leaves the usual
-		// visible-output room on top of the budget; an explicit MaxTokens
-		// is a hard cap, so a preset level is clamped to half of it (the
-		// rest stays for the answer) and an explicit ThinkingBudget that
-		// cannot fit fails fast.
-		switch {
-		case out.MaxTokens <= 0:
-			out.MaxTokens = budget + anthropicDefaultMaxTokens
-		case budget >= out.MaxTokens && req.ThinkingBudget > 0:
-			return nil, &ConfigError{Msg: fmt.Sprintf("Anthropic ThinkingBudget %d must be below MaxTokens %d", budget, out.MaxTokens)}
-		case budget > out.MaxTokens/2 && req.ThinkingBudget <= 0:
-			// A preset larger than half an explicit cap would starve the
-			// visible answer: keep half for output (never below Anthropic's
-			// minimum budget, which must still fit under the cap).
-			budget = maxInt(out.MaxTokens/2, anthropicMinThinkingBudget)
-			if budget >= out.MaxTokens {
-				return nil, &ConfigError{Msg: fmt.Sprintf("Anthropic thinking needs MaxTokens above %d, got %d", anthropicMinThinkingBudget, out.MaxTokens)}
+	if req.TopK > 0 {
+		k := req.TopK
+		out.TopK = &k
+	}
+	if anthropicThinkingOn(req.Thinking) {
+		if req.ThinkingBudget > 0 {
+			// Legacy budget path: max_tokens must exceed budget_tokens.
+			budget := maxInt(req.ThinkingBudget, anthropicMinThinkingBudget)
+			switch {
+			case out.MaxTokens <= 0:
+				out.MaxTokens = budget + anthropicDefaultMaxTokens
+			case budget >= out.MaxTokens:
+				return nil, &ConfigError{Msg: fmt.Sprintf("Anthropic ThinkingBudget %d must be below MaxTokens %d", budget, out.MaxTokens)}
+			}
+			out.Thinking = &anThinking{Type: "enabled", BudgetTokens: budget}
+			legacyThinking = true
+		} else {
+			// Adaptive thinking; the preset level selects the effort.
+			if out.MaxTokens <= 0 {
+				out.MaxTokens = anthropicAdaptiveMaxTokens
+			}
+			out.Thinking = &anThinking{Type: "adaptive"}
+			if req.Thinking != "enabled" {
+				out.OutputConfig = &anOutputConfig{Effort: req.Thinking}
 			}
 		}
-		out.Thinking = &anThinking{Type: "enabled", BudgetTokens: budget}
-		// Extended thinking rejects modified sampling; the provider default
+		// Thinking rejects modified sampling; the provider default
 		// is the only accepted value.
-		out.Temperature, out.TopP = nil, nil
+		out.Temperature, out.TopP, out.TopK = nil, nil, nil
 	}
 	if out.MaxTokens <= 0 {
 		out.MaxTokens = anthropicDefaultMaxTokens
@@ -237,23 +269,48 @@ func buildAnthropicRequest(req *ChatRequest, model string, stream bool) ([]byte,
 		}
 		out.Tools = append(out.Tools, tool)
 	}
-	if err := anthropicToolControls(req, &out, out.Thinking != nil); err != nil {
+	if !q.AnthropicToolJSON && req.ResponseFormat.jsonMode() {
+		schema := req.ResponseFormat.Schema
+		if len(schema) == 0 {
+			schema = json.RawMessage(`{"type":"object"}`)
+		}
+		if out.OutputConfig == nil {
+			out.OutputConfig = &anOutputConfig{}
+		}
+		out.OutputConfig.Format = &anOutputFormat{Type: "json_schema", Schema: schema}
+	}
+	if err := anthropicToolControls(req, &out, legacyThinking, out.Thinking != nil, q.AnthropicToolJSON); err != nil {
 		return nil, err
 	}
 
 	// Messages. Hard edges:
 	//   - consecutive tool messages merge into ONE user message carrying
 	//     multiple tool_result blocks;
-	//   - empty assistant turns synthesize a placeholder text block
-	//     (Anthropic rejects empty content arrays).
+	//   - an assistant turn with nothing to replay is dropped (Anthropic
+	//     rejects empty and whitespace-only text blocks); the user turns
+	//     around it merge so role alternation still holds.
+	dropped := false
+	appendMsg := func(role string, blocks []anBlock) {
+		if n := len(out.Messages); dropped && role == "user" && n > 0 && out.Messages[n-1].Role == "user" {
+			out.Messages[n-1].Content = append(out.Messages[n-1].Content, blocks...)
+		} else {
+			out.Messages = append(out.Messages, anMessage{Role: role, Content: blocks})
+		}
+		dropped = false
+	}
 	for i := 0; i < len(req.Messages); i++ {
 		m := req.Messages[i]
 		switch m.Role {
 		case RoleSystem:
-			out.System = append(out.System, anSysBlock{Type: "text", Text: m.Content})
+			if m.Content != "" {
+				out.System = append(out.System, anSysBlock{Type: "text", Text: m.Content})
+			}
 		case RoleUser:
 			blocks := make([]anBlock, 0, maxInt(1, len(m.Parts)))
 			if len(m.Parts) == 0 {
+				if m.Content == "" {
+					return nil, &ConfigError{Msg: fmt.Sprintf("message %d: user message has no content", i)}
+				}
 				blocks = append(blocks, anBlock{Type: "text", Text: m.Content})
 			} else {
 				blocks = append(blocks, anthropicPartBlocks(m.Parts)...)
@@ -261,7 +318,7 @@ func buildAnthropicRequest(req *ChatRequest, model string, stream bool) ([]byte,
 			if m.Cache && len(blocks) > 0 && blocks[0].Type == "text" {
 				blocks[0].CacheControl = &anCacheControl{Type: "ephemeral"}
 			}
-			out.Messages = append(out.Messages, anMessage{Role: "user", Content: blocks})
+			appendMsg("user", blocks)
 		case RoleAssistant:
 			blocks, err := anthropicThinkingReplay(m, i)
 			if err != nil {
@@ -289,9 +346,10 @@ func buildAnthropicRequest(req *ChatRequest, model string, stream bool) ([]byte,
 				})
 			}
 			if len(blocks) == 0 {
-				blocks = []anBlock{{Type: "text", Text: " "}} // placeholder
+				dropped = true
+				continue
 			}
-			out.Messages = append(out.Messages, anMessage{Role: "assistant", Content: blocks})
+			appendMsg("assistant", blocks)
 		case RoleTool:
 			// Merge the run of consecutive tool messages.
 			var results []anBlock
@@ -306,7 +364,7 @@ func buildAnthropicRequest(req *ChatRequest, model string, stream bool) ([]byte,
 				results = append(results, tr)
 			}
 			i-- // outer loop increment
-			out.Messages = append(out.Messages, anMessage{Role: "user", Content: results})
+			appendMsg("user", results)
 		}
 	}
 
@@ -333,10 +391,18 @@ type anUsage struct {
 	CacheReadTokens     int `json:"cache_read_input_tokens"`
 }
 
+type anStopDetails struct {
+	Explanation string `json:"explanation"`
+}
+
 type anResponse struct {
+	ID         string        `json:"id"`
+	Model      string        `json:"model"`
 	Content    []anRespBlock `json:"content"`
 	StopReason string        `json:"stop_reason"`
-	Usage      anUsage       `json:"usage"`
+	// StopDetails.Explanation is the refusal explanation, when present.
+	StopDetails anStopDetails `json:"stop_details"`
+	Usage       anUsage       `json:"usage"`
 }
 
 // usageFromAnthropic maps Messages API usage onto canonical Usage.
@@ -385,7 +451,10 @@ func parseAnthropicResponse(body []byte) (*ChatResult, error) {
 	if len(r.Content) == 0 && r.StopReason == "" {
 		return nil, fmt.Errorf("llm: response has no content blocks")
 	}
-	res := &ChatResult{FinishReason: mapAnthropicStopReason(r.StopReason)}
+	res := &ChatResult{FinishReason: mapAnthropicStopReason(r.StopReason), Meta: ResponseMeta{ID: r.ID, Model: r.Model}}
+	if r.StopReason == "refusal" {
+		res.Refusal = r.StopDetails.Explanation
+	}
 	var content, thinking []string
 	for _, b := range r.Content {
 		switch b.Type {
@@ -422,6 +491,8 @@ type anStreamEvent struct {
 	Type string `json:"type"`
 	// message_start
 	Message struct {
+		ID    string  `json:"id"`
+		Model string  `json:"model"`
 		Usage anUsage `json:"usage"`
 	} `json:"message"`
 	// content_block_start / content_block_stop
@@ -431,20 +502,18 @@ type anStreamEvent struct {
 	// delta and usage as top-level siblings, not nested under a
 	// "message_delta" key.
 	Delta struct {
-		Type        string `json:"type"` // "text_delta" | "thinking_delta" | "signature_delta" | "input_json_delta"
-		StopReason  string `json:"stop_reason"`
-		Text        string `json:"text"`
-		Thinking    string `json:"thinking"`
-		Signature   string `json:"signature"`
-		PartialJSON string `json:"partial_json"`
+		Type        string        `json:"type"` // "text_delta" | "thinking_delta" | "signature_delta" | "input_json_delta"
+		StopReason  string        `json:"stop_reason"`
+		StopDetails anStopDetails `json:"stop_details"`
+		Text        string        `json:"text"`
+		Thinking    string        `json:"thinking"`
+		Signature   string        `json:"signature"`
+		PartialJSON string        `json:"partial_json"`
 	} `json:"delta"`
 	// message_delta usage (top-level sibling of delta)
 	Usage anUsage `json:"usage"` // message_delta: cumulative counts
 	// error
-	Error *struct {
-		Type    string `json:"type"`
-		Message string `json:"message"`
-	} `json:"error"`
+	Error json.RawMessage `json:"error"` // see streamErrorMessage
 }
 
 // mapAnthropicStreamEvent folds one Anthropic SSE payload into acc.
@@ -456,6 +525,7 @@ func mapAnthropicStreamEvent(data []byte, acc *streamAccum) ([]Delta, bool, erro
 	var deltas []Delta
 	switch ev.Type {
 	case "message_start":
+		acc.noteMeta(ev.Message.ID, ev.Message.Model)
 		acc.usage = usageFromAnthropic(ev.Message.Usage)
 	case "content_block_start":
 		switch ev.ContentBlock.Type {
@@ -496,6 +566,7 @@ func mapAnthropicStreamEvent(data []byte, acc *streamAccum) ([]Delta, bool, erro
 		case "input_json_delta":
 			if acc.jsonTool != "" && ev.Index == acc.jsonBlock {
 				acc.content.WriteString(ev.Delta.PartialJSON)
+				acc.jsonWritten = acc.jsonWritten || ev.Delta.PartialJSON != ""
 				deltas = append(deltas, Delta{Kind: DeltaContent, Text: ev.Delta.PartialJSON})
 				break
 			}
@@ -510,6 +581,10 @@ func mapAnthropicStreamEvent(data []byte, acc *streamAccum) ([]Delta, bool, erro
 			})
 		}
 	case "message_delta":
+		if ev.Delta.StopReason == "refusal" && ev.Delta.StopDetails.Explanation != "" && acc.refusal.Len() == 0 {
+			acc.refusal.WriteString(ev.Delta.StopDetails.Explanation)
+			deltas = append(deltas, Delta{Kind: DeltaRefusal, Text: ev.Delta.StopDetails.Explanation})
+		}
 		if ev.Delta.StopReason != "" {
 			acc.finishReason = mapAnthropicStopReason(ev.Delta.StopReason)
 			acc.sawFinish = true
@@ -538,8 +613,8 @@ func mapAnthropicStreamEvent(data []byte, acc *streamAccum) ([]Delta, bool, erro
 		return deltas, true, nil
 	case "error":
 		msg := "provider stream error"
-		if ev.Error != nil && ev.Error.Message != "" {
-			msg = ev.Error.Message
+		if m, ok := streamErrorMessage(ev.Error); ok && m != "stream error" {
+			msg = m
 		}
 		return deltas, false, fmt.Errorf("llm: %s", msg)
 	case "ping", "content_block_stop":
@@ -586,8 +661,11 @@ func listModelsAnthropic(ctx context.Context, pc *providerClient) ([]Model, erro
 			}
 			out = append(out, mm)
 		}
-		if !p.HasMore || p.LastID == "" {
+		if !p.HasMore {
 			return out, nil
+		}
+		if p.LastID == "" {
+			return nil, terminal(errors.New("llm: anthropic models: has_more without last_id (cannot page; refusing a partial listing)"))
 		}
 		pageID = p.LastID
 	}

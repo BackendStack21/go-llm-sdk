@@ -30,10 +30,15 @@ type gmFnResp struct {
 type gmPart struct {
 	Text             string    `json:"text,omitempty"`
 	InlineData       *gmBlob   `json:"inlineData,omitempty"`
+	FileData         *gmFile   `json:"fileData,omitempty"`
 	Thought          bool      `json:"thought,omitempty"`
 	FunctionCall     *gmFnCall `json:"functionCall,omitempty"`
 	FunctionResponse *gmFnResp `json:"functionResponse,omitempty"`
 	ThoughtSignature string    `json:"thoughtSignature,omitempty"`
+}
+type gmFile struct {
+	FileURI  string `json:"fileUri"`
+	MIMEType string `json:"mimeType"`
 }
 type gmBlob struct {
 	MIMEType string `json:"mimeType"`
@@ -48,7 +53,7 @@ type gmContent struct {
 type gmFnDecl struct {
 	Name        string          `json:"name"`
 	Description string          `json:"description,omitempty"`
-	Parameters  json.RawMessage `json:"parameters,omitempty"`
+	Parameters  json.RawMessage `json:"parametersJsonSchema,omitempty"` // JSON Schema, not the restricted OpenAPI `parameters`
 }
 
 type gmToolGroup struct {
@@ -64,6 +69,7 @@ type gmGenCfg struct {
 	MaxOutputTokens    int             `json:"maxOutputTokens,omitempty"`
 	Temperature        *float64        `json:"temperature,omitempty"`
 	TopP               *float64        `json:"topP,omitempty"`
+	TopK               *int            `json:"topK,omitempty"`
 	StopSequences      []string        `json:"stopSequences,omitempty"`
 	ThinkingConfig     *gmThinkCfg     `json:"thinkingConfig,omitempty"`
 	Seed               *int            `json:"seed,omitempty"`
@@ -128,6 +134,13 @@ func mustJSONString(s string) string {
 	return string(b)
 }
 
+// geminiModelPath returns the model as a single safe URL path segment: a
+// leading "models/" (as ListModels echoes ids) is stripped and the rest is
+// escaped so an id can never rewrite the path or smuggle a query.
+func geminiModelPath(model string) string {
+	return neturl.PathEscape(strings.TrimPrefix(model, "models/"))
+}
+
 // buildGeminiRequest renders the canonical request in Gemini format.
 func buildGeminiRequest(req *ChatRequest, model string, stream bool) ([]byte, error) {
 	_ = model // rides the URL path
@@ -138,10 +151,12 @@ func buildGeminiRequest(req *ChatRequest, model string, stream bool) ([]byte, er
 	// System: canonical blocks + in-band system messages → systemInstruction.
 	var sysParts []gmPart
 	for _, b := range req.System {
-		sysParts = append(sysParts, gmPart{Text: b.Text})
+		if b.Text != "" { // an empty part is rejected by Gemini
+			sysParts = append(sysParts, gmPart{Text: b.Text})
+		}
 	}
 	for _, m := range req.Messages {
-		if m.Role == RoleSystem {
+		if m.Role == RoleSystem && m.Content != "" {
 			sysParts = append(sysParts, gmPart{Text: m.Content})
 		}
 	}
@@ -158,14 +173,21 @@ func buildGeminiRequest(req *ChatRequest, model string, stream bool) ([]byte, er
 		case RoleUser:
 			parts := make([]gmPart, 0, maxInt(1, len(m.Parts)))
 			if len(m.Parts) == 0 {
+				if m.Content == "" {
+					return nil, &ConfigError{Msg: fmt.Sprintf("message %d: user message has no content", i)}
+				}
 				parts = append(parts, gmPart{Text: m.Content})
 			} else {
 				for _, p := range m.Parts {
-					if p.Type == ContentPartImage {
-						parts = append(parts, gmPart{InlineData: &gmBlob{MIMEType: wireMIME(p.MIMEType), Data: base64.StdEncoding.EncodeToString(p.Image)}})
-					} else {
+					if p.Type == ContentPartText {
 						parts = append(parts, gmPart{Text: p.Text})
+						continue
 					}
+					gp, err := geminiAttachment(p)
+					if err != nil {
+						return nil, err
+					}
+					parts = append(parts, gp)
 				}
 			}
 			out.Contents = append(out.Contents, gmContent{Role: "user", Parts: parts})
@@ -218,8 +240,12 @@ func buildGeminiRequest(req *ChatRequest, model string, stream bool) ([]byte, er
 					FunctionResponse: &gmFnResp{Name: name, Response: resp},
 				})
 				// Images from the tool ride the same user turn as inlineData.
-				for _, p := range imageParts(tm) {
-					images = append(images, gmPart{InlineData: &gmBlob{MIMEType: wireMIME(p.MIMEType), Data: base64.StdEncoding.EncodeToString(p.Image)}})
+				for _, p := range attachmentParts(tm) {
+					gp, err := geminiAttachment(p)
+					if err != nil {
+						return nil, err
+					}
+					images = append(images, gp)
 				}
 			}
 			parts = append(parts, images...)
@@ -256,6 +282,10 @@ func buildGeminiRequest(req *ChatRequest, model string, stream bool) ([]byte, er
 		}
 		cfg.TopP = &p
 	}
+	if req.TopK > 0 {
+		k := req.TopK
+		cfg.TopK = &k
+	}
 	if tc := geminiThinkingConfig(req.Thinking, req.ThinkingBudget); tc != nil {
 		cfg.ThinkingConfig = tc
 	}
@@ -270,7 +300,7 @@ func buildGeminiRequest(req *ChatRequest, model string, stream bool) ([]byte, er
 		}
 	}
 	out.ToolConfig = geminiToolConfig(req.ToolChoice)
-	if cfg.MaxOutputTokens != 0 || cfg.Temperature != nil || cfg.TopP != nil ||
+	if cfg.MaxOutputTokens != 0 || cfg.Temperature != nil || cfg.TopP != nil || cfg.TopK != nil ||
 		len(cfg.StopSequences) > 0 || cfg.ThinkingConfig != nil || cfg.Seed != nil ||
 		cfg.ResponseMimeType != "" {
 		out.GenerationConfig = &cfg
@@ -313,6 +343,8 @@ type gmPromptFeedback struct {
 }
 
 type gmResponse struct {
+	ResponseID     string            `json:"responseId"`
+	ModelVersion   string            `json:"modelVersion"`
 	Candidates     []gmCandidate     `json:"candidates"`
 	UsageMetadata  gmUsage           `json:"usageMetadata"`
 	PromptFeedback *gmPromptFeedback `json:"promptFeedback"`
@@ -325,7 +357,8 @@ func mapGeminiFinishReason(s string) string {
 		return FinishStop
 	case "MAX_TOKENS":
 		return FinishLength
-	case "SAFETY", "RECITATION", "BLOCKLIST", "PROHIBITED_CONTENT", "SPII":
+	case "SAFETY", "RECITATION", "BLOCKLIST", "PROHIBITED_CONTENT", "SPII",
+		"IMAGE_SAFETY", "IMAGE_PROHIBITED_CONTENT", "IMAGE_RECITATION":
 		return FinishContentFilter
 	case "":
 		return ""
@@ -419,13 +452,14 @@ func parseGeminiResponse(body []byte) (*ChatResult, error) {
 	if len(r.Candidates) == 0 {
 		if r.PromptFeedback != nil && r.PromptFeedback.BlockReason != "" {
 			// A blocked prompt is a completed, filtered turn.
-			return &ChatResult{FinishReason: FinishContentFilter, Usage: mapGeminiUsage(r.UsageMetadata)}, nil
+			return &ChatResult{FinishReason: FinishContentFilter, Usage: mapGeminiUsage(r.UsageMetadata), Meta: ResponseMeta{ID: r.ResponseID, Model: r.ModelVersion}}, nil
 		}
 		return nil, fmt.Errorf("llm: response has no candidates")
 	}
 	acc := newStreamAccum()
 	c := r.Candidates[0]
 	foldGeminiParts(c.Content.Parts, acc)
+	acc.noteMeta(r.ResponseID, r.ModelVersion)
 	res := acc.result()
 	res.FinishReason = geminiFinish(c.FinishReason, len(res.ToolCalls) > 0)
 	res.Usage = mapGeminiUsage(r.UsageMetadata)
@@ -435,9 +469,12 @@ func parseGeminiResponse(body []byte) (*ChatResult, error) {
 // ── streaming ────────────────────────────────────────────────────────────
 
 type gmStreamChunk struct {
+	ResponseID     string            `json:"responseId"`
+	ModelVersion   string            `json:"modelVersion"`
 	Candidates     []gmCandidate     `json:"candidates"`
 	PromptFeedback *gmPromptFeedback `json:"promptFeedback"`
 	UsageMetadata  *gmUsage          `json:"usageMetadata"` // nil = chunk carries no usage update
+	Error          json.RawMessage   `json:"error"`         // see streamErrorMessage
 }
 
 // mapGeminiStreamEvent folds one Gemini SSE chunk into acc. Chunks carry
@@ -448,6 +485,10 @@ func mapGeminiStreamEvent(data []byte, acc *streamAccum) ([]Delta, bool, error) 
 	if err := json.Unmarshal(data, &c); err != nil {
 		return nil, false, fmt.Errorf("llm: parse stream chunk: %w", err)
 	}
+	if msg, ok := streamErrorMessage(c.Error); ok {
+		return nil, false, fmt.Errorf("llm: provider error: %s", msg)
+	}
+	acc.noteMeta(c.ResponseID, c.ModelVersion)
 	if c.UsageMetadata != nil {
 		acc.usage = mapGeminiUsage(*c.UsageMetadata)
 	}
@@ -517,4 +558,18 @@ func listModelsGemini(ctx context.Context, pc *providerClient) ([]Model, error) 
 		pageToken = p.NextPageToken
 	}
 	return nil, fmt.Errorf("%w (%d pages)", ErrModelListTruncated, maxModelPages)
+}
+
+// geminiAttachment renders an image, image-URL or document part.
+func geminiAttachment(p ContentPart) (gmPart, error) {
+	switch p.Type {
+	case ContentPartImageURL:
+		if p.MIMEType == "" {
+			return gmPart{}, &ConfigError{Msg: "Gemini image URL parts require a MIME type (use ImageURLPartMIME or WithMIME)"}
+		}
+		return gmPart{FileData: &gmFile{FileURI: p.URL, MIMEType: canonMIME(p.MIMEType)}}, nil
+	case ContentPartDocument:
+		return gmPart{InlineData: &gmBlob{MIMEType: canonMIME(p.MIMEType), Data: base64.StdEncoding.EncodeToString(p.Data)}}, nil
+	}
+	return gmPart{InlineData: &gmBlob{MIMEType: wireMIME(p.MIMEType), Data: base64.StdEncoding.EncodeToString(p.Image)}}, nil
 }

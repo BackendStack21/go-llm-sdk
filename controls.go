@@ -20,6 +20,9 @@ var schemaNameRE = regexp.MustCompile(`^[A-Za-z0-9_-]{1,64}$`)
 const defaultSchemaName = "response"
 
 func validateRequestControls(req *ChatRequest) error {
+	if req.TopK < 0 {
+		return &ConfigError{Msg: "TopK must not be negative"}
+	}
 	if tc := req.ToolChoice; tc != nil {
 		if len(req.Tools) == 0 {
 			return &ConfigError{Msg: "ToolChoice requires Tools"}
@@ -189,15 +192,16 @@ func anthropicJSONToolName(req *ChatRequest) string {
 }
 
 // anthropicToolControls appends the JSON-mode tool when requested and
-// renders tool_choice. thinking reports extended thinking, which rejects
-// forced tool use.
-func anthropicToolControls(req *ChatRequest, out *anRequest, thinking bool) error {
+// renders tool_choice. thinking reports legacy budget thinking, which rejects
+// forced tool use (adaptive thinking accepts it). anyThinking (either mode)
+// guards the emulated JSON tool, matching the pre-M4 behaviour.
+func anthropicToolControls(req *ChatRequest, out *anRequest, thinking, anyThinking, emulateJSON bool) error {
 	var choice *anToolChoice
-	if name := anthropicJSONToolName(req); name != "" {
+	if name := anthropicJSONToolName(req); emulateJSON && name != "" {
 		switch {
 		case req.ToolChoice != nil:
 			return &ConfigError{Msg: "Anthropic JSON ResponseFormat forces its own tool; it cannot be combined with ToolChoice"}
-		case thinking:
+		case anyThinking:
 			return &ConfigError{Msg: "Anthropic JSON ResponseFormat forces tool use, which extended thinking rejects"}
 		case len(req.Tools) > 0:
 			// The forced JSON tool would make every user tool uncallable.
@@ -227,7 +231,7 @@ func anthropicToolControls(req *ChatRequest, out *anRequest, thinking bool) erro
 			choice = &anToolChoice{Type: "tool", Name: tc.Name}
 		}
 		if thinking && (choice.Type == "any" || choice.Type == "tool") {
-			return &ConfigError{Msg: "Anthropic extended thinking rejects forced tool use (ToolChoice required/tool)"}
+			return &ConfigError{Msg: "Anthropic extended thinking with ThinkingBudget rejects forced tool use (ToolChoice required/tool)"}
 		}
 	}
 	if p := req.ParallelToolCalls; p != nil && !*p && len(out.Tools) > 0 && (choice == nil || choice.Type != "none") {

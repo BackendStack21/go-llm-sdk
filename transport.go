@@ -60,5 +60,10 @@ func sameHostRedirect(req *http.Request, via []*http.Request) error {
 	if len(via) >= 10 || req.URL.Host != via[0].URL.Host {
 		return http.ErrUseLastResponse
 	}
+	// Never downgrade https -> http: that would resend credentials in
+	// plaintext.
+	if via[0].URL.Scheme == "https" && req.URL.Scheme != "https" {
+		return http.ErrUseLastResponse
+	}
 	return nil
 }

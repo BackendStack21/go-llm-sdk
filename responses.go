@@ -1,6 +1,7 @@
 package llm
 
 import (
+	"bytes"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
@@ -36,6 +37,8 @@ type rsInputContentPart struct {
 	Type     string `json:"type"`
 	Text     string `json:"text,omitempty"`
 	ImageURL string `json:"image_url,omitempty"`
+	Filename string `json:"filename,omitempty"`
+	FileData string `json:"file_data,omitempty"`
 }
 
 func responsesContent(m Message) any {
@@ -44,9 +47,14 @@ func responsesContent(m Message) any {
 	}
 	parts := make([]rsInputContentPart, 0, len(m.Parts))
 	for _, p := range m.Parts {
-		if p.Type == ContentPartImage {
+		switch p.Type {
+		case ContentPartImage:
 			parts = append(parts, rsInputContentPart{Type: "input_image", ImageURL: "data:" + wireMIME(p.MIMEType) + ";base64," + base64.StdEncoding.EncodeToString(p.Image)})
-		} else {
+		case ContentPartImageURL:
+			parts = append(parts, rsInputContentPart{Type: "input_image", ImageURL: p.URL})
+		case ContentPartDocument:
+			parts = append(parts, rsInputContentPart{Type: "input_file", Filename: documentName(p), FileData: "data:application/pdf;base64," + base64.StdEncoding.EncodeToString(p.Data)})
+		default:
 			parts = append(parts, rsInputContentPart{Type: "input_text", Text: p.Text})
 		}
 	}
@@ -278,8 +286,9 @@ func buildResponsesInput(req *ChatRequest) (instructions string, input []any) {
 // ── response ─────────────────────────────────────────────────────────────
 
 type rsContentPart struct {
-	Type string `json:"type"`
-	Text string `json:"text"`
+	Type    string `json:"type"`
+	Text    string `json:"text"`
+	Refusal string `json:"refusal"`
 }
 
 type rsOutputItem struct {
@@ -310,7 +319,19 @@ type rsErrorBody struct {
 	Code    string `json:"code"`
 }
 
+// UnmarshalJSON tolerates a non-object "error" value ("", false, 0): it is
+// not a provider error and must not fail an otherwise-good response.
+func (e *rsErrorBody) UnmarshalJSON(b []byte) error {
+	if b = bytes.TrimSpace(b); len(b) == 0 || b[0] != '{' {
+		return nil
+	}
+	type plain rsErrorBody
+	return json.Unmarshal(b, (*plain)(e))
+}
+
 type rsResponse struct {
+	ID                string `json:"id"`
+	Model             string `json:"model"`
 	Status            string `json:"status"`
 	IncompleteDetails *struct {
 		Reason string `json:"reason"`
@@ -343,7 +364,7 @@ func usageFromResponses(u *rsUsage) Usage {
 }
 
 func chatResultFromResponses(r *rsResponse) *ChatResult {
-	res := &ChatResult{}
+	res := &ChatResult{Meta: ResponseMeta{ID: r.ID, Model: r.Model}}
 	var summaries []string
 	for _, item := range r.Output {
 		switch item.Type {
@@ -364,17 +385,24 @@ func chatResultFromResponses(r *rsResponse) *ChatResult {
 				if p.Type == "output_text" && p.Text != "" {
 					res.Content += p.Text
 				}
+				if p.Type == "refusal" {
+					res.Refusal += p.Refusal
+				}
 			}
 		case "function_call":
+			args := item.Arguments
+			if args == "" {
+				args = "{}"
+			}
 			res.ToolCalls = append(res.ToolCalls, ToolCall{
 				ID:        item.CallID,
 				Name:      item.Name,
-				Arguments: item.Arguments,
+				Arguments: args,
 			})
 		}
 	}
 	res.ReasoningContent = strings.Join(summaries, "\n")
-	res.FinishReason = responsesFinishReason(r, len(res.ToolCalls) > 0)
+	res.FinishReason = refusalFinish(responsesFinishReason(r, len(res.ToolCalls) > 0), res.Refusal)
 	if r.Usage != nil {
 		res.Usage = usageFromResponses(r.Usage)
 	}
@@ -404,6 +432,9 @@ func responsesFinishReason(r *rsResponse, hasTools bool) string {
 			return FinishContentFilter
 		case strings.Contains(reason, "max_output"):
 			return FinishLength
+		}
+		if reason != "" {
+			return "" // unrecognised incomplete reason stays unmapped
 		}
 		if hasTools {
 			return FinishToolCalls
@@ -462,6 +493,9 @@ func mapResponsesStreamEvent(data []byte, acc *streamAccum) (deltas []Delta, don
 	if err := json.Unmarshal(data, &ev); err != nil {
 		return nil, false, fmt.Errorf("llm: parse responses stream: %w", err)
 	}
+	if ev.Response != nil {
+		acc.noteMeta(ev.Response.ID, ev.Response.Model)
+	}
 	switch ev.Type {
 	case "response.reasoning_summary_text.delta":
 		if ev.Delta != "" {
@@ -472,6 +506,11 @@ func mapResponsesStreamEvent(data []byte, acc *streamAccum) (deltas []Delta, don
 		if ev.Delta != "" {
 			acc.content.WriteString(ev.Delta)
 			deltas = append(deltas, Delta{Kind: DeltaContent, Text: ev.Delta})
+		}
+	case "response.refusal.delta":
+		if ev.Delta != "" {
+			acc.refusal.WriteString(ev.Delta)
+			deltas = append(deltas, Delta{Kind: DeltaRefusal, Text: ev.Delta})
 		}
 	case "response.function_call_arguments.delta":
 		call := acc.call(ev.OutputIndex)

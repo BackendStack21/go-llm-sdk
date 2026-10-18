@@ -25,10 +25,11 @@ import (
 
 // SpeakRequest describes one text-to-speech conversion.
 type SpeakRequest struct {
-	Text   string  // required, non-empty
-	Voice  string  // provider voice id (no fallback tables — invariant #5)
-	Format string  // container for OpenAI-compat providers ("mp3" default)
-	Speed  float64 // optional playback speed, OpenAI-compat only (0 = omit)
+	Headers map[string]string // per-request headers (SL03)
+	Text    string            // required, non-empty
+	Voice   string            // provider voice id (no fallback tables — invariant #5)
+	Format  string            // container for OpenAI-compat providers ("mp3" default)
+	Speed   float64           // optional playback speed, OpenAI-compat only (0 = omit)
 }
 
 // SpeakResult carries the synthesized audio.
@@ -36,6 +37,7 @@ type SpeakResult struct {
 	Audio    []byte // raw audio bytes as the provider returned them
 	Model    string // model that produced the audio
 	MIMEType string // provider-declared (or well-known default) MIME type
+	Meta     ResponseMeta
 }
 
 // Speak synthesizes speech with the named provider and model. Buffered
@@ -90,17 +92,22 @@ func (pc *providerClient) buildSpeakRequest(model string, req SpeakRequest) ([]b
 // ladder and whole-call budget of the buffered chat path (binary body, no
 // SSE).
 func (pc *providerClient) speak(ctx context.Context, model string, req SpeakRequest) (*SpeakResult, error) {
+	ctx, herr := withReqHeaders(ctx, req.Headers)
+	if herr != nil {
+		return nil, herr
+	}
 	body, url, mimeHint, err := pc.buildSpeakRequest(model, req)
 	if err != nil {
 		return nil, err
 	}
 	gemini := pc.cfg.Format == FormatGemini
 
+	ctx = pc.withAttempts(ctx, "speak", model)
 	ctx, cancel := context.WithTimeout(ctx, pc.requestTimeout())
 	defer cancel()
 	var res *SpeakResult
 	err = pc.withRetry(ctx, func() (time.Duration, error) {
-		data, ctype, ra, err := pc.postAudio(ctx, url, body)
+		data, ctype, hdr, ra, err := pc.postAudio(ctx, url, body)
 		if err != nil {
 			return ra, err
 		}
@@ -128,6 +135,7 @@ func (pc *providerClient) speak(ctx context.Context, model string, req SpeakRequ
 			Audio:    data,
 			Model:    model,
 			MIMEType: resolveAudioMIME(ctype, mimeHint),
+			Meta:     parseResponseMeta(hdr),
 		}
 		return 0, nil
 	}, nil)
@@ -150,32 +158,32 @@ func resolveAudioMIME(ctype, fallback string) string {
 
 // postAudio sends one TTS request and reads the full binary body (capped).
 // Unlike post it captures the response Content-Type and never assumes JSON.
-func (pc *providerClient) postAudio(ctx context.Context, url string, body []byte) (data []byte, ctype string, ra time.Duration, err error) {
+func (pc *providerClient) postAudio(ctx context.Context, url string, body []byte) (data []byte, ctype string, hdr http.Header, ra time.Duration, err error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body))
 	if err != nil {
-		return nil, "", 0, &ConfigError{Msg: "build request: " + err.Error()}
+		return nil, "", nil, 0, &ConfigError{Msg: "build request: " + err.Error()}
 	}
 	req.Header.Set("Content-Type", "application/json")
-	pc.setHeaders(req.Header)
+	pc.setHeaders(req.Header, reqHeadersFrom(ctx))
 
-	resp, err := pc.buffered().Do(req)
+	resp, err := doObserved(ctx, pc.buffered(), req)
 	if err != nil {
-		return nil, "", 0, err
+		return nil, "", nil, 0, err
 	}
 	defer func() { _ = resp.Body.Close() }()
 	ctype = resp.Header.Get("Content-Type")
 	data, err = io.ReadAll(io.LimitReader(resp.Body, maxResponseSize+1))
 	if err != nil {
-		return nil, "", 0, err
+		return nil, "", nil, 0, err
 	}
 	if len(data) > maxResponseSize {
-		return nil, "", 0, fmt.Errorf("llm: audio response exceeds %d bytes", maxResponseSize)
+		return nil, "", nil, 0, terminal(fmt.Errorf("llm: audio response exceeds %d bytes", maxResponseSize))
 	}
 	ra = parseRetryAfter(resp.Header.Get("Retry-After"), time.Now())
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return nil, "", ra, pc.httpError(resp.StatusCode, data)
+		return nil, "", nil, ra, pc.httpError(resp.StatusCode, data)
 	}
-	return data, ctype, ra, nil
+	return data, ctype, resp.Header, ra, nil
 }
 
 // ── Gemini TTS wire types ────────────────────────────────────────────────
@@ -228,7 +236,7 @@ func buildGeminiSpeakRequest(base, model string, req SpeakRequest) ([]byte, stri
 		},
 	}
 	b, err := json.Marshal(greq)
-	return b, fmt.Sprintf("%s/v1beta/models/%s:generateContent", base, model), "", err
+	return b, fmt.Sprintf("%s/v1beta/models/%s:generateContent", base, geminiModelPath(model)), "", err
 }
 
 // parseGeminiSpeakResponse decodes a buffered Gemini TTS response.
