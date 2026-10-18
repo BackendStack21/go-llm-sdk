@@ -207,7 +207,11 @@ func (pc *providerClient) buildFormatBody(req *ChatRequest, model string, stream
 		if pc.cfg.Quirks.NoJSONSchema && req.ResponseFormat != nil && req.ResponseFormat.Type == ResponseJSONSchema {
 			return nil, "", &ConfigError{Msg: pc.cfg.ID + " supports ResponseFormat json_object only, not json_schema"}
 		}
-		if useResponsesAPI(pc.learn, pc.cfg.Format, model, req) {
+		useRS := useResponsesAPI(pc.learn, pc.cfg.Format, model, req)
+		if err := validateOpenAIFormatParts(req.Messages, useRS); err != nil {
+			return nil, "", err
+		}
+		if useRS {
 			body, err := json.Marshal(buildResponsesRequest(req, model, stream))
 			return body, pc.base + "/responses", err
 		}

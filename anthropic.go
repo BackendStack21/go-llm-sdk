@@ -32,6 +32,7 @@ type anBlock struct {
 	Type   string         `json:"type"` // "text" | "tool_use" | "tool_result"
 	Text   string         `json:"text,omitempty"`
 	Source *anImageSource `json:"source,omitempty"`
+	Title  string         `json:"title,omitempty"` // document
 	// CacheControl is set on user text blocks when Message.Cache is true.
 	CacheControl *anCacheControl `json:"cache_control,omitempty"`
 	// thinking / redacted_thinking (replayed assistant turns; they go
@@ -52,8 +53,9 @@ type anBlock struct {
 
 type anImageSource struct {
 	Type      string `json:"type"`
-	MediaType string `json:"media_type"`
-	Data      string `json:"data"`
+	MediaType string `json:"media_type,omitempty"`
+	Data      string `json:"data,omitempty"`
+	URL       string `json:"url,omitempty"`
 }
 
 type anMessage struct {
@@ -121,9 +123,18 @@ const anthropicAdaptiveMaxTokens = 16384
 func anthropicPartBlocks(parts []ContentPart) []anBlock {
 	blocks := make([]anBlock, 0, len(parts))
 	for _, p := range parts {
-		if p.Type == ContentPartImage {
+		switch p.Type {
+		case ContentPartImage:
 			blocks = append(blocks, anBlock{Type: "image", Source: &anImageSource{Type: "base64", MediaType: wireMIME(p.MIMEType), Data: base64.StdEncoding.EncodeToString(p.Image)}})
-		} else {
+		case ContentPartImageURL:
+			blocks = append(blocks, anBlock{Type: "image", Source: &anImageSource{Type: "url", URL: p.URL}})
+		case ContentPartDocument:
+			src := &anImageSource{Type: "base64", MediaType: p.MIMEType, Data: base64.StdEncoding.EncodeToString(p.Data)}
+			if p.MIMEType == "text/plain" {
+				src = &anImageSource{Type: "text", MediaType: p.MIMEType, Data: string(p.Data)}
+			}
+			blocks = append(blocks, anBlock{Type: "document", Source: src, Title: p.Name})
+		default:
 			blocks = append(blocks, anBlock{Type: "text", Text: p.Text})
 		}
 	}

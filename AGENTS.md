@@ -57,7 +57,7 @@ The canonical type system is OpenAI-shaped; `gemini.go`/`anthropic.go` translate
 9. **`Usage` has one meaning everywhere**: `PromptTokens` uncached-only, cache reads/writes in their fields (a DeepSeek miss is uncached input, not a write), `CompletionTokens` includes reasoning, `CachedTokens` is a diagnostic subset never summed.
 10. **The request timeout is a whole-call budget**, retries included, on every entry point (buffered, streaming, speech, transcription, embeddings).
 11. **Meta fields are provider-reported or zero, never guessed**; headers come from the successful attempt only. Attempt-observer panics are recovered and discarded; events never contain the API key.
-11. **Anthropic JSON mode is native `output_config.format`** unless the explicit registry quirk `Quirks.AnthropicToolJSON` is on (off for the built-in provider, set via `WithQuirks`); the quirk restores the pre-M4 forced-tool emulation byte-for-byte, including its ConfigErrors (also under any thinking mode). Never infer it from URL or model name.
+12. **Anthropic JSON mode is native `output_config.format`** unless the explicit registry quirk `Quirks.AnthropicToolJSON` is on (off for the built-in provider, set via `WithQuirks`); the quirk restores the pre-M4 forced-tool emulation byte-for-byte, including its ConfigErrors (also under any thinking mode). Never infer it from URL or model name.
 
 ## Testing conventions
 

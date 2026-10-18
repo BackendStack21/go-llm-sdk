@@ -60,15 +60,26 @@ type oaContentPart struct {
 	Type     string      `json:"type"`
 	Text     string      `json:"text,omitempty"`
 	ImageURL *oaImageURL `json:"image_url,omitempty"`
+	File     *oaFile     `json:"file,omitempty"`
+}
+
+type oaFile struct {
+	Filename string `json:"filename"`
+	FileData string `json:"file_data"`
 }
 
 // openAIContent renders ordered content parts as chat-completions parts.
 func openAIContent(m Message) []oaContentPart {
 	parts := make([]oaContentPart, 0, len(m.Parts))
 	for _, p := range m.Parts {
-		if p.Type == ContentPartImage {
+		switch p.Type {
+		case ContentPartImage:
 			parts = append(parts, oaContentPart{Type: "image_url", ImageURL: &oaImageURL{URL: "data:" + wireMIME(p.MIMEType) + ";base64," + base64.StdEncoding.EncodeToString(p.Image)}})
-		} else {
+		case ContentPartImageURL:
+			parts = append(parts, oaContentPart{Type: "image_url", ImageURL: &oaImageURL{URL: p.URL}})
+		case ContentPartDocument:
+			parts = append(parts, oaContentPart{Type: "file", File: &oaFile{Filename: documentName(p), FileData: "data:application/pdf;base64," + base64.StdEncoding.EncodeToString(p.Data)}})
+		default:
 			parts = append(parts, oaContentPart{Type: "text", Text: p.Text})
 		}
 	}
@@ -165,7 +176,7 @@ func buildOpenAIRequest(cfg ProviderConfig, req *ChatRequest, model string, stre
 				c = "(image result attached below)" // some providers reject empty tool content
 			}
 			msgs = append(msgs, oaMessage{Role: "tool", Content: &c, ToolCallID: m.ToolCallID})
-			if imgs := imageParts(m); len(imgs) > 0 {
+			if imgs := imageLikeParts(m); len(imgs) > 0 {
 				toolImages = append(toolImages, TextPart("Images returned by tool call "+m.ToolCallID+":"))
 				toolImages = append(toolImages, imgs...)
 			}

@@ -28,6 +28,10 @@ type ContentPartType string
 const (
 	ContentPartText  ContentPartType = "text"
 	ContentPartImage ContentPartType = "image"
+	// ContentPartDocument is an inline document (PDF or plain text).
+	ContentPartDocument ContentPartType = "document"
+	// ContentPartImageURL is an image the provider fetches by URL.
+	ContentPartImageURL ContentPartType = "image_url"
 )
 
 // ContentPart is one ordered text or inline-image segment in a message.
@@ -39,16 +43,41 @@ type ContentPart struct {
 	Text     string
 	Image    []byte
 	MIMEType string
+	// Data is the document payload (ContentPartDocument).
+	Data []byte
+	// Name is the optional document filename.
+	Name string
+	// URL is the remote image location (ContentPartImageURL).
+	URL string
 }
 
 const MaxImageBytes = 10 << 20
 
-// TextPart creates an ordered text content part.
-func TextPart(text string) ContentPart { return ContentPart{Type: ContentPartText, Text: text} }
+// MaxDocumentBytes bounds one inline document part.
+const MaxDocumentBytes = 20 << 20
 
-// ImagePart creates an ordered inline-image content part.
-func ImagePart(mimeType string, data []byte) ContentPart {
-	return ContentPart{Type: ContentPartImage, Image: data, MIMEType: mimeType}
+// DocumentPart creates an inline document part (application/pdf or
+// text/plain). Name is an optional filename.
+func DocumentPart(mimeType string, data []byte, name string) ContentPart {
+	return ContentPart{Type: ContentPartDocument, MIMEType: mimeType, Data: data, Name: name}
+}
+
+// ImageURLPart creates a part referencing a remote http(s) image. The SDK
+// never fetches it; the provider does. Gemini needs a MIME type: use
+// ImageURLPartMIME or WithMIME.
+func ImageURLPart(url string) ContentPart {
+	return ContentPart{Type: ContentPartImageURL, URL: url}
+}
+
+// ImageURLPartMIME creates a remote-image part with a MIME type hint.
+func ImageURLPartMIME(url, mime string) ContentPart {
+	return ContentPart{Type: ContentPartImageURL, URL: url, MIMEType: mime}
+}
+
+// WithMIME returns a copy of p with MIMEType set.
+func (p ContentPart) WithMIME(mime string) ContentPart {
+	p.MIMEType = mime
+	return p
 }
 
 const (
@@ -343,4 +372,12 @@ func (r *ChatResult) AssistantMessage() Message {
 		m.ToolCalls = append([]ToolCall(nil), r.ToolCalls...)
 	}
 	return m
+}
+
+// TextPart creates an ordered text content part.
+func TextPart(text string) ContentPart { return ContentPart{Type: ContentPartText, Text: text} }
+
+// ImagePart creates an ordered inline-image content part.
+func ImagePart(mimeType string, data []byte) ContentPart {
+	return ContentPart{Type: ContentPartImage, Image: data, MIMEType: mimeType}
 }

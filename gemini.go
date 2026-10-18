@@ -30,10 +30,15 @@ type gmFnResp struct {
 type gmPart struct {
 	Text             string    `json:"text,omitempty"`
 	InlineData       *gmBlob   `json:"inlineData,omitempty"`
+	FileData         *gmFile   `json:"fileData,omitempty"`
 	Thought          bool      `json:"thought,omitempty"`
 	FunctionCall     *gmFnCall `json:"functionCall,omitempty"`
 	FunctionResponse *gmFnResp `json:"functionResponse,omitempty"`
 	ThoughtSignature string    `json:"thoughtSignature,omitempty"`
+}
+type gmFile struct {
+	FileURI  string `json:"fileUri"`
+	MIMEType string `json:"mimeType"`
 }
 type gmBlob struct {
 	MIMEType string `json:"mimeType"`
@@ -173,11 +178,15 @@ func buildGeminiRequest(req *ChatRequest, model string, stream bool) ([]byte, er
 				parts = append(parts, gmPart{Text: m.Content})
 			} else {
 				for _, p := range m.Parts {
-					if p.Type == ContentPartImage {
-						parts = append(parts, gmPart{InlineData: &gmBlob{MIMEType: wireMIME(p.MIMEType), Data: base64.StdEncoding.EncodeToString(p.Image)}})
-					} else {
+					if p.Type == ContentPartText {
 						parts = append(parts, gmPart{Text: p.Text})
+						continue
 					}
+					gp, err := geminiAttachment(p)
+					if err != nil {
+						return nil, err
+					}
+					parts = append(parts, gp)
 				}
 			}
 			out.Contents = append(out.Contents, gmContent{Role: "user", Parts: parts})
@@ -230,8 +239,12 @@ func buildGeminiRequest(req *ChatRequest, model string, stream bool) ([]byte, er
 					FunctionResponse: &gmFnResp{Name: name, Response: resp},
 				})
 				// Images from the tool ride the same user turn as inlineData.
-				for _, p := range imageParts(tm) {
-					images = append(images, gmPart{InlineData: &gmBlob{MIMEType: wireMIME(p.MIMEType), Data: base64.StdEncoding.EncodeToString(p.Image)}})
+				for _, p := range attachmentParts(tm) {
+					gp, err := geminiAttachment(p)
+					if err != nil {
+						return nil, err
+					}
+					images = append(images, gp)
 				}
 			}
 			parts = append(parts, images...)
@@ -540,4 +553,18 @@ func listModelsGemini(ctx context.Context, pc *providerClient) ([]Model, error) 
 		pageToken = p.NextPageToken
 	}
 	return nil, fmt.Errorf("%w (%d pages)", ErrModelListTruncated, maxModelPages)
+}
+
+// geminiAttachment renders an image, image-URL or document part.
+func geminiAttachment(p ContentPart) (gmPart, error) {
+	switch p.Type {
+	case ContentPartImageURL:
+		if p.MIMEType == "" {
+			return gmPart{}, &ConfigError{Msg: "Gemini image URL parts require a MIME type (use ImageURLPartMIME or WithMIME)"}
+		}
+		return gmPart{FileData: &gmFile{FileURI: p.URL, MIMEType: wireMIME(p.MIMEType)}}, nil
+	case ContentPartDocument:
+		return gmPart{InlineData: &gmBlob{MIMEType: p.MIMEType, Data: base64.StdEncoding.EncodeToString(p.Data)}}, nil
+	}
+	return gmPart{InlineData: &gmBlob{MIMEType: wireMIME(p.MIMEType), Data: base64.StdEncoding.EncodeToString(p.Image)}}, nil
 }

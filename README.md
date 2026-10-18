@@ -157,6 +157,30 @@ req := &llm.ChatRequest{Messages: []llm.Message{{
 }}}
 ```
 
+### Documents and image URLs
+
+Besides `TextPart` and `ImagePart`, user and tool messages accept:
+
+- `DocumentPart(mime, data, name)`: an inline document, `application/pdf` or
+  `text/plain` (lower-case, no parameters). Up to `MaxDocumentBytes` (20 MiB)
+  each; document bytes count toward the same `MaxRequestImageBytes` aggregate
+  cap as inline images.
+- `ImageURLPart(url)` / `ImageURLPartMIME(url, mime)` / `part.WithMIME(mime)`:
+  a remote `http`/`https` image the provider fetches (the SDK never fetches it;
+  `data:`, `file:` and every other scheme are rejected). The optional MIME must
+  be an image type.
+
+| Format | Document | Image URL |
+|---|---|---|
+| OpenAI chat | `file` part, PDF only | `image_url` |
+| Responses | `input_file`, PDF only | `input_image` |
+| Anthropic | `document` (PDF base64, text/plain text source) | `image` with `url` source (MIME hint ignored) |
+| Gemini | `inlineData` | `fileData`; a MIME type is required (`*ConfigError` otherwise) |
+
+In tool results, documents are accepted on Anthropic and Gemini and are a
+`*ConfigError` on OpenAI chat and the Responses API; image URLs ride the
+post-tool user message (OpenAI chat) or `function_call_output` (Responses).
+
 ```go
 type ChatRequest struct {
 	Model          string         // optional; ChatClient's model wins when both set

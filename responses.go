@@ -37,6 +37,8 @@ type rsInputContentPart struct {
 	Type     string `json:"type"`
 	Text     string `json:"text,omitempty"`
 	ImageURL string `json:"image_url,omitempty"`
+	Filename string `json:"filename,omitempty"`
+	FileData string `json:"file_data,omitempty"`
 }
 
 func responsesContent(m Message) any {
@@ -45,9 +47,14 @@ func responsesContent(m Message) any {
 	}
 	parts := make([]rsInputContentPart, 0, len(m.Parts))
 	for _, p := range m.Parts {
-		if p.Type == ContentPartImage {
+		switch p.Type {
+		case ContentPartImage:
 			parts = append(parts, rsInputContentPart{Type: "input_image", ImageURL: "data:" + wireMIME(p.MIMEType) + ";base64," + base64.StdEncoding.EncodeToString(p.Image)})
-		} else {
+		case ContentPartImageURL:
+			parts = append(parts, rsInputContentPart{Type: "input_image", ImageURL: p.URL})
+		case ContentPartDocument:
+			parts = append(parts, rsInputContentPart{Type: "input_file", Filename: documentName(p), FileData: "data:application/pdf;base64," + base64.StdEncoding.EncodeToString(p.Data)})
+		default:
 			parts = append(parts, rsInputContentPart{Type: "input_text", Text: p.Text})
 		}
 	}
