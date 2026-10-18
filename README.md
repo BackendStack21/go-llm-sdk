@@ -17,7 +17,7 @@ Multi-provider Go SDK for LLM inference endpoints — **OpenAI, Google Gemini, D
 ## Install
 
 ```bash
-go get github.com/BackendStack21/go-llm-sdk@v1.0.0
+go get github.com/BackendStack21/go-llm-sdk@v1.1.0
 ```
 
 Requires Go 1.25+. No dependencies beyond the standard library.
@@ -460,6 +460,24 @@ Coverage sits at **99.0%** of statements (unit suite, no e2e), including the str
 
 See [AGENTS.md](AGENTS.md) for the architecture map, invariants, testing conventions, and the odek migration path.
 
+## Upgrading to v1.1 (from v1.0)
+
+v1.1 adds API only (`Refusal`, `ResponseMeta`, per-request `Headers`, `WithAttemptObserver`, `DocumentPart`, `ImageURLPart`, `RunTools`, `CountTokens`, `TopK`, `EmbedRequest.TaskType`, `Quirks.AnthropicToolJSON`); nothing exported is removed or renamed. Positional (unkeyed) literals of structs that gained fields need field names. Behaviors that changed on purpose:
+
+| Area | v1.0 | v1.1 | What to do |
+|---|---|---|---|
+| Anthropic thinking | Presets sent `budget_tokens` (5000/1024/8192/16384); unset `MaxTokens` → budget + 8192; presets clamped to half of `MaxTokens` | Presets send adaptive thinking + `output_config.effort`; unset `MaxTokens` → 16384; `MaxTokens` as-is; `temperature`/`top_p` omitted; forced `ToolChoice` allowed | Set `ThinkingBudget` > 0 for models needing the legacy `budget_tokens` form (Haiku 4.5 and older) |
+| Anthropic JSON mode | Forced synthetic tool folded into `Content`; errors with `Tools`, `ToolChoice`, thinking | Native `output_config.format` (reply text as-is); those combinations are allowed | Gateways lacking `output_config` set `Quirks.AnthropicToolJSON` for the old behaviour (byte-identical, errors included) |
+| OpenAI-compatible embeddings | Float arrays requested | `encoding_format:"base64"` requested (float arrays still accepted) | — |
+| Streaming | A mid-stream `{"error":…}` chunk or a bare `[DONE]` with no output ended as an empty success | Provider error / premature-close error | None; this surfaces real failures |
+| Finish reasons | OpenAI `stop` with tool calls stayed `stop`; unknown Responses `incomplete` reasons leaked as `length` | `tool_calls`; `""` | Loops checking `len(res.ToolCalls) > 0` are unaffected |
+| Empty content | Empty text blocks sent (provider 400) | Never sent; an empty Anthropic assistant turn is dropped and adjacent user turns merged | — |
+| Gemini tools | `parameters` (OpenAPI subset) | `parametersJsonSchema` (full JSON Schema) | — |
+| STT `text`/`srt`/`vtt` | JSON-decoded (failed after billing) | Raw body returned as `Text` | — |
+| Redirects | Same-host https-to-http followed | Refused (credential leak), surfaces as `*APIError` | Point `WithBaseURL` at the final scheme and host |
+| Oversized bodies / long backoff | Retried up to 8×; a wait past the deadline returned bare `DeadlineExceeded` | Terminal; the last provider error is returned immediately | — |
+| `ListModels` | Ignored `WithRetryPolicy`, request timeout, `Retry-After` | Honours all three | — |
+
 ## Upgrading to v1.0 (from v0.7)
 
 v1.0 removes or renames nothing exported. Existing code compiles unchanged unless it builds `ToolCall`, `Message`, `ChatRequest`, `ChatResult`, `ProviderConfig` or `Quirks` with positional (unkeyed) struct literals; those structs gained fields, so switch to field names. A few behaviors changed on purpose. Check these before upgrading:
@@ -472,16 +490,15 @@ v1.0 removes or renames nothing exported. Existing code compiles unchanged unles
 | Gemini finish reason | A function-call turn returned `stop` | Returns `tool_calls`, like every other format | Loops checking `len(res.ToolCalls) > 0` are unaffected |
 | Gemini truncated streams | A stream ending without `finishReason` was a silent success | It is a premature-close error (retried before the first delta, partial result + error after) | None; this surfaces real truncation |
 | `Delta.ToolIndex` | Anthropic content-block / Responses output index | The call's position in `ChatResult.ToolCalls` on every format | Streaming UIs that grouped fragments by index on Anthropic or Responses |
-| Anthropic thinking | Presets sent `budget_tokens` (5000/1024/8192/16384); unset `MaxTokens` 8192 or budget + 8192; presets clamped to half of `MaxTokens` | Presets send adaptive thinking + `output_config.effort`; unset `MaxTokens` → 16384; `MaxTokens` as-is; `temperature`/`top_p` omitted; forced `ToolChoice` allowed | Set `ThinkingBudget` > 0 for models needing the legacy `budget_tokens` form (Haiku 4.5 and older) |
-| Anthropic JSON mode | Forced synthetic tool folded into `Content`; errors with `Tools`, `ToolChoice`, thinking | Native `output_config.format` (reply text as-is); those combinations are allowed | Gateways lacking `output_config` set `Quirks.AnthropicToolJSON` for the old behaviour (byte-identical, errors included) |
+| Anthropic thinking | Unset `MaxTokens` sent 8192 (rejected with budgets ≥ 8192); sampling fields sent | Unset `MaxTokens` → budget + 8192; `temperature`/`top_p` omitted; impossible budgets are a `ConfigError` | Requests that used to 400 now succeed |
 | Thinking replay | One `ReasoningContent` + `ThinkingSignature` pair | Every block in `ThinkingBlocks` (incl. redacted), Gemini signatures per `ToolCall` | Append `res.AssistantMessage()` instead of copying fields by hand |
-| Redirects | Followed to any host | Cross-host redirects and https-to-http downgrades are not followed (credential leak); they surface as `*APIError` | Point `WithBaseURL` at the final host |
+| Redirects | Followed to any host | Cross-host redirects are not followed (credential leak); they surface as `*APIError` | Point `WithBaseURL` at the final host |
 | Validation | Sent to the provider | DeepSeek `json_schema`, malformed base URLs, control characters in `TranscribeRequest.Filename`/`MIMEType` are `ConfigError`s | — |
 | `ListModels` | Silently truncated at 10 pages | Up to 100 pages, then `ErrModelListTruncated` | — |
 
 ## Status
 
-v1.0.0 — stable. The exported API follows semantic versioning from here: breaking changes only in a new major version.
+v1.1.0 — stable. The exported API follows semantic versioning from here: breaking changes only in a new major version.
 
 ## License
 
