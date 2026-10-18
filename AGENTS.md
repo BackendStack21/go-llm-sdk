@@ -33,6 +33,7 @@ go test -tags e2e -run 'TestE2E' -timeout 15m -v .   # LIVE provider e2e (see be
 | `controls.go` | Request controls: `ToolChoice`, `ResponseFormat` (Anthropic JSON is native `output_config.format`; the forced-tool emulation + `foldAnthropicJSON` run only under `Quirks.AnthropicToolJSON`, off for the built-in provider), `ParallelToolCalls`, per-format mapping and boundary validation |
 | `observe.go` | `AttemptEvent` + `WithAttemptObserver`: per-attempt record filled by `doObserved` in the HTTP helpers and emitted from the retry ladders (`withRetryN`, `callStream`) with the delay about to be waited; key-masked errors; panics recovered |
 | `meta.go` | `ResponseMeta`/`RateLimit` and `parseResponseMeta` (request-id + rate-limit headers from the successful attempt); per-request `Headers` validation (reserved auth/framing names rejected, no values in errors) and ctx carriage |
+| `tools.go` | `RunTools`: buffered tool-call loop (`ToolHandler`, `ToolLoopOptions`, `ErrMaxToolTurns`); handler errors/panics/unknown tools become `IsError` results, `Parallel` keeps call order |
 | `embed.go` | Embeddings: `Embed`/`EmbedRequest`/`EmbedResult` — OpenAI-compat `/embeddings` (requests `encoding_format: base64`, decodes float32 LE, accepts float arrays) + Gemini `batchEmbedContents` |
 | `stt.go` | Speech-to-text: `Transcribe`/`TranscribeRequest`/`TranscribeResult` — OpenAI-compat `/audio/transcriptions` (multipart), 25MB input cap |
 | `sse.go` | SSE parser (abort-safe via `done` channel) + idle-watchdog pump |
