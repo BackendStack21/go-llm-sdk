@@ -197,7 +197,11 @@ func terminal(err error) error {
 // retryable statuses and transport errors back off; anything else (and any
 // terminal error) is returned as is.
 func (pc *providerClient) withRetry(ctx context.Context, op func() (time.Duration, error), learn func(*APIError) bool) error {
-	n := pc.opts.retry.attempts()
+	return pc.withRetryN(ctx, pc.opts.retry.attempts(), op, learn)
+}
+
+// withRetryN is withRetry with an explicit attempt budget (n >= 1).
+func (pc *providerClient) withRetryN(ctx context.Context, n int, op func() (time.Duration, error), learn func(*APIError) bool) error {
 	var (
 		rateErr *APIError // last 429
 		rateRA  time.Duration

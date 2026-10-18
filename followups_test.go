@@ -232,7 +232,7 @@ func TestEmbed_OpenAI(t *testing.T) {
 	if res.Model != "emb" || res.Usage.PromptTokens != 5 {
 		t.Errorf("result = %+v", res)
 	}
-	if got["model"] != "emb" || got["dimensions"] != float64(2) || got["encoding_format"] != "float" {
+	if got["model"] != "emb" || got["dimensions"] != float64(2) || got["encoding_format"] != "base64" {
 		t.Errorf("request = %v", got)
 	}
 }

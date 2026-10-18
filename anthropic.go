@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	neturl "net/url"
 	"strings"
@@ -625,8 +626,11 @@ func listModelsAnthropic(ctx context.Context, pc *providerClient) ([]Model, erro
 			}
 			out = append(out, mm)
 		}
-		if !p.HasMore || p.LastID == "" {
+		if !p.HasMore {
 			return out, nil
+		}
+		if p.LastID == "" {
+			return nil, terminal(errors.New("llm: anthropic models: has_more without last_id (cannot page; refusing a partial listing)"))
 		}
 		pageID = p.LastID
 	}

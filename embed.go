@@ -1,9 +1,13 @@
 package llm
 
 import (
+	"bytes"
 	"context"
+	"encoding/base64"
+	"encoding/binary"
 	"encoding/json"
 	"fmt"
+	"math"
 	"net/http"
 	"sort"
 	"strings"
@@ -68,8 +72,8 @@ type oaEmbedRequest struct {
 
 type oaEmbedResponse struct {
 	Data []struct {
-		Index     int       `json:"index"`
-		Embedding []float64 `json:"embedding"`
+		Index     int             `json:"index"`
+		Embedding json.RawMessage `json:"embedding"`
 	} `json:"data"`
 	Usage *struct {
 		PromptTokens int `json:"prompt_tokens"`
@@ -106,7 +110,7 @@ func (pc *providerClient) buildEmbedRequest(model string, req EmbedRequest) ([]b
 		b, err := json.Marshal(r)
 		return b, fmt.Sprintf("%s/v1beta/models/%s:batchEmbedContents", pc.base, geminiModelPath(model)), err
 	}
-	b, err := json.Marshal(oaEmbedRequest{Model: model, Input: req.Inputs, Dimensions: req.Dimensions, EncodingFormat: "float"})
+	b, err := json.Marshal(oaEmbedRequest{Model: model, Input: req.Inputs, Dimensions: req.Dimensions, EncodingFormat: "base64"})
 	return b, pc.base + "/embeddings", err
 }
 
@@ -152,13 +156,47 @@ func (pc *providerClient) parseEmbedResponse(data []byte, n int) ([][]float64, U
 		if d.Index != i {
 			return nil, Usage{}, fmt.Errorf("llm: embeddings: vector index %d out of range", d.Index)
 		}
-		out[i] = d.Embedding
+		v, err := decodeOAEmbedding(d.Embedding)
+		if err != nil {
+			return nil, Usage{}, err
+		}
+		out[i] = v
 	}
 	var u Usage
 	if r.Usage != nil {
 		u.PromptTokens = r.Usage.PromptTokens
 	}
 	return out, u, nil
+}
+
+// decodeOAEmbedding decodes one OpenAI-compatible embedding: a base64 string
+// of little-endian float32 (encoding_format=base64) or a JSON float array
+// (providers that ignore the parameter).
+func decodeOAEmbedding(raw json.RawMessage) ([]float64, error) {
+	raw = bytes.TrimSpace(raw)
+	if len(raw) > 0 && raw[0] == '"' {
+		var s string
+		if err := json.Unmarshal(raw, &s); err != nil {
+			return nil, fmt.Errorf("llm: parse embeddings: %w", err)
+		}
+		b, err := base64.StdEncoding.DecodeString(s)
+		if err != nil {
+			return nil, fmt.Errorf("llm: embeddings: invalid base64 vector: %w", err)
+		}
+		if len(b)%4 != 0 {
+			return nil, fmt.Errorf("llm: embeddings: base64 vector is %d bytes, not a multiple of 4", len(b))
+		}
+		v := make([]float64, len(b)/4)
+		for i := range v {
+			v[i] = float64(math.Float32frombits(binary.LittleEndian.Uint32(b[4*i:])))
+		}
+		return v, nil
+	}
+	var v []float64
+	if err := json.Unmarshal(raw, &v); err != nil {
+		return nil, fmt.Errorf("llm: parse embeddings: %w", err)
+	}
+	return v, nil
 }
 
 // Per-request input caps: Gemini batchEmbedContents takes at most 100

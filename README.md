@@ -358,7 +358,7 @@ Requests carry the same retry ladder and error taxonomy as chat. Oversized audio
 
 ## Embeddings
 
-`Embed` turns texts into vectors via OpenAI-compatible `POST {base}/embeddings` or Gemini `batchEmbedContents`; Anthropic (no endpoint) returns a `ConfigError`.
+`Embed` turns texts into vectors via OpenAI-compatible `POST {base}/embeddings` or Gemini `batchEmbedContents`; Anthropic (no endpoint) returns a `ConfigError`. OpenAI-compatible requests ask for `encoding_format: base64` (little-endian float32, decoded by the SDK) so a 2048-input batch fits the response size cap; providers that ignore it and return float arrays are still accepted.
 
 ```go
 res, err := sdk.Embed(ctx, "openai", "text-embedding-3-small", llm.EmbedRequest{
@@ -376,7 +376,7 @@ Vectors come back in input order (the SDK sorts by the provider's `index` — or
 
 ## Model discovery
 
-`ListModels` hits each provider's models endpoint (Anthropic paginates with `after_id`, Gemini with `pageToken`), caches per SDK for 5 minutes (`WithModelCacheTTL(0)` disables, `ForceRefresh()` bypasses), and retries transient failures 3× (a malformed body is not retried). Concurrent cache misses share one upstream fetch. A listing longer than 100 pages returns `ErrModelListTruncated` — never a silently truncated list. Fields the provider does not report stay zero — the SDK never guesses.
+`ListModels` hits each provider's models endpoint (Anthropic paginates with `after_id`, Gemini with `pageToken`), caches per SDK for 5 minutes (`WithModelCacheTTL(0)` disables, `ForceRefresh()` bypasses), and retries transient failures through the shared ladder: 3 attempts unless `WithRetryPolicy` sets `MaxAttempts`, honoring `Retry-After`, under a whole-call budget of 30s unless `WithRequestTimeout` is set (a malformed body is not retried). OpenAI-format listings accept `{data:[…]}`, `{models:[…]}` or a bare array (Together AI). Anthropic `has_more` without a `last_id` is an error, never a partial list. Results are deep-copied on every read (mutating `Capabilities` cannot corrupt the cache) and an empty successful listing is cached like any other. Concurrent cache misses share one upstream fetch. A listing longer than 100 pages returns `ErrModelListTruncated` — never a silently truncated list. Fields the provider does not report stay zero — the SDK never guesses.
 
 ## Testing
 

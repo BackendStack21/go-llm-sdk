@@ -33,6 +33,16 @@ func (s *SDK) clientOpts() clientOpts {
 	return clientOpts{retry: s.retry, idle: s.idle, observer: s.observer}
 }
 
+// listTimeout is the whole-call budget for model discovery: the configured
+// request timeout, or 30s (the long-standing listing default) when the
+// request timeout is left at its chat default.
+func (s *SDK) listTimeout() time.Duration {
+	if s.timeout == DefaultTimeout {
+		return 30 * time.Second
+	}
+	return s.timeout
+}
+
 // newClient builds a provider client for p with the SDK's settings.
 func (s *SDK) newClient(p *Provider, timeout time.Duration, learn *learnOnce) *providerClient {
 	pc := newProviderClientWithLearn(p.cfg, newBufferedHTTP(s.rt, timeout), newStreamHTTP(s.rt), learn)
@@ -277,6 +287,7 @@ type Provider struct {
 
 	mu       sync.Mutex
 	cached   []Model
+	cachedOK bool // cached holds a successful listing (possibly empty)
 	cachedAt time.Time
 	flight   *modelFlight // in-progress listing shared by concurrent callers
 }
@@ -320,9 +331,8 @@ func (p *Provider) ListModels(ctx context.Context, opts ...ListOption) ([]Model,
 	ttl := p.sdk.cacheTTL
 	if !lo.force && ttl > 0 {
 		p.mu.Lock()
-		if p.cached != nil && time.Since(p.cachedAt) < ttl {
-			out := make([]Model, len(p.cached))
-			copy(out, p.cached)
+		if p.cachedOK && time.Since(p.cachedAt) < ttl {
+			out := cloneModels(p.cached)
 			p.mu.Unlock()
 			return out, nil
 		}
@@ -332,15 +342,13 @@ func (p *Provider) ListModels(ctx context.Context, opts ...ListOption) ([]Model,
 		return nil, &ConfigError{Msg: p.cfg.ID + " has no API key"}
 	}
 	p.clientOnce.Do(func() {
-		p.listClient = p.sdk.newClient(p, 30*time.Second, nil)
+		p.listClient = p.sdk.newClient(p, p.sdk.listTimeout(), nil)
 	})
 	models, err := p.fetchModels(ctx)
 	if err != nil {
 		return nil, err
 	}
-	out := make([]Model, len(models))
-	copy(out, models)
-	return out, nil
+	return cloneModels(models), nil
 }
 
 // modelFlight is one in-progress upstream model listing that concurrent
@@ -392,7 +400,7 @@ func (p *Provider) lead(ctx context.Context, f *modelFlight) {
 		p.mu.Lock()
 		p.flight = nil
 		if f.err == nil {
-			p.cached, p.cachedAt = f.models, time.Now()
+			p.cached, p.cachedOK, p.cachedAt = f.models, true, time.Now()
 		}
 		p.mu.Unlock()
 		close(f.done)
