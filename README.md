@@ -133,6 +133,15 @@ and normalized to `image/jpeg` on the wire). Per-image (`MaxImageBytes`, 10 MiB)
 and per-request aggregate (`MaxRequestImageBytes`, 32 MiB) caps are enforced
 before any network I/O. All validation failures are typed `*ConfigError`.
 
+Empty text never reaches Anthropic or Gemini as an empty block: empty system
+text (`SystemBlock`, in-band system messages) is skipped; a user message with no
+`Content` and no `Parts` is a `*ConfigError`; an assistant turn with no text,
+thinking or tool calls is dropped on Anthropic and the surrounding user turns are
+merged so roles still alternate. Gemini tool `Parameters` are sent as
+`parametersJsonSchema` (full JSON Schema: `$ref`/`$defs`, `const`, type arrays).
+Gemini model ids may carry a `models/` prefix on every endpoint (chat, stream,
+embeddings, speech); ids are path-escaped.
+
 ```go
 req := &llm.ChatRequest{Messages: []llm.Message{{
 	Role: llm.RoleUser,
@@ -341,7 +350,7 @@ res, err := sdk.Transcribe(ctx, "openai", "whisper-1", llm.TranscribeRequest{
 // res.Language, res.DurationSec — provider-reported, zero when omitted
 ```
 
-Requests carry the same retry ladder and error taxonomy as chat. Oversized audio (>25MB), empty `Audio`/`Model`, and control characters in `Filename`/`MIMEType` (header injection) fail fast with a `ConfigError` before any network I/O. A 2xx body that is not JSON surfaces as a typed `*APIError`. Fields the provider does not report stay zero — the SDK never guesses.
+Requests carry the same retry ladder and error taxonomy as chat. Oversized audio (>25MB), empty `Audio`/`Model`, and control characters in `Filename`/`MIMEType` (header injection) fail fast with a `ConfigError` before any network I/O. `Format` `"text"`, `"srt"` and `"vtt"` are not JSON: the raw response body is returned as `Text` (other fields zero). For the JSON formats (default, `json`, `verbose_json`) a 2xx body that is not JSON surfaces as a typed `*APIError`. Fields the provider does not report stay zero — the SDK never guesses.
 
 ## Embeddings
 

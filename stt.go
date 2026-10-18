@@ -144,7 +144,7 @@ func (pc *providerClient) transcribe(ctx context.Context, model string, req Tran
 		if err != nil {
 			return ra, err
 		}
-		r, perr := parseTranscribeResponse(data)
+		r, perr := parseTranscribeBody(data, req.Format)
 		if perr != nil {
 			// 2xx with an undecodable body is a provider protocol
 			// failure — surface it through the typed error taxonomy
@@ -183,6 +183,16 @@ type transcribeResponse struct {
 	Text     string  `json:"text"`
 	Language string  `json:"language"`
 	Duration float64 `json:"duration"`
+}
+
+// parseTranscribeBody maps a 2xx body to a result. The text, srt and vtt
+// response formats are not JSON: the raw body is the transcription.
+func parseTranscribeBody(data []byte, format string) (*TranscribeResult, error) {
+	switch strings.ToLower(format) {
+	case "text", "srt", "vtt":
+		return &TranscribeResult{Text: string(data)}, nil
+	}
+	return parseTranscribeResponse(data)
 }
 
 // parseTranscribeResponse decodes a buffered transcription response.

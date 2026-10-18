@@ -8,7 +8,6 @@ import (
 	"fmt"
 	"io"
 	"net/http"
-	neturl "net/url"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -198,7 +197,7 @@ func (pc *providerClient) buildFormatBody(req *ChatRequest, model string, stream
 		body, err := buildGeminiRequest(req, model, stream)
 		// The model rides the URL path: escape it so a model id can never
 		// rewrite the path or smuggle a query.
-		m := neturl.PathEscape(model)
+		m := geminiModelPath(model)
 		if stream {
 			return body, fmt.Sprintf("%s/v1beta/models/%s:streamGenerateContent?alt=sse", pc.base, m), err
 		}

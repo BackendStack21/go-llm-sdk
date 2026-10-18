@@ -228,7 +228,7 @@ func buildGeminiSpeakRequest(base, model string, req SpeakRequest) ([]byte, stri
 		},
 	}
 	b, err := json.Marshal(greq)
-	return b, fmt.Sprintf("%s/v1beta/models/%s:generateContent", base, model), "", err
+	return b, fmt.Sprintf("%s/v1beta/models/%s:generateContent", base, geminiModelPath(model)), "", err
 }
 
 // parseGeminiSpeakResponse decodes a buffered Gemini TTS response.

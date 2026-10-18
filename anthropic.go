@@ -172,6 +172,9 @@ func buildAnthropicRequest(req *ChatRequest, model string, stream bool) ([]byte,
 	// System: canonical blocks (with cache markers) + in-band system
 	// messages become the top-level system field.
 	for _, b := range req.System {
+		if b.Text == "" { // Anthropic rejects empty text blocks
+			continue
+		}
 		sb := anSysBlock{Type: "text", Text: b.Text}
 		if b.Cache {
 			sb.CacheControl = &anCacheControl{Type: "ephemeral"}
@@ -244,16 +247,31 @@ func buildAnthropicRequest(req *ChatRequest, model string, stream bool) ([]byte,
 	// Messages. Hard edges:
 	//   - consecutive tool messages merge into ONE user message carrying
 	//     multiple tool_result blocks;
-	//   - empty assistant turns synthesize a placeholder text block
-	//     (Anthropic rejects empty content arrays).
+	//   - an assistant turn with nothing to replay is dropped (Anthropic
+	//     rejects empty and whitespace-only text blocks); the user turns
+	//     around it merge so role alternation still holds.
+	dropped := false
+	appendMsg := func(role string, blocks []anBlock) {
+		if n := len(out.Messages); dropped && role == "user" && n > 0 && out.Messages[n-1].Role == "user" {
+			out.Messages[n-1].Content = append(out.Messages[n-1].Content, blocks...)
+		} else {
+			out.Messages = append(out.Messages, anMessage{Role: role, Content: blocks})
+		}
+		dropped = false
+	}
 	for i := 0; i < len(req.Messages); i++ {
 		m := req.Messages[i]
 		switch m.Role {
 		case RoleSystem:
-			out.System = append(out.System, anSysBlock{Type: "text", Text: m.Content})
+			if m.Content != "" {
+				out.System = append(out.System, anSysBlock{Type: "text", Text: m.Content})
+			}
 		case RoleUser:
 			blocks := make([]anBlock, 0, maxInt(1, len(m.Parts)))
 			if len(m.Parts) == 0 {
+				if m.Content == "" {
+					return nil, &ConfigError{Msg: fmt.Sprintf("message %d: user message has no content", i)}
+				}
 				blocks = append(blocks, anBlock{Type: "text", Text: m.Content})
 			} else {
 				blocks = append(blocks, anthropicPartBlocks(m.Parts)...)
@@ -261,7 +279,7 @@ func buildAnthropicRequest(req *ChatRequest, model string, stream bool) ([]byte,
 			if m.Cache && len(blocks) > 0 && blocks[0].Type == "text" {
 				blocks[0].CacheControl = &anCacheControl{Type: "ephemeral"}
 			}
-			out.Messages = append(out.Messages, anMessage{Role: "user", Content: blocks})
+			appendMsg("user", blocks)
 		case RoleAssistant:
 			blocks, err := anthropicThinkingReplay(m, i)
 			if err != nil {
@@ -289,9 +307,10 @@ func buildAnthropicRequest(req *ChatRequest, model string, stream bool) ([]byte,
 				})
 			}
 			if len(blocks) == 0 {
-				blocks = []anBlock{{Type: "text", Text: " "}} // placeholder
+				dropped = true
+				continue
 			}
-			out.Messages = append(out.Messages, anMessage{Role: "assistant", Content: blocks})
+			appendMsg("assistant", blocks)
 		case RoleTool:
 			// Merge the run of consecutive tool messages.
 			var results []anBlock
@@ -306,7 +325,7 @@ func buildAnthropicRequest(req *ChatRequest, model string, stream bool) ([]byte,
 				results = append(results, tr)
 			}
 			i-- // outer loop increment
-			out.Messages = append(out.Messages, anMessage{Role: "user", Content: results})
+			appendMsg("user", results)
 		}
 	}
 

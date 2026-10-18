@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
-	neturl "net/url"
 	"sort"
 	"strings"
 	"time"
@@ -105,7 +104,7 @@ func (pc *providerClient) buildEmbedRequest(model string, req EmbedRequest) ([]b
 			})
 		}
 		b, err := json.Marshal(r)
-		return b, fmt.Sprintf("%s/v1beta/models/%s:batchEmbedContents", pc.base, neturl.PathEscape(model)), err
+		return b, fmt.Sprintf("%s/v1beta/models/%s:batchEmbedContents", pc.base, geminiModelPath(model)), err
 	}
 	b, err := json.Marshal(oaEmbedRequest{Model: model, Input: req.Inputs, Dimensions: req.Dimensions, EncodingFormat: "float"})
 	return b, pc.base + "/embeddings", err

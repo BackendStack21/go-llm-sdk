@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 )
 
@@ -158,11 +159,17 @@ func TestBuildAnthropicRequest_EmptyAssistantPlaceholder(t *testing.T) {
 	body, _ := buildAnthropicRequest(req, "claude", false)
 	var m map[string]any
 	json.Unmarshal(body, &m)
+	// Anthropic rejects empty and whitespace-only text blocks: the empty
+	// assistant turn is dropped and the user turns around it merge.
 	msgs := m["messages"].([]any)
-	asst := msgs[1].(map[string]any)
-	blocks := asst["content"].([]any)
-	if len(blocks) != 1 || blocks[0].(map[string]any)["type"] != "text" {
-		t.Fatalf("empty assistant blocks = %v, want one placeholder text", blocks)
+	if len(msgs) != 1 || msgs[0].(map[string]any)["role"] != "user" {
+		t.Fatalf("messages = %v, want one merged user turn", msgs)
+	}
+	if blocks := msgs[0].(map[string]any)["content"].([]any); len(blocks) != 2 {
+		t.Fatalf("merged blocks = %v, want 2 text blocks", blocks)
+	}
+	if strings.Contains(string(body), `"text":" "`) {
+		t.Fatalf("whitespace-only block on wire: %s", body)
 	}
 }
 

@@ -48,7 +48,7 @@ type gmContent struct {
 type gmFnDecl struct {
 	Name        string          `json:"name"`
 	Description string          `json:"description,omitempty"`
-	Parameters  json.RawMessage `json:"parameters,omitempty"`
+	Parameters  json.RawMessage `json:"parametersJsonSchema,omitempty"` // JSON Schema, not the restricted OpenAPI `parameters`
 }
 
 type gmToolGroup struct {
@@ -128,6 +128,13 @@ func mustJSONString(s string) string {
 	return string(b)
 }
 
+// geminiModelPath returns the model as a single safe URL path segment: a
+// leading "models/" (as ListModels echoes ids) is stripped and the rest is
+// escaped so an id can never rewrite the path or smuggle a query.
+func geminiModelPath(model string) string {
+	return neturl.PathEscape(strings.TrimPrefix(model, "models/"))
+}
+
 // buildGeminiRequest renders the canonical request in Gemini format.
 func buildGeminiRequest(req *ChatRequest, model string, stream bool) ([]byte, error) {
 	_ = model // rides the URL path
@@ -138,10 +145,12 @@ func buildGeminiRequest(req *ChatRequest, model string, stream bool) ([]byte, er
 	// System: canonical blocks + in-band system messages → systemInstruction.
 	var sysParts []gmPart
 	for _, b := range req.System {
-		sysParts = append(sysParts, gmPart{Text: b.Text})
+		if b.Text != "" { // an empty part is rejected by Gemini
+			sysParts = append(sysParts, gmPart{Text: b.Text})
+		}
 	}
 	for _, m := range req.Messages {
-		if m.Role == RoleSystem {
+		if m.Role == RoleSystem && m.Content != "" {
 			sysParts = append(sysParts, gmPart{Text: m.Content})
 		}
 	}
@@ -158,6 +167,9 @@ func buildGeminiRequest(req *ChatRequest, model string, stream bool) ([]byte, er
 		case RoleUser:
 			parts := make([]gmPart, 0, maxInt(1, len(m.Parts)))
 			if len(m.Parts) == 0 {
+				if m.Content == "" {
+					return nil, &ConfigError{Msg: fmt.Sprintf("message %d: user message has no content", i)}
+				}
 				parts = append(parts, gmPart{Text: m.Content})
 			} else {
 				for _, p := range m.Parts {

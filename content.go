@@ -71,7 +71,7 @@ func validateMessageContent(m Message, index int) error {
 }
 
 var supportedImageMIME = map[string]bool{
-	"image/png": true, "image/jpeg": true,
+	"image/png": true, "image/jpeg": true, "image/jpg": true,
 	"image/gif": true, "image/webp": true,
 }
 
