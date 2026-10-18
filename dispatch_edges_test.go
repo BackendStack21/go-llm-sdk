@@ -695,7 +695,7 @@ func TestBuildAnthropicRequestArmsTail(t *testing.T) {
 			{Role: RoleUser, Content: "q"},
 			{Role: RoleAssistant, ToolCalls: []ToolCall{{ID: "tu_1", Name: "f"}}}, // empty args → {}
 		},
-		Thinking: "enabled", // no explicit budget → 5000 default
+		Thinking: "enabled", ThinkingBudget: 5000, // explicit budget: presets are adaptive now
 	}
 	b, err := buildAnthropicRequest(req, "claude-x", false)
 	if err != nil {

@@ -189,8 +189,8 @@ func anthropicJSONToolName(req *ChatRequest) string {
 }
 
 // anthropicToolControls appends the JSON-mode tool when requested and
-// renders tool_choice. thinking reports extended thinking, which rejects
-// forced tool use.
+// renders tool_choice. thinking reports legacy budget thinking, which rejects
+// forced tool use (adaptive thinking accepts it).
 func anthropicToolControls(req *ChatRequest, out *anRequest, thinking bool) error {
 	var choice *anToolChoice
 	if name := anthropicJSONToolName(req); name != "" {
@@ -227,7 +227,7 @@ func anthropicToolControls(req *ChatRequest, out *anRequest, thinking bool) erro
 			choice = &anToolChoice{Type: "tool", Name: tc.Name}
 		}
 		if thinking && (choice.Type == "any" || choice.Type == "tool") {
-			return &ConfigError{Msg: "Anthropic extended thinking rejects forced tool use (ToolChoice required/tool)"}
+			return &ConfigError{Msg: "Anthropic extended thinking with ThinkingBudget rejects forced tool use (ToolChoice required/tool)"}
 		}
 	}
 	if p := req.ParallelToolCalls; p != nil && !*p && len(out.Tools) > 0 && (choice == nil || choice.Type != "none") {

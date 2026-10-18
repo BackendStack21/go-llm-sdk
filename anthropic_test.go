@@ -174,15 +174,27 @@ func TestBuildAnthropicRequest_EmptyAssistantPlaceholder(t *testing.T) {
 }
 
 func TestBuildAnthropicRequest_ThinkingLevels(t *testing.T) {
-	cases := map[string]int{"low": 1024, "medium": 8192, "high": 16384, "max": 16384}
-	for level, want := range cases {
+	// Presets map to adaptive thinking + output_config.effort (AC-1); "enabled" carries no effort.
+	cases := map[string]string{"enabled": "", "low": "low", "medium": "medium", "high": "high", "max": "max"}
+	for level, wantEffort := range cases {
 		req := &ChatRequest{Messages: []Message{{Role: RoleUser, Content: "x"}}, Thinking: level}
 		body, _ := buildAnthropicRequest(req, "claude", false)
 		var m map[string]any
 		json.Unmarshal(body, &m)
 		th := m["thinking"].(map[string]any)
-		if th["budget_tokens"].(float64) != float64(want) {
-			t.Errorf("%s budget = %v, want %d", level, th["budget_tokens"], want)
+		if th["type"] != "adaptive" {
+			t.Errorf("%s thinking.type = %v, want adaptive", level, th["type"])
+		}
+		if _, ok := th["budget_tokens"]; ok {
+			t.Errorf("%s: adaptive thinking must not carry budget_tokens", level)
+		}
+		oc, hasOC := m["output_config"].(map[string]any)
+		if wantEffort == "" {
+			if hasOC {
+				t.Errorf("%s: output_config must be absent, got %v", level, oc)
+			}
+		} else if oc["effort"] != wantEffort {
+			t.Errorf("%s effort = %v, want %s", level, oc["effort"], wantEffort)
 		}
 	}
 	// disabled → no thinking field

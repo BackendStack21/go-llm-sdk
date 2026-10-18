@@ -68,22 +68,27 @@ type anTool struct {
 }
 
 type anThinking struct {
-	Type         string `json:"type"` // "enabled"
+	Type         string `json:"type"` // "enabled" (budget) or "adaptive"
 	BudgetTokens int    `json:"budget_tokens,omitempty"`
 }
 
+type anOutputConfig struct {
+	Effort string `json:"effort,omitempty"`
+}
+
 type anRequest struct {
-	Model       string        `json:"model"`
-	MaxTokens   int           `json:"max_tokens"`
-	Messages    []anMessage   `json:"messages"`
-	System      []anSysBlock  `json:"system,omitempty"`
-	Tools       []anTool      `json:"tools,omitempty"`
-	Temperature *float64      `json:"temperature,omitempty"`
-	TopP        *float64      `json:"top_p,omitempty"`
-	Stop        []string      `json:"stop_sequences,omitempty"`
-	Stream      bool          `json:"stream,omitempty"`
-	Thinking    *anThinking   `json:"thinking,omitempty"`
-	ToolChoice  *anToolChoice `json:"tool_choice,omitempty"`
+	Model        string          `json:"model"`
+	MaxTokens    int             `json:"max_tokens"`
+	Messages     []anMessage     `json:"messages"`
+	System       []anSysBlock    `json:"system,omitempty"`
+	Tools        []anTool        `json:"tools,omitempty"`
+	Temperature  *float64        `json:"temperature,omitempty"`
+	TopP         *float64        `json:"top_p,omitempty"`
+	Stop         []string        `json:"stop_sequences,omitempty"`
+	Stream       bool            `json:"stream,omitempty"`
+	Thinking     *anThinking     `json:"thinking,omitempty"`
+	ToolChoice   *anToolChoice   `json:"tool_choice,omitempty"`
+	OutputConfig *anOutputConfig `json:"output_config,omitempty"`
 }
 
 const anthropicDefaultMaxTokens = 8192
@@ -91,27 +96,19 @@ const anthropicDefaultMaxTokens = 8192
 // anthropicMinThinkingBudget is Anthropic's minimum budget_tokens.
 const anthropicMinThinkingBudget = 1024
 
-// anthropicThinkingBudget maps canonical thinking levels to budgets.
-// Anthropic requires budget_tokens >= 1024.
-func anthropicThinkingBudget(level string, explicit int) (int, bool) {
-	var budget int
+// anthropicThinkingOn reports whether a canonical thinking level enables
+// thinking ("" and "disabled" do not).
+func anthropicThinkingOn(level string) bool {
 	switch level {
-	case "enabled":
-		budget = 5000
-	case "low":
-		budget = 1024
-	case "medium":
-		budget = 8192
-	case "high", "max":
-		budget = 16384
-	default: // "", "disabled"
-		return 0, false
+	case "enabled", "low", "medium", "high", "max":
+		return true
 	}
-	if explicit > 0 {
-		budget = maxInt(explicit, anthropicMinThinkingBudget)
-	}
-	return budget, true
+	return false
 }
+
+// anthropicAdaptiveMaxTokens is the max_tokens default under adaptive
+// thinking, leaving room for thinking plus the visible answer.
+const anthropicAdaptiveMaxTokens = 16384
 
 // anthropicPartBlocks renders ordered content parts as text/image blocks.
 func anthropicPartBlocks(parts []ContentPart) []anBlock {
@@ -169,6 +166,8 @@ func buildAnthropicRequest(req *ChatRequest, model string, stream bool) ([]byte,
 		Stream:    stream,
 	}
 
+	legacyThinking := false
+
 	// System: canonical blocks (with cache markers) + in-band system
 	// messages become the top-level system field.
 	for _, b := range req.System {
@@ -196,29 +195,29 @@ func buildAnthropicRequest(req *ChatRequest, model string, stream bool) ([]byte,
 		}
 		out.TopP = &p
 	}
-	if budget, ok := anthropicThinkingBudget(req.Thinking, req.ThinkingBudget); ok {
-		// Anthropic requires max_tokens > budget_tokens, and the budget
-		// counts against max_tokens. An unset MaxTokens leaves the usual
-		// visible-output room on top of the budget; an explicit MaxTokens
-		// is a hard cap, so a preset level is clamped to half of it (the
-		// rest stays for the answer) and an explicit ThinkingBudget that
-		// cannot fit fails fast.
-		switch {
-		case out.MaxTokens <= 0:
-			out.MaxTokens = budget + anthropicDefaultMaxTokens
-		case budget >= out.MaxTokens && req.ThinkingBudget > 0:
-			return nil, &ConfigError{Msg: fmt.Sprintf("Anthropic ThinkingBudget %d must be below MaxTokens %d", budget, out.MaxTokens)}
-		case budget > out.MaxTokens/2 && req.ThinkingBudget <= 0:
-			// A preset larger than half an explicit cap would starve the
-			// visible answer: keep half for output (never below Anthropic's
-			// minimum budget, which must still fit under the cap).
-			budget = maxInt(out.MaxTokens/2, anthropicMinThinkingBudget)
-			if budget >= out.MaxTokens {
-				return nil, &ConfigError{Msg: fmt.Sprintf("Anthropic thinking needs MaxTokens above %d, got %d", anthropicMinThinkingBudget, out.MaxTokens)}
+	if anthropicThinkingOn(req.Thinking) {
+		if req.ThinkingBudget > 0 {
+			// Legacy budget path: max_tokens must exceed budget_tokens.
+			budget := maxInt(req.ThinkingBudget, anthropicMinThinkingBudget)
+			switch {
+			case out.MaxTokens <= 0:
+				out.MaxTokens = budget + anthropicDefaultMaxTokens
+			case budget >= out.MaxTokens:
+				return nil, &ConfigError{Msg: fmt.Sprintf("Anthropic ThinkingBudget %d must be below MaxTokens %d", budget, out.MaxTokens)}
+			}
+			out.Thinking = &anThinking{Type: "enabled", BudgetTokens: budget}
+			legacyThinking = true
+		} else {
+			// Adaptive thinking; the preset level selects the effort.
+			if out.MaxTokens <= 0 {
+				out.MaxTokens = anthropicAdaptiveMaxTokens
+			}
+			out.Thinking = &anThinking{Type: "adaptive"}
+			if req.Thinking != "enabled" {
+				out.OutputConfig = &anOutputConfig{Effort: req.Thinking}
 			}
 		}
-		out.Thinking = &anThinking{Type: "enabled", BudgetTokens: budget}
-		// Extended thinking rejects modified sampling; the provider default
+		// Thinking rejects modified sampling; the provider default
 		// is the only accepted value.
 		out.Temperature, out.TopP = nil, nil
 	}
@@ -240,7 +239,7 @@ func buildAnthropicRequest(req *ChatRequest, model string, stream bool) ([]byte,
 		}
 		out.Tools = append(out.Tools, tool)
 	}
-	if err := anthropicToolControls(req, &out, out.Thinking != nil); err != nil {
+	if err := anthropicToolControls(req, &out, legacyThinking); err != nil {
 		return nil, err
 	}
 

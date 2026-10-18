@@ -154,11 +154,17 @@ func TestParallelToolCallsAndSeed(t *testing.T) {
 func TestAnthropic_ForcedToolWithThinkingRejected(t *testing.T) {
 	for _, choice := range []*ToolChoice{{Mode: ToolChoiceRequired}, ToolChoiceNamed("f")} {
 		req := toolReq(choice)
-		req.Thinking = "low"
+		req.Thinking, req.ThinkingBudget = "low", 2000 // legacy budget path only (AC-6)
 		_, err := buildAnthropicRequest(req, "claude", false)
 		var ce *ConfigError
 		if !errors.As(err, &ce) {
 			t.Errorf("%+v: err = %v, want ConfigError", choice, err)
+		}
+		// Adaptive thinking passes forced tool choice through unchanged.
+		req = toolReq(choice)
+		req.Thinking = "low"
+		if _, err := buildAnthropicRequest(req, "claude", false); err != nil {
+			t.Errorf("%+v adaptive: err = %v, want pass-through", choice, err)
 		}
 	}
 	req := toolReq(&ToolChoice{Mode: ToolChoiceAuto})
@@ -235,7 +241,7 @@ func TestResponseFormat_AnthropicConflicts(t *testing.T) {
 	cases := []*ChatRequest{
 		{Tools: []ToolDef{{Name: "f"}}, ResponseFormat: rf},                                                // name collision
 		{Tools: []ToolDef{{Name: "g"}}, ToolChoice: &ToolChoice{Mode: ToolChoiceAuto}, ResponseFormat: rf}, // forced tool vs ToolChoice
-		{Thinking: "low", ResponseFormat: &ResponseFormat{Type: ResponseJSONObject}},                       // forced tool vs thinking
+		{Thinking: "low", ThinkingBudget: 2000, ResponseFormat: &ResponseFormat{Type: ResponseJSONObject}}, // forced tool vs thinking
 	}
 	for i, req := range cases {
 		req.Messages = []Message{{Role: RoleUser, Content: "x"}}
