@@ -2,6 +2,7 @@ package llm
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"io"
 	"time"
@@ -41,11 +42,17 @@ type sseItem struct {
 // goroutine on a channel send.
 func parseSSEStream(r io.Reader, ch chan<- sseItem, done <-chan struct{}) {
 	defer close(ch)
-	br := bufio.NewReaderSize(r, 64*1024)
+	lr := &sseLineReader{br: bufio.NewReaderSize(r, 64*1024)}
 	var data []byte
 	sawActivity := false
+	first := true
 	for {
-		line, err := readSSELine(br)
+		line, err := lr.readSSELine()
+		if first {
+			// A leading UTF-8 BOM is not part of the first field name.
+			line = bytes.TrimPrefix(line, []byte("\xef\xbb\xbf"))
+			first = false
+		}
 		if len(line) > 0 {
 			sawActivity = true
 			switch {
@@ -107,32 +114,41 @@ func sendSSE(ch chan<- sseItem, done <-chan struct{}, it sseItem) bool {
 	}
 }
 
-// readSSELine reads one line including the trailing newline; returns the
-// line without it (also strips a trailing \r\n for CRLF frames). Lines
-// longer than the bufio buffer are accumulated across ReadSlice calls,
-// bounded by sseMaxLineSize.
-func readSSELine(br *bufio.Reader) ([]byte, error) {
+// sseLineReader splits SSE input on \n, \r\n or a bare \r (all three are
+// line endings per the SSE spec). A \r at the end of the buffered data
+// never blocks waiting for a possible \n: the pending-LF flag skips it when
+// it arrives.
+type sseLineReader struct {
+	br     *bufio.Reader
+	skipLF bool
+}
+
+// readSSELine reads one line and returns it without its terminator. Lines
+// longer than sseMaxLineSize fail with errSSEOversized.
+func (lr *sseLineReader) readSSELine() ([]byte, error) {
 	var buf []byte
 	for {
-		frag, err := br.ReadSlice('\n')
-		if len(buf)+len(frag) > sseMaxLineSize {
-			return nil, errSSEOversized
-		}
-		buf = append(buf, frag...)
-		if err == bufio.ErrBufferFull {
-			continue // line spans the buffer boundary; keep accumulating
-		}
+		c, err := lr.br.ReadByte()
 		if err != nil {
-			return buf, err // EOF or read error; trailing line lacks '\n'
+			return buf, err // EOF or read error; trailing line lacks a terminator
 		}
-		l := len(buf)
-		if l > 0 && buf[l-1] == '\n' {
-			l--
-			if l > 0 && buf[l-1] == '\r' {
-				l--
+		if lr.skipLF {
+			lr.skipLF = false
+			if c == '\n' {
+				continue
 			}
 		}
-		return buf[:l], nil
+		switch c {
+		case '\n':
+			return buf, nil
+		case '\r':
+			lr.skipLF = true
+			return buf, nil
+		}
+		if len(buf) >= sseMaxLineSize {
+			return nil, errSSEOversized
+		}
+		buf = append(buf, c)
 	}
 }
 
@@ -186,11 +202,13 @@ func pumpSSE(ctx context.Context, r io.ReadCloser, idle time.Duration, handle fu
 			}
 			switch it.kind {
 			case sseData:
-				if timer != nil {
-					timer.Reset(idle)
-				}
+				// Only provider silence counts: the consumer's handle time
+				// is excluded, so the timer restarts after handle returns.
 				if err := handle(it.data); err != nil {
 					return err
+				}
+				if timer != nil {
+					timer.Reset(idle)
 				}
 			case sseKeepalive:
 				if timer != nil {

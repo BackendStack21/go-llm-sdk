@@ -563,6 +563,9 @@ type oaStreamChoice struct {
 type oaStreamChunk struct {
 	Choices []oaStreamChoice `json:"choices"`
 	Usage   *oaRespUsage     `json:"usage"`
+	Error   *struct {
+		Message string `json:"message"`
+	} `json:"error"`
 }
 
 // mapOpenAIStreamEvent folds one SSE data payload into the accumulator and
@@ -571,6 +574,13 @@ func mapOpenAIStreamEvent(data []byte, acc *streamAccum) (deltas []Delta, done b
 	var c oaStreamChunk
 	if err := json.Unmarshal(data, &c); err != nil {
 		return nil, false, fmt.Errorf("llm: parse stream chunk: %w", err)
+	}
+	if c.Error != nil {
+		msg := c.Error.Message
+		if msg == "" {
+			msg = "stream error"
+		}
+		return nil, false, fmt.Errorf("llm: provider error: %s", msg)
 	}
 	if c.Usage != nil {
 		acc.usage = usageFromOpenAI(c.Usage)

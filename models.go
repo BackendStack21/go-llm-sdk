@@ -76,7 +76,7 @@ func (pc *providerClient) get(ctx context.Context, url string) ([]byte, time.Dur
 		return nil, 0, err
 	}
 	if len(data) > maxModelsResponseSize {
-		return nil, 0, fmt.Errorf("llm: models response exceeds %d bytes", maxModelsResponseSize)
+		return nil, 0, terminal(fmt.Errorf("llm: models response exceeds %d bytes", maxModelsResponseSize))
 	}
 	ra := parseRetryAfter(resp.Header.Get("Retry-After"), time.Now())
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {

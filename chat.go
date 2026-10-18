@@ -377,7 +377,7 @@ func (pc *providerClient) post(ctx context.Context, client *http.Client, url str
 		return nil, 0, err
 	}
 	if len(data) > maxResponseSize {
-		return nil, 0, fmt.Errorf("llm: response exceeds %d bytes", maxResponseSize)
+		return nil, 0, terminal(fmt.Errorf("llm: response exceeds %d bytes", maxResponseSize))
 	}
 	ra = parseRetryAfter(resp.Header.Get("Retry-After"), time.Now())
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
@@ -610,7 +610,7 @@ func (pc *providerClient) callStream(ctx context.Context, req *ChatRequest, mode
 				rateErr, rateRA = out.apiErr, out.retryAfter
 			}
 			lastErr = out.apiErr
-			if attempt < n-1 && retrySleep(deadlineCtx, pc.retryDelay(out.retryAfter, attempt)) {
+			if attempt < n-1 && waitRetry(deadlineCtx, pc.retryDelay(out.retryAfter, attempt)) {
 				continue
 			}
 			if rateErr != nil {
@@ -621,10 +621,12 @@ func (pc *providerClient) callStream(ctx context.Context, req *ChatRequest, mode
 			return nil, out.apiErr
 		case out.err != nil && attempt < n-1:
 			lastErr = out.err
-			if retrySleep(deadlineCtx, pc.retryDelay(0, attempt)) {
+			if waitRetry(deadlineCtx, pc.retryDelay(0, attempt)) {
 				continue
 			}
-			return nil, deadlineCtx.Err() // interrupted by deadline/cancel, not exhaustion
+			// Interrupted by (or about to outlive) the deadline/cancel, not
+			// exhaustion: keep the last error retrievable.
+			return nil, withBudgetCause(deadlineCtx, out.err)
 		default:
 			return nil, out.err
 		}
@@ -732,7 +734,10 @@ func (pc *providerClient) attemptStream(ctx context.Context, url string, body []
 
 	switch {
 	case perr == nil, errors.Is(perr, errStreamStop):
-		if perr == nil && !acc.sawFinish {
+		// A bare [DONE] (nothing emitted, no finish) is an empty premature
+		// close, never a silent empty success. [DONE] after content is
+		// tolerated: some gateways omit finish_reason.
+		if !acc.sawFinish && (perr == nil || !acc.emitted) {
 			// Every format sends an explicit completion signal ([DONE],
 			// finish_reason, message_stop, finishReason, response.completed)
 			// before EOF. It never arrived: the provider dropped the stream.

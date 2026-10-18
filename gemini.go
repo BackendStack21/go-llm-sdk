@@ -438,6 +438,9 @@ type gmStreamChunk struct {
 	Candidates     []gmCandidate     `json:"candidates"`
 	PromptFeedback *gmPromptFeedback `json:"promptFeedback"`
 	UsageMetadata  *gmUsage          `json:"usageMetadata"` // nil = chunk carries no usage update
+	Error          *struct {
+		Message string `json:"message"`
+	} `json:"error"`
 }
 
 // mapGeminiStreamEvent folds one Gemini SSE chunk into acc. Chunks carry
@@ -447,6 +450,13 @@ func mapGeminiStreamEvent(data []byte, acc *streamAccum) ([]Delta, bool, error) 
 	var c gmStreamChunk
 	if err := json.Unmarshal(data, &c); err != nil {
 		return nil, false, fmt.Errorf("llm: parse stream chunk: %w", err)
+	}
+	if c.Error != nil {
+		msg := c.Error.Message
+		if msg == "" {
+			msg = "stream error"
+		}
+		return nil, false, fmt.Errorf("llm: provider error: %s", msg)
 	}
 	if c.UsageMetadata != nil {
 		acc.usage = mapGeminiUsage(*c.UsageMetadata)

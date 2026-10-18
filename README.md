@@ -115,7 +115,7 @@ llm.WithProvider("azure", llm.WithFormat(llm.FormatOpenAI), llm.WithBaseURL(azur
 	llm.WithHeaders(map[string]string{"Authorization": "", "api-key": key}))
 ```
 
-Redirects to another host are never followed (the redirect response surfaces as an `*APIError`): Go strips only `Authorization` across hosts, so `x-api-key`, `x-goog-api-key` and custom headers would otherwise leak to the target. `Provider` and `ProviderConfig` redact the key and header values under every `fmt` verb (`%v`, `%+v`, `%#v`).
+Redirects to another host, and https-to-http scheme downgrades on the same host, are never followed (the redirect response surfaces as an `*APIError`): Go strips only `Authorization` across hosts, so `x-api-key`, `x-goog-api-key` and custom headers would otherwise leak to the target. `Provider` and `ProviderConfig` redact the key and header values under every `fmt` verb (`%v`, `%+v`, `%#v`).
 
 For request/response observability (logging, metrics, tracing), wrap the transport: `llm.WithTransport(myRoundTripper)` sees every HTTP exchange the SDK makes.
 
@@ -219,7 +219,7 @@ Controls are validated before any network I/O (`*ConfigError`): `ToolChoice` nee
 
 `CallStream` enforces four guarantees, each covered by regression tests:
 
-1. **Idle watchdog** — a stream silent longer than the idle timeout (120s default; per SDK via `WithStreamIdleTimeout`, process-wide default via the race-safe `SetStreamIdleTimeout`; positive values only) fails with `ErrIdleTimeout`. Keepalive comments reset it.
+1. **Idle watchdog** — a stream silent longer than the idle timeout (120s default; per SDK via `WithStreamIdleTimeout`, process-wide default via the race-safe `SetStreamIdleTimeout`; positive values only) fails with `ErrIdleTimeout`. Keepalive comments reset it; time spent in your `onDelta` callback never counts, only provider silence. A provider `{"error":...}` chunk (OpenAI-compat, Gemini, plus Anthropic/Responses error events) fails the stream with the provider message, and a bare `[DONE]` with nothing emitted is a premature-close error. The parser tolerates a leading UTF-8 BOM and `\n`, `\r\n` or bare `\r` line endings.
 2. **Hard wall-clock deadline** — the whole stream is bounded by the per-request timeout (`WithRequestTimeout`, default 120s; per-client via `SetRequestTimeout`).
 3. **Retries never duplicate output** — retries happen only before the first emitted delta. A failure after partial output returns the partial `*ChatResult` plus a wrapped error and is never retried.
 4. **No silent truncation** — a provider that closes the stream before any completion signal (`[DONE]`, a `finish_reason`, `message_stop`, a Gemini `finishReason`, `response.completed`) yields an error: retryable before the first delta, the partial result plus a wrapped error after it. Gemini is no longer exempt. An unmapped provider finish reason still counts as completion.
@@ -277,7 +277,7 @@ Every engagement is observable: `WithLearnObserver(func(LearnEvent))` registers 
 
 ## Retry policy
 
-8 attempts, exponential backoff capped at 30s with ±20% jitter (both configurable per SDK with `WithRetryPolicy(llm.RetryPolicy{MaxAttempts, MaxBackoff})`; `MaxAttempts: 1` disables retries), `Retry-After` (seconds or HTTP-date) honored and capped at 120s, context cancellation honored between and during attempts. Retryable statuses include 408/429/5xx plus Cloudflare 520–524 and Anthropic 529. Persistent 429s surface as `*llm.RateLimitError{Attempts, RetryAfter}` — including when the retry sleep is cut short by a deadline, so the caller never loses the retry signal. A 429 whose body is billing exhaustion (`insufficient_quota`, `exceeded your current quota`, `insufficient balance`, `no resource package`) is not retryable and fails on the first attempt. `RateLimitError` unwraps to `*APIError` for `errors.As` access to `Status`/`Retryable`.
+8 attempts, exponential backoff capped at 30s with ±20% jitter (both configurable per SDK with `WithRetryPolicy(llm.RetryPolicy{MaxAttempts, MaxBackoff})`; `MaxAttempts: 1` disables retries), `Retry-After` (seconds or HTTP-date) honored and capped at 120s, context cancellation honored between and during attempts. Retryable statuses include 408/429/5xx plus Cloudflare 520–524 and Anthropic 529. Persistent 429s surface as `*llm.RateLimitError{Attempts, RetryAfter}` — including when the retry sleep is cut short by a deadline, so the caller never loses the retry signal. When a backoff or `Retry-After` wait would outlive the context deadline, the SDK does not sleep: it returns the last `*APIError` / transport error immediately, also matching `context.DeadlineExceeded` under `errors.Is`. Oversized response bodies (50MB; 8MB for model lists) are terminal and never retried. A 429 whose body is billing exhaustion (`insufficient_quota`, `exceeded your current quota`, `insufficient balance`, `no resource package`) is not retryable and fails on the first attempt. `RateLimitError` unwraps to `*APIError` for `errors.As` access to `Status`/`Retryable`.
 
 ## Timeouts & cancellation
 
@@ -401,7 +401,7 @@ v1.0 removes or renames nothing exported. Existing code compiles unchanged unles
 | `Delta.ToolIndex` | Anthropic content-block / Responses output index | The call's position in `ChatResult.ToolCalls` on every format | Streaming UIs that grouped fragments by index on Anthropic or Responses |
 | Anthropic thinking | Unset `MaxTokens` sent 8192 (rejected with budgets ≥ 8192); sampling fields sent | Unset `MaxTokens` → budget + 8192; `temperature`/`top_p` omitted; impossible budgets are a `ConfigError` | Requests that used to 400 now succeed |
 | Thinking replay | One `ReasoningContent` + `ThinkingSignature` pair | Every block in `ThinkingBlocks` (incl. redacted), Gemini signatures per `ToolCall` | Append `res.AssistantMessage()` instead of copying fields by hand |
-| Redirects | Followed to any host | Cross-host redirects are not followed (credential leak); they surface as `*APIError` | Point `WithBaseURL` at the final host |
+| Redirects | Followed to any host | Cross-host redirects and https-to-http downgrades are not followed (credential leak); they surface as `*APIError` | Point `WithBaseURL` at the final host |
 | Validation | Sent to the provider | DeepSeek `json_schema`, malformed base URLs, control characters in `TranscribeRequest.Filename`/`MIMEType` are `ConfigError`s | — |
 | `ListModels` | Silently truncated at 10 pages | Up to 100 pages, then `ErrModelListTruncated` | — |
 

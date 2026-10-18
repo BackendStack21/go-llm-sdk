@@ -220,7 +220,7 @@ func (pc *providerClient) postMultipart(ctx context.Context, url string, body []
 		return nil, 0, err
 	}
 	if len(data) > maxResponseSize {
-		return nil, 0, fmt.Errorf("llm: response exceeds %d bytes", maxResponseSize)
+		return nil, 0, terminal(fmt.Errorf("llm: response exceeds %d bytes", maxResponseSize))
 	}
 	ra = parseRetryAfter(resp.Header.Get("Retry-After"), time.Now())
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
