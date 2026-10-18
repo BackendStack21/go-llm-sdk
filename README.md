@@ -405,6 +405,15 @@ res, err := sdk.Transcribe(ctx, "openai", "whisper-1", llm.TranscribeRequest{
 
 Requests carry the same retry ladder and error taxonomy as chat. Oversized audio (>25MB), empty `Audio`/`Model`, and control characters in `Filename`/`MIMEType` (header injection) fail fast with a `ConfigError` before any network I/O. `Format` `"text"`, `"srt"` and `"vtt"` are not JSON: the raw response body is returned as `Text` (other fields zero). For the JSON formats (default, `json`, `verbose_json`) a 2xx body that is not JSON surfaces as a typed `*APIError`. Fields the provider does not report stay zero — the SDK never guesses.
 
+## Counting tokens
+
+`ChatClient.CountTokens(ctx, req)` returns the input token count of a request without generating: Anthropic `POST /v1/messages/count_tokens` and Gemini `:countTokens`. The request is validated like `Call` (`Extra` and sampling parameters are ignored). OpenAI-format providers, including the Responses API, have no such endpoint: the call returns `*UnsupportedError` (`errors.Is(err, llm.ErrUnsupported)`) without any network I/O, and the SDK never estimates. Same retry ladder, whole-call timeout, per-request `Headers` and attempt observer (operation `count_tokens`) as chat; a 2xx response without a valid count is a terminal `*APIError`.
+
+```go
+n, err := chat.CountTokens(ctx, &llm.ChatRequest{Messages: msgs, Tools: tools})
+if errors.Is(err, llm.ErrUnsupported) { /* fall back to your own estimate */ }
+```
+
 ## Embeddings
 
 `Embed` turns texts into vectors via OpenAI-compatible `POST {base}/embeddings` or Gemini `batchEmbedContents`; Anthropic (no endpoint) returns a `ConfigError`. OpenAI-compatible requests ask for `encoding_format: base64` (little-endian float32, decoded by the SDK) so a 2048-input batch fits the response size cap; providers that ignore it and return float arrays are still accepted.

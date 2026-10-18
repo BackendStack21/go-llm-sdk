@@ -153,11 +153,11 @@ func (pc *providerClient) requestTimeout() time.Duration {
 
 // ── request assembly ─────────────────────────────────────────────────────
 
-// buildChatRequest dispatches format-specific serialization. stream=false
-// yields the buffered request; stream=true the SSE request.
-func (pc *providerClient) buildChatRequest(req *ChatRequest, model string, stream bool) ([]byte, string, error) {
+// validateChatRequest applies the boundary validation shared by chat and
+// token counting and returns the effective model.
+func validateChatRequest(req *ChatRequest, model string) (string, error) {
 	if req == nil {
-		return nil, "", &ConfigError{Msg: "chat request is nil"}
+		return "", &ConfigError{Msg: "chat request is nil"}
 	}
 	// Reject unknown roles loudly: OpenAI would silently send them as user
 	// messages and Anthropic/Gemini would silently drop them.
@@ -165,20 +165,30 @@ func (pc *providerClient) buildChatRequest(req *ChatRequest, model string, strea
 		switch m.Role {
 		case RoleUser, RoleAssistant, RoleSystem, RoleTool:
 		default:
-			return nil, "", &ConfigError{Msg: fmt.Sprintf("message %d: unknown role %q", i, string(m.Role))}
+			return "", &ConfigError{Msg: fmt.Sprintf("message %d: unknown role %q", i, string(m.Role))}
 		}
 	}
 	if err := validateRequestContent(req.Messages); err != nil {
-		return nil, "", err
+		return "", err
 	}
 	if err := validateRequestControls(req); err != nil {
-		return nil, "", err
+		return "", err
 	}
 	if model == "" {
 		model = req.Model
 	}
 	if model == "" {
-		return nil, "", &ConfigError{Msg: "no model set (ChatRequest.Model empty and no ChatClient model)"}
+		return "", &ConfigError{Msg: "no model set (ChatRequest.Model empty and no ChatClient model)"}
+	}
+	return model, nil
+}
+
+// buildChatRequest dispatches format-specific serialization. stream=false
+// yields the buffered request; stream=true the SSE request.
+func (pc *providerClient) buildChatRequest(req *ChatRequest, model string, stream bool) ([]byte, string, error) {
+	model, err := validateChatRequest(req, model)
+	if err != nil {
+		return nil, "", err
 	}
 	body, url, err := pc.buildFormatBody(req, model, stream)
 	if err != nil {

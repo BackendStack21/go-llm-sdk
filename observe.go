@@ -11,7 +11,7 @@ import (
 // WithAttemptObserver.
 type AttemptEvent struct {
 	Provider   string
-	Operation  string        // "chat" | "stream" | "embed" | "speak" | "transcribe" | "models"
+	Operation  string        // "chat" | "stream" | "embed" | "speak" | "transcribe" | "models" | "count_tokens"
 	Model      string        // "" for models
 	Attempt    int           // 1-based, per entry-point call
 	Status     int           // HTTP status; 0 on transport error
