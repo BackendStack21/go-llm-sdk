@@ -476,6 +476,8 @@ func usageFromOpenAI(u *oaRespUsage) Usage {
 }
 
 type oaResponse struct {
+	ID      string         `json:"id"`
+	Model   string         `json:"model"`
 	Choices []oaRespChoice `json:"choices"`
 	Usage   *oaRespUsage   `json:"usage"`
 	Error   *oaErrorBody   `json:"error"`
@@ -524,6 +526,7 @@ func parseOpenAIResponse(body []byte) (*ChatResult, error) {
 		ReasoningContent: foldReasoning(string(ch.Message.ReasoningContent), string(ch.Message.Reasoning), ch.Message.ReasoningDetails),
 		FinishReason:     mapOpenAIFinishReason(ch.FinishReason),
 		Refusal:          ch.Message.Refusal,
+		Meta:             ResponseMeta{ID: r.ID, Model: r.Model},
 	}
 	for _, tc := range ch.Message.ToolCalls {
 		args := tc.Function.Arguments
@@ -573,6 +576,8 @@ type oaStreamChoice struct {
 }
 
 type oaStreamChunk struct {
+	ID      string           `json:"id"`
+	Model   string           `json:"model"`
 	Choices []oaStreamChoice `json:"choices"`
 	Usage   *oaRespUsage     `json:"usage"`
 	Error   json.RawMessage  `json:"error"` // see streamErrorMessage
@@ -588,6 +593,7 @@ func mapOpenAIStreamEvent(data []byte, acc *streamAccum) (deltas []Delta, done b
 	if msg, ok := streamErrorMessage(c.Error); ok {
 		return nil, false, fmt.Errorf("llm: provider error: %s", msg)
 	}
+	acc.noteMeta(c.ID, c.Model)
 	if c.Usage != nil {
 		acc.usage = usageFromOpenAI(c.Usage)
 	}

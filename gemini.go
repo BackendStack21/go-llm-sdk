@@ -325,6 +325,8 @@ type gmPromptFeedback struct {
 }
 
 type gmResponse struct {
+	ResponseID     string            `json:"responseId"`
+	ModelVersion   string            `json:"modelVersion"`
 	Candidates     []gmCandidate     `json:"candidates"`
 	UsageMetadata  gmUsage           `json:"usageMetadata"`
 	PromptFeedback *gmPromptFeedback `json:"promptFeedback"`
@@ -432,13 +434,14 @@ func parseGeminiResponse(body []byte) (*ChatResult, error) {
 	if len(r.Candidates) == 0 {
 		if r.PromptFeedback != nil && r.PromptFeedback.BlockReason != "" {
 			// A blocked prompt is a completed, filtered turn.
-			return &ChatResult{FinishReason: FinishContentFilter, Usage: mapGeminiUsage(r.UsageMetadata)}, nil
+			return &ChatResult{FinishReason: FinishContentFilter, Usage: mapGeminiUsage(r.UsageMetadata), Meta: ResponseMeta{ID: r.ResponseID, Model: r.ModelVersion}}, nil
 		}
 		return nil, fmt.Errorf("llm: response has no candidates")
 	}
 	acc := newStreamAccum()
 	c := r.Candidates[0]
 	foldGeminiParts(c.Content.Parts, acc)
+	acc.noteMeta(r.ResponseID, r.ModelVersion)
 	res := acc.result()
 	res.FinishReason = geminiFinish(c.FinishReason, len(res.ToolCalls) > 0)
 	res.Usage = mapGeminiUsage(r.UsageMetadata)
@@ -448,6 +451,8 @@ func parseGeminiResponse(body []byte) (*ChatResult, error) {
 // ── streaming ────────────────────────────────────────────────────────────
 
 type gmStreamChunk struct {
+	ResponseID     string            `json:"responseId"`
+	ModelVersion   string            `json:"modelVersion"`
 	Candidates     []gmCandidate     `json:"candidates"`
 	PromptFeedback *gmPromptFeedback `json:"promptFeedback"`
 	UsageMetadata  *gmUsage          `json:"usageMetadata"` // nil = chunk carries no usage update
@@ -465,6 +470,7 @@ func mapGeminiStreamEvent(data []byte, acc *streamAccum) ([]Delta, bool, error) 
 	if msg, ok := streamErrorMessage(c.Error); ok {
 		return nil, false, fmt.Errorf("llm: provider error: %s", msg)
 	}
+	acc.noteMeta(c.ResponseID, c.ModelVersion)
 	if c.UsageMetadata != nil {
 		acc.usage = mapGeminiUsage(*c.UsageMetadata)
 	}

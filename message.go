@@ -282,6 +282,8 @@ type ChatResult struct {
 	// Refusal is the provider's refusal text when it signals one; empty
 	// otherwise. Content is never altered.
 	Refusal string
+	// Meta is provider-reported response metadata (zero when unreported).
+	Meta ResponseMeta
 }
 
 // DeltaKind discriminates streamed fragments.

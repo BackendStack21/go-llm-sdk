@@ -323,6 +323,8 @@ func (e *rsErrorBody) UnmarshalJSON(b []byte) error {
 }
 
 type rsResponse struct {
+	ID                string `json:"id"`
+	Model             string `json:"model"`
 	Status            string `json:"status"`
 	IncompleteDetails *struct {
 		Reason string `json:"reason"`
@@ -355,7 +357,7 @@ func usageFromResponses(u *rsUsage) Usage {
 }
 
 func chatResultFromResponses(r *rsResponse) *ChatResult {
-	res := &ChatResult{}
+	res := &ChatResult{Meta: ResponseMeta{ID: r.ID, Model: r.Model}}
 	var summaries []string
 	for _, item := range r.Output {
 		switch item.Type {
@@ -483,6 +485,9 @@ func mapResponsesStreamEvent(data []byte, acc *streamAccum) (deltas []Delta, don
 	var ev rsStreamEvent
 	if err := json.Unmarshal(data, &ev); err != nil {
 		return nil, false, fmt.Errorf("llm: parse responses stream: %w", err)
+	}
+	if ev.Response != nil {
+		acc.noteMeta(ev.Response.ID, ev.Response.Model)
 	}
 	switch ev.Type {
 	case "response.reasoning_summary_text.delta":

@@ -383,7 +383,7 @@ func TestModelsGetOversizedBody(t *testing.T) {
 func TestBufferedCallPostBuildError(t *testing.T) {
 	pc := newProviderClient(ProviderConfig{ID: "x", Format: FormatOpenAI, BaseURL: "http://127.0.0.1:1", APIKey: "k"}, nil, nil)
 	// NUL is rejected by net/url at request-build time, before any dial.
-	_, _, err := pc.post(context.Background(), pc.buffered(), "http://127.0.0.1:1/\x00chat", nil)
+	_, _, _, err := pc.post(context.Background(), pc.buffered(), "http://127.0.0.1:1/\x00chat", nil)
 	var ce *ConfigError
 	if !errors.As(err, &ce) {
 		t.Fatalf("err = %v (%T), want request-build ConfigError", err, err)

@@ -357,10 +357,10 @@ func (pc *providerClient) httpError(status int, body []byte) *APIError {
 
 // post sends one HTTP request and reads the full body (capped). Non-2xx
 // responses return an *APIError with the Retry-After hint alongside.
-func (pc *providerClient) post(ctx context.Context, client *http.Client, url string, body []byte) (data []byte, ra time.Duration, err error) {
+func (pc *providerClient) post(ctx context.Context, client *http.Client, url string, body []byte) (data []byte, hdr http.Header, ra time.Duration, err error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body))
 	if err != nil {
-		return nil, 0, &ConfigError{Msg: "build request: " + err.Error()}
+		return nil, nil, 0, &ConfigError{Msg: "build request: " + err.Error()}
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Accept", "application/json")
@@ -368,21 +368,21 @@ func (pc *providerClient) post(ctx context.Context, client *http.Client, url str
 
 	resp, err := client.Do(req)
 	if err != nil {
-		return nil, 0, err
+		return nil, nil, 0, err
 	}
 	defer func() { _ = resp.Body.Close() }()
 	data, err = io.ReadAll(io.LimitReader(resp.Body, maxResponseSize+1))
 	if err != nil {
-		return nil, 0, err
+		return nil, nil, 0, err
 	}
 	if len(data) > maxResponseSize {
-		return nil, 0, terminal(fmt.Errorf("llm: response exceeds %d bytes", maxResponseSize))
+		return nil, nil, 0, terminal(fmt.Errorf("llm: response exceeds %d bytes", maxResponseSize))
 	}
 	ra = parseRetryAfter(resp.Header.Get("Retry-After"), time.Now())
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return data, ra, pc.httpError(resp.StatusCode, data)
+		return data, resp.Header, ra, pc.httpError(resp.StatusCode, data)
 	}
-	return data, ra, nil
+	return data, resp.Header, ra, nil
 }
 
 // ── error classification helpers ─────────────────────────────────────────
@@ -467,11 +467,12 @@ func (pc *providerClient) call(ctx context.Context, req *ChatRequest, model stri
 		if err != nil {
 			return 0, terminal(err)
 		}
-		data, ra, err := pc.post(ctx, pc.buffered(), url, body)
+		data, hdr, ra, err := pc.post(ctx, pc.buffered(), url, body)
 		if err != nil {
 			return ra, err
 		}
 		res, err = pc.parseResponse(data, url, pc.jsonTool(req))
+		res.withHeaderMeta(hdr)
 		return 0, terminal(err)
 	}, func(apiErr *APIError) bool {
 		return pc.learnFromChatError(req, apiErr)
@@ -706,6 +707,7 @@ func (pc *providerClient) attemptStream(ctx context.Context, url string, body []
 			return streamOutcome{bufferedResponse: true, err: fmt.Errorf("llm: response exceeds %d bytes", maxResponseSize)}
 		}
 		result, err := pc.parseResponse(data, url, jsonTool)
+		result.withHeaderMeta(resp.Header)
 		return streamOutcome{bufferedResponse: true, result: result, err: err}
 	}
 
@@ -743,17 +745,17 @@ func (pc *providerClient) attemptStream(ctx context.Context, url string, body []
 			// Never surface this as a silent (partial or empty) success.
 			if acc.emitted {
 				return streamOutcome{
-					result: acc.result(),
+					result: acc.resultWith(resp.Header),
 					err:    fmt.Errorf("llm: stream closed before completion: %w", errPrematureClose),
 				}
 			}
 			return streamOutcome{err: errPrematureClose}
 		}
-		return streamOutcome{result: acc.result()}
+		return streamOutcome{result: acc.resultWith(resp.Header)}
 	default:
 		var ca *consumerAbort
 		if errors.As(perr, &ca) {
-			return streamOutcome{result: acc.result(), abort: &StreamAbortedError{Reason: ca.err}}
+			return streamOutcome{result: acc.resultWith(resp.Header), abort: &StreamAbortedError{Reason: ca.err}}
 		}
 		if !acc.emitted {
 			// No output delivered yet: a full retry duplicates nothing.
@@ -763,7 +765,7 @@ func (pc *providerClient) attemptStream(ctx context.Context, url string, body []
 		}
 		// Partial output was delivered: never retry, surface with partial.
 		return streamOutcome{
-			result: acc.result(),
+			result: acc.resultWith(resp.Header),
 			err:    fmt.Errorf("llm: stream failed after partial output: %w", perr),
 		}
 	}
@@ -808,6 +810,7 @@ type streamAccum struct {
 	jsonBlock         int    // content-block index of the JSON-mode tool_use (-1 = none)
 	jsonWritten       bool   // JSON-mode tool input produced any content
 	lastToolKey       int    // OpenAI-format: provider key of the most recent tool-call delta
+	metaID, metaModel string // provider-reported response id / model
 }
 
 func newStreamAccum() *streamAccum {
@@ -865,6 +868,23 @@ func (a *streamAccum) block(idx int) *thinkingAccum {
 	return b
 }
 
+// noteMeta records the first non-empty provider id/model seen.
+func (a *streamAccum) noteMeta(id, model string) {
+	if a.metaID == "" {
+		a.metaID = id
+	}
+	if a.metaModel == "" {
+		a.metaModel = model
+	}
+}
+
+// resultWith is result() plus the response-header metadata.
+func (a *streamAccum) resultWith(h http.Header) *ChatResult {
+	res := a.result()
+	res.withHeaderMeta(h)
+	return res
+}
+
 func (a *streamAccum) result() *ChatResult {
 	res := &ChatResult{
 		Content:           a.content.String(),
@@ -873,6 +893,7 @@ func (a *streamAccum) result() *ChatResult {
 		FinishReason:      a.finishReason,
 		Usage:             a.usage,
 		Refusal:           a.refusal.String(),
+		Meta:              ResponseMeta{ID: a.metaID, Model: a.metaModel},
 	}
 	res.FinishReason = refusalFinish(res.FinishReason, res.Refusal)
 	for _, b := range a.thinking {

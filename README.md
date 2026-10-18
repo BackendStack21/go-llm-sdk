@@ -184,11 +184,14 @@ type ChatResult struct {
 	ToolCalls         []ToolCall      // {ID, Name, Arguments, Signature (Gemini thoughtSignature)}
 	FinishReason      string          // stop | length | tool_calls | content_filter | ""
 	Refusal           string          // provider refusal text ("" when none); Content is never altered
+	Meta              llm.ResponseMeta // provider-reported id/model/request id/rate-limit headroom (zero when unreported)
 	Usage             Usage           // see "Usage" below
 }
 ```
 
 `Refusal` carries the provider's refusal text (OpenAI `message.refusal`, Responses `refusal` parts, Anthropic `stop_details.explanation`; Gemini has none) and is streamed as `DeltaRefusal`. A refusal on a `stop`/unmapped finish reports `content_filter`; `length`/`tool_calls` are kept. `AssistantMessage()` does not replay it.
+
+`Meta` (`ResponseMeta`, also on `EmbedResult`, `SpeakResult`, `TranscribeResult`) is provider-reported or zero, never guessed: `ID` (OpenAI/Responses `id`, Anthropic `id`, Gemini `responseId`), `Model` (`model`, Gemini `modelVersion`), `RequestID` (first of `x-request-id`, `request-id`, `x-goog-request-id`, `x-amzn-requestid`) and `RateLimit` (`Reported`, `RemainingRequests`, `RemainingTokens`, `ResetRequests`, `ResetTokens`, from `x-ratelimit-*` with `anthropic-ratelimit-*` as per-field fallback; unparseable values stay zero). Headers come from the successful attempt only, buffered and streaming. ID/Model are empty on Embed/Speak/Transcribe.
 
 Finish reasons are canonical: anything a provider reports outside that vocabulary maps to `""` (unknown) rather than leaking provider-specific strings. A tool-call turn that ends normally (provider `stop`/`STOP`/`end_turn`, or the format's tool signal) finishes as `tool_calls` on every format (Gemini and OpenAI-format providers with a named `tool_choice` report `STOP`/`stop` for it; the SDK maps it). A truncation (`length`), filter (`content_filter`) or unmapped reason keeps that value (or `""`) even when calls are present, because the calls may be incomplete. A tool call with no arguments carries `{}` in `Arguments` on every format, buffered and streaming.
 

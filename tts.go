@@ -36,6 +36,7 @@ type SpeakResult struct {
 	Audio    []byte // raw audio bytes as the provider returned them
 	Model    string // model that produced the audio
 	MIMEType string // provider-declared (or well-known default) MIME type
+	Meta     ResponseMeta
 }
 
 // Speak synthesizes speech with the named provider and model. Buffered
@@ -100,7 +101,7 @@ func (pc *providerClient) speak(ctx context.Context, model string, req SpeakRequ
 	defer cancel()
 	var res *SpeakResult
 	err = pc.withRetry(ctx, func() (time.Duration, error) {
-		data, ctype, ra, err := pc.postAudio(ctx, url, body)
+		data, ctype, hdr, ra, err := pc.postAudio(ctx, url, body)
 		if err != nil {
 			return ra, err
 		}
@@ -128,6 +129,7 @@ func (pc *providerClient) speak(ctx context.Context, model string, req SpeakRequ
 			Audio:    data,
 			Model:    model,
 			MIMEType: resolveAudioMIME(ctype, mimeHint),
+			Meta:     parseResponseMeta(hdr),
 		}
 		return 0, nil
 	}, nil)
@@ -150,32 +152,32 @@ func resolveAudioMIME(ctype, fallback string) string {
 
 // postAudio sends one TTS request and reads the full binary body (capped).
 // Unlike post it captures the response Content-Type and never assumes JSON.
-func (pc *providerClient) postAudio(ctx context.Context, url string, body []byte) (data []byte, ctype string, ra time.Duration, err error) {
+func (pc *providerClient) postAudio(ctx context.Context, url string, body []byte) (data []byte, ctype string, hdr http.Header, ra time.Duration, err error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body))
 	if err != nil {
-		return nil, "", 0, &ConfigError{Msg: "build request: " + err.Error()}
+		return nil, "", nil, 0, &ConfigError{Msg: "build request: " + err.Error()}
 	}
 	req.Header.Set("Content-Type", "application/json")
 	pc.setHeaders(req.Header)
 
 	resp, err := pc.buffered().Do(req)
 	if err != nil {
-		return nil, "", 0, err
+		return nil, "", nil, 0, err
 	}
 	defer func() { _ = resp.Body.Close() }()
 	ctype = resp.Header.Get("Content-Type")
 	data, err = io.ReadAll(io.LimitReader(resp.Body, maxResponseSize+1))
 	if err != nil {
-		return nil, "", 0, err
+		return nil, "", nil, 0, err
 	}
 	if len(data) > maxResponseSize {
-		return nil, "", 0, terminal(fmt.Errorf("llm: audio response exceeds %d bytes", maxResponseSize))
+		return nil, "", nil, 0, terminal(fmt.Errorf("llm: audio response exceeds %d bytes", maxResponseSize))
 	}
 	ra = parseRetryAfter(resp.Header.Get("Retry-After"), time.Now())
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return nil, "", ra, pc.httpError(resp.StatusCode, data)
+		return nil, "", nil, ra, pc.httpError(resp.StatusCode, data)
 	}
-	return data, ctype, ra, nil
+	return data, ctype, resp.Header, ra, nil
 }
 
 // ── Gemini TTS wire types ────────────────────────────────────────────────

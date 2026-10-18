@@ -34,6 +34,7 @@ type EmbedResult struct {
 	Embeddings [][]float64
 	Model      string
 	Usage      Usage // PromptTokens when the provider reports it
+	Meta       ResponseMeta
 }
 
 // Embed computes embeddings for req.Inputs with the named provider and
@@ -226,7 +227,7 @@ func (pc *providerClient) embed(ctx context.Context, model string, req EmbedRequ
 			return nil, err
 		}
 		err = pc.withRetry(ctx, func() (time.Duration, error) {
-			data, ra, err := pc.post(ctx, pc.buffered(), url, body)
+			data, hdr, ra, err := pc.post(ctx, pc.buffered(), url, body)
 			if err != nil {
 				return ra, err
 			}
@@ -238,6 +239,7 @@ func (pc *providerClient) embed(ctx context.Context, model string, req EmbedRequ
 			}
 			res.Embeddings = append(res.Embeddings, vecs...)
 			res.Usage.PromptTokens += usage.PromptTokens
+			res.Meta = parseResponseMeta(hdr)
 			return 0, nil
 		}, nil)
 		if err != nil {

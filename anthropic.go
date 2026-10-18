@@ -380,6 +380,8 @@ type anStopDetails struct {
 }
 
 type anResponse struct {
+	ID         string        `json:"id"`
+	Model      string        `json:"model"`
 	Content    []anRespBlock `json:"content"`
 	StopReason string        `json:"stop_reason"`
 	// StopDetails.Explanation is the refusal explanation, when present.
@@ -433,7 +435,7 @@ func parseAnthropicResponse(body []byte) (*ChatResult, error) {
 	if len(r.Content) == 0 && r.StopReason == "" {
 		return nil, fmt.Errorf("llm: response has no content blocks")
 	}
-	res := &ChatResult{FinishReason: mapAnthropicStopReason(r.StopReason)}
+	res := &ChatResult{FinishReason: mapAnthropicStopReason(r.StopReason), Meta: ResponseMeta{ID: r.ID, Model: r.Model}}
 	if r.StopReason == "refusal" {
 		res.Refusal = r.StopDetails.Explanation
 	}
@@ -473,6 +475,8 @@ type anStreamEvent struct {
 	Type string `json:"type"`
 	// message_start
 	Message struct {
+		ID    string  `json:"id"`
+		Model string  `json:"model"`
 		Usage anUsage `json:"usage"`
 	} `json:"message"`
 	// content_block_start / content_block_stop
@@ -505,6 +509,7 @@ func mapAnthropicStreamEvent(data []byte, acc *streamAccum) ([]Delta, bool, erro
 	var deltas []Delta
 	switch ev.Type {
 	case "message_start":
+		acc.noteMeta(ev.Message.ID, ev.Message.Model)
 		acc.usage = usageFromAnthropic(ev.Message.Usage)
 	case "content_block_start":
 		switch ev.ContentBlock.Type {

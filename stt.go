@@ -45,6 +45,7 @@ type TranscribeResult struct {
 	Model       string
 	Language    string
 	DurationSec float64
+	Meta        ResponseMeta
 }
 
 // Transcribe converts speech to text with the named provider and
@@ -140,7 +141,7 @@ func (pc *providerClient) transcribe(ctx context.Context, model string, req Tran
 	defer cancel()
 	var res *TranscribeResult
 	err = pc.withRetry(ctx, func() (time.Duration, error) {
-		data, ra, err := pc.postMultipart(ctx, url, body, ctype)
+		data, hdr, ra, err := pc.postMultipart(ctx, url, body, ctype)
 		if err != nil {
 			return ra, err
 		}
@@ -156,6 +157,7 @@ func (pc *providerClient) transcribe(ctx context.Context, model string, req Tran
 			})
 		}
 		r.Model = model
+		r.Meta = parseResponseMeta(hdr)
 		res = r
 		return 0, nil
 	}, nil)
@@ -212,29 +214,29 @@ func parseTranscribeResponse(data []byte) (*TranscribeResult, error) {
 
 // postMultipart sends one transcription request and reads the full JSON
 // body (capped). Mirrors postAudio but with the multipart content type.
-func (pc *providerClient) postMultipart(ctx context.Context, url string, body []byte, ctype string) (data []byte, ra time.Duration, err error) {
+func (pc *providerClient) postMultipart(ctx context.Context, url string, body []byte, ctype string) (data []byte, hdr http.Header, ra time.Duration, err error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body))
 	if err != nil {
-		return nil, 0, &ConfigError{Msg: "build request: " + err.Error()}
+		return nil, nil, 0, &ConfigError{Msg: "build request: " + err.Error()}
 	}
 	req.Header.Set("Content-Type", ctype)
 	pc.setHeaders(req.Header)
 
 	resp, err := pc.buffered().Do(req)
 	if err != nil {
-		return nil, 0, err
+		return nil, nil, 0, err
 	}
 	defer func() { _ = resp.Body.Close() }()
 	data, err = io.ReadAll(io.LimitReader(resp.Body, maxResponseSize+1))
 	if err != nil {
-		return nil, 0, err
+		return nil, nil, 0, err
 	}
 	if len(data) > maxResponseSize {
-		return nil, 0, terminal(fmt.Errorf("llm: response exceeds %d bytes", maxResponseSize))
+		return nil, nil, 0, terminal(fmt.Errorf("llm: response exceeds %d bytes", maxResponseSize))
 	}
 	ra = parseRetryAfter(resp.Header.Get("Retry-After"), time.Now())
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return nil, ra, pc.httpError(resp.StatusCode, data)
+		return nil, nil, ra, pc.httpError(resp.StatusCode, data)
 	}
-	return data, ra, nil
+	return data, resp.Header, ra, nil
 }
