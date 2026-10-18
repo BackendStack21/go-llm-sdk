@@ -524,11 +524,19 @@ func parseOpenAIResponse(body []byte) (*ChatResult, error) {
 		FinishReason:     mapOpenAIFinishReason(ch.FinishReason),
 	}
 	for _, tc := range ch.Message.ToolCalls {
+		args := tc.Function.Arguments
+		if args == "" {
+			args = "{}"
+		}
 		res.ToolCalls = append(res.ToolCalls, ToolCall{
 			ID:        tc.ID,
 			Name:      tc.Function.Name,
-			Arguments: tc.Function.Arguments,
+			Arguments: args,
 		})
+	}
+	// Named tool_choice (and many gateways) report "stop" for a tool turn.
+	if res.FinishReason == FinishStop && len(res.ToolCalls) > 0 {
+		res.FinishReason = FinishToolCalls
 	}
 	if r.Usage != nil {
 		res.Usage = usageFromOpenAI(r.Usage)
@@ -590,10 +598,7 @@ func mapOpenAIStreamEvent(data []byte, acc *streamAccum) (deltas []Delta, done b
 			deltas = append(deltas, Delta{Kind: DeltaContent, Text: d.Content})
 		}
 		for _, tc := range d.ToolCalls {
-			idx := 0
-			if tc.Index != nil {
-				idx = *tc.Index
-			}
+			idx := acc.openAIToolKey(tc.Index, tc.ID)
 			call := acc.call(idx)
 			if tc.ID != "" {
 				call.id = tc.ID
@@ -607,6 +612,9 @@ func mapOpenAIStreamEvent(data []byte, acc *streamAccum) (deltas []Delta, done b
 		}
 		if ch.FinishReason != "" {
 			acc.finishReason = mapOpenAIFinishReason(ch.FinishReason)
+			if acc.finishReason == FinishStop && len(acc.calls) > 0 {
+				acc.finishReason = FinishToolCalls
+			}
 			acc.sawFinish = true
 		}
 	}

@@ -493,6 +493,7 @@ func mapAnthropicStreamEvent(data []byte, acc *streamAccum) ([]Delta, bool, erro
 		case "input_json_delta":
 			if acc.jsonTool != "" && ev.Index == acc.jsonBlock {
 				acc.content.WriteString(ev.Delta.PartialJSON)
+				acc.jsonWritten = acc.jsonWritten || ev.Delta.PartialJSON != ""
 				deltas = append(deltas, Delta{Kind: DeltaContent, Text: ev.Delta.PartialJSON})
 				break
 			}

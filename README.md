@@ -173,7 +173,7 @@ type ChatResult struct {
 }
 ```
 
-Finish reasons are canonical: anything a provider reports outside that vocabulary maps to `""` (unknown) rather than leaking provider-specific strings. A turn that requested tools finishes as `tool_calls` on every format (Gemini reports `STOP` for it; the SDK maps it).
+Finish reasons are canonical: anything a provider reports outside that vocabulary maps to `""` (unknown) rather than leaking provider-specific strings. A turn that requested tools finishes as `tool_calls` on every format (Gemini and OpenAI-format providers with a named `tool_choice` report `STOP`/`stop` for it; the SDK maps it). A tool call with no arguments carries `{}` in `Arguments` on every format, buffered and streaming.
 
 Signatures (`ThinkingSignature`, `ThinkingBlocks`, `ToolCall.Signature`) are provider-specific: replay them only to the provider that produced them — never carry a conversation's signed turns across providers.
 

@@ -806,6 +806,8 @@ type streamAccum struct {
 	thinkingSignature string // legacy single signature (last block's)
 	jsonTool          string // Anthropic JSON-mode synthetic tool name ("" = off)
 	jsonBlock         int    // content-block index of the JSON-mode tool_use (-1 = none)
+	jsonWritten       bool   // JSON-mode tool input produced any content
+	lastToolKey       int    // OpenAI-format: provider key of the most recent tool-call delta
 }
 
 func newStreamAccum() *streamAccum {
@@ -814,6 +816,29 @@ func newStreamAccum() *streamAccum {
 		thinkingIndex: make(map[int]*thinkingAccum),
 		jsonBlock:     -1,
 	}
+}
+
+// openAIToolKey resolves the provider key of an OpenAI-format streamed
+// tool-call delta. An explicit index wins. Without one (some gateways omit
+// it), a delta continues the most recent call unless it carries a
+// different non-empty id, which starts a new call.
+func (a *streamAccum) openAIToolKey(index *int, id string) int {
+	key := a.lastToolKey
+	switch {
+	case index != nil:
+		key = *index
+	case id != "" && len(a.calls) > 0:
+		if cur, ok := a.callIndex[key]; ok && cur.id != "" && cur.id != id {
+			key = 0
+			for k := range a.callIndex {
+				if k >= key {
+					key = k + 1
+				}
+			}
+		}
+	}
+	a.lastToolKey = key
+	return key
 }
 
 // call returns the accumulator for provider index idx, creating it in
@@ -851,8 +876,15 @@ func (a *streamAccum) result() *ChatResult {
 	for _, b := range a.thinking {
 		res.ThinkingBlocks = append(res.ThinkingBlocks, ThinkingBlock{Text: b.text.String(), Signature: b.sig, Redacted: b.redacted})
 	}
+	if a.jsonBlock >= 0 && !a.jsonWritten {
+		res.Content += "{}" // JSON-mode tool with empty input, as buffered
+	}
 	for _, c := range a.calls {
-		res.ToolCalls = append(res.ToolCalls, ToolCall{ID: c.id, Name: c.name, Arguments: c.args.String(), Signature: c.sig})
+		args := c.args.String()
+		if args == "" {
+			args = "{}" // a no-argument call is an empty object on every format
+		}
+		res.ToolCalls = append(res.ToolCalls, ToolCall{ID: c.id, Name: c.name, Arguments: args, Signature: c.sig})
 	}
 	return res
 }

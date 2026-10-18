@@ -377,10 +377,14 @@ func chatResultFromResponses(r *rsResponse) *ChatResult {
 				}
 			}
 		case "function_call":
+			args := item.Arguments
+			if args == "" {
+				args = "{}"
+			}
 			res.ToolCalls = append(res.ToolCalls, ToolCall{
 				ID:        item.CallID,
 				Name:      item.Name,
-				Arguments: item.Arguments,
+				Arguments: args,
 			})
 		}
 	}
@@ -415,6 +419,9 @@ func responsesFinishReason(r *rsResponse, hasTools bool) string {
 			return FinishContentFilter
 		case strings.Contains(reason, "max_output"):
 			return FinishLength
+		}
+		if reason != "" {
+			return "" // unrecognised incomplete reason stays unmapped
 		}
 		if hasTools {
 			return FinishToolCalls

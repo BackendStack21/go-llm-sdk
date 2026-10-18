@@ -325,7 +325,8 @@ func mapGeminiFinishReason(s string) string {
 		return FinishStop
 	case "MAX_TOKENS":
 		return FinishLength
-	case "SAFETY", "RECITATION", "BLOCKLIST", "PROHIBITED_CONTENT", "SPII":
+	case "SAFETY", "RECITATION", "BLOCKLIST", "PROHIBITED_CONTENT", "SPII",
+		"IMAGE_SAFETY", "IMAGE_PROHIBITED_CONTENT", "IMAGE_RECITATION":
 		return FinishContentFilter
 	case "":
 		return ""
