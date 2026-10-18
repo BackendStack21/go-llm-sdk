@@ -794,6 +794,7 @@ type thinkingAccum struct {
 type streamAccum struct {
 	content           strings.Builder
 	reasoning         strings.Builder
+	refusal           strings.Builder
 	calls             []*toolCallAccum
 	callIndex         map[int]*toolCallAccum
 	thinking          []*thinkingAccum
@@ -871,7 +872,9 @@ func (a *streamAccum) result() *ChatResult {
 		ThinkingSignature: a.thinkingSignature,
 		FinishReason:      a.finishReason,
 		Usage:             a.usage,
+		Refusal:           a.refusal.String(),
 	}
+	res.FinishReason = refusalFinish(res.FinishReason, res.Refusal)
 	for _, b := range a.thinking {
 		res.ThinkingBlocks = append(res.ThinkingBlocks, ThinkingBlock{Text: b.text.String(), Signature: b.sig, Redacted: b.redacted})
 	}
@@ -886,6 +889,15 @@ func (a *streamAccum) result() *ChatResult {
 		res.ToolCalls = append(res.ToolCalls, ToolCall{ID: c.id, Name: c.name, Arguments: args, Signature: c.sig})
 	}
 	return res
+}
+
+// refusalFinish maps a refusal that finished "stop" (or unmapped) to
+// content_filter; length and tool_calls stay as the provider sent them.
+func refusalFinish(finish, refusal string) string {
+	if refusal != "" && (finish == FinishStop || finish == "") {
+		return FinishContentFilter
+	}
+	return finish
 }
 
 // streamErrorMessage interprets the "error" field of a stream chunk. Only a

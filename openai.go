@@ -349,6 +349,7 @@ func (s *oaFlexString) UnmarshalJSON(b []byte) error {
 type oaRespMessage struct {
 	Role             string              `json:"role"`
 	Content          string              `json:"content"`
+	Refusal          string              `json:"refusal"`
 	ReasoningContent oaFlexString        `json:"reasoning_content"`
 	Reasoning        oaFlexString        `json:"reasoning"`
 	ReasoningDetails []oaReasoningDetail `json:"reasoning_details"`
@@ -522,6 +523,7 @@ func parseOpenAIResponse(body []byte) (*ChatResult, error) {
 		Content:          ch.Message.Content,
 		ReasoningContent: foldReasoning(string(ch.Message.ReasoningContent), string(ch.Message.Reasoning), ch.Message.ReasoningDetails),
 		FinishReason:     mapOpenAIFinishReason(ch.FinishReason),
+		Refusal:          ch.Message.Refusal,
 	}
 	for _, tc := range ch.Message.ToolCalls {
 		args := tc.Function.Arguments
@@ -538,6 +540,7 @@ func parseOpenAIResponse(body []byte) (*ChatResult, error) {
 	if res.FinishReason == FinishStop && len(res.ToolCalls) > 0 {
 		res.FinishReason = FinishToolCalls
 	}
+	res.FinishReason = refusalFinish(res.FinishReason, res.Refusal)
 	if r.Usage != nil {
 		res.Usage = usageFromOpenAI(r.Usage)
 	}
@@ -548,6 +551,7 @@ func parseOpenAIResponse(body []byte) (*ChatResult, error) {
 
 type oaStreamDelta struct {
 	Content          string              `json:"content"`
+	Refusal          string              `json:"refusal"`
 	ReasoningContent oaFlexString        `json:"reasoning_content"`
 	Reasoning        oaFlexString        `json:"reasoning"`
 	ReasoningDetails []oaReasoningDetail `json:"reasoning_details"`
@@ -596,6 +600,10 @@ func mapOpenAIStreamEvent(data []byte, acc *streamAccum) (deltas []Delta, done b
 		if d.Content != "" {
 			acc.content.WriteString(d.Content)
 			deltas = append(deltas, Delta{Kind: DeltaContent, Text: d.Content})
+		}
+		if d.Refusal != "" {
+			acc.refusal.WriteString(d.Refusal)
+			deltas = append(deltas, Delta{Kind: DeltaRefusal, Text: d.Refusal})
 		}
 		for _, tc := range d.ToolCalls {
 			idx := acc.openAIToolKey(tc.Index, tc.ID)

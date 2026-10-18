@@ -279,6 +279,9 @@ type ChatResult struct {
 	ToolCalls      []ToolCall
 	FinishReason   string
 	Usage          Usage
+	// Refusal is the provider's refusal text when it signals one; empty
+	// otherwise. Content is never altered.
+	Refusal string
 }
 
 // DeltaKind discriminates streamed fragments.
@@ -292,6 +295,8 @@ const (
 	// DeltaToolArgs is a tool-call argument fragment (partial JSON). ToolIndex
 	// and, on the first fragment of a call, ToolID/ToolName identify the call.
 	DeltaToolArgs
+	// DeltaRefusal is a refusal-text fragment carried in Delta.Text.
+	DeltaRefusal
 )
 
 // Delta is one streamed fragment. Text is the fragment for this event, not

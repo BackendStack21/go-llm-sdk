@@ -43,6 +43,7 @@ The canonical type system is OpenAI-shaped; `gemini.go`/`anthropic.go` translate
 ## Invariants (breaking any of these is a defect)
 
 1. **Canonical finish reasons** are `stop | length | tool_calls | content_filter | ""`. Unmapped provider stop reasons map to `""` on every format — provider-specific strings never leak. A tool-call turn that ends normally (provider stop/`STOP`/end, or the format's tool signal) finishes `tool_calls` on every format (Gemini's `STOP` and OpenAI-format `stop` are mapped); a `length`, `content_filter` or unmapped reason keeps that value (or `""`) even with calls present, since the calls may be incomplete.
+   Refusal text surfaces in `ChatResult.Refusal` / `DeltaRefusal` (never in `Content`); a refusal on `stop`/unmapped finishes `content_filter`.
 2. **API keys never appear** in error text, `String()`, or any typed error.
 3. **Streaming**: retries only before the first emitted delta; a failure after partial output returns the partial `*ChatResult` + wrapped error and is **never retried**; a premature close (no completion signal — on every format, Gemini included; an unmapped finish reason still counts as one) is an error, never a silent empty or partial success; the parser goroutine is always released (abort-safe `done` protocol).
    A successful non-SSE response is parsed directly with the usual body cap and format mapper. It learns buffered mode for future requests, but never discards the current generation or makes a replacement request; parse/read errors remain terminal for that response.

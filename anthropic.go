@@ -375,10 +375,16 @@ type anUsage struct {
 	CacheReadTokens     int `json:"cache_read_input_tokens"`
 }
 
+type anStopDetails struct {
+	Explanation string `json:"explanation"`
+}
+
 type anResponse struct {
 	Content    []anRespBlock `json:"content"`
 	StopReason string        `json:"stop_reason"`
-	Usage      anUsage       `json:"usage"`
+	// StopDetails.Explanation is the refusal explanation, when present.
+	StopDetails anStopDetails `json:"stop_details"`
+	Usage       anUsage       `json:"usage"`
 }
 
 // usageFromAnthropic maps Messages API usage onto canonical Usage.
@@ -428,6 +434,9 @@ func parseAnthropicResponse(body []byte) (*ChatResult, error) {
 		return nil, fmt.Errorf("llm: response has no content blocks")
 	}
 	res := &ChatResult{FinishReason: mapAnthropicStopReason(r.StopReason)}
+	if r.StopReason == "refusal" {
+		res.Refusal = r.StopDetails.Explanation
+	}
 	var content, thinking []string
 	for _, b := range r.Content {
 		switch b.Type {
@@ -473,12 +482,13 @@ type anStreamEvent struct {
 	// delta and usage as top-level siblings, not nested under a
 	// "message_delta" key.
 	Delta struct {
-		Type        string `json:"type"` // "text_delta" | "thinking_delta" | "signature_delta" | "input_json_delta"
-		StopReason  string `json:"stop_reason"`
-		Text        string `json:"text"`
-		Thinking    string `json:"thinking"`
-		Signature   string `json:"signature"`
-		PartialJSON string `json:"partial_json"`
+		Type        string        `json:"type"` // "text_delta" | "thinking_delta" | "signature_delta" | "input_json_delta"
+		StopReason  string        `json:"stop_reason"`
+		StopDetails anStopDetails `json:"stop_details"`
+		Text        string        `json:"text"`
+		Thinking    string        `json:"thinking"`
+		Signature   string        `json:"signature"`
+		PartialJSON string        `json:"partial_json"`
 	} `json:"delta"`
 	// message_delta usage (top-level sibling of delta)
 	Usage anUsage `json:"usage"` // message_delta: cumulative counts
@@ -550,6 +560,10 @@ func mapAnthropicStreamEvent(data []byte, acc *streamAccum) ([]Delta, bool, erro
 			})
 		}
 	case "message_delta":
+		if ev.Delta.StopReason == "refusal" && ev.Delta.StopDetails.Explanation != "" && acc.refusal.Len() == 0 {
+			acc.refusal.WriteString(ev.Delta.StopDetails.Explanation)
+			deltas = append(deltas, Delta{Kind: DeltaRefusal, Text: ev.Delta.StopDetails.Explanation})
+		}
 		if ev.Delta.StopReason != "" {
 			acc.finishReason = mapAnthropicStopReason(ev.Delta.StopReason)
 			acc.sawFinish = true

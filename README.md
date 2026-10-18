@@ -72,6 +72,7 @@ res, err = chat.CallStream(ctx, req, func(d llm.Delta) error {
 	switch d.Kind {
 	case llm.DeltaReasoning: // thinking fragment
 	case llm.DeltaContent:   // text fragment
+	case llm.DeltaRefusal:    // refusal-text fragment (OpenAI, Responses; Anthropic: one delta with the explanation)
 	case llm.DeltaToolArgs:  // tool-call argument fragment (d.ToolID, d.ToolName; d.ToolIndex = position in res.ToolCalls)
 	}
 	return nil // or an error to abort — partial result comes back with *StreamAbortedError
@@ -182,9 +183,12 @@ type ChatResult struct {
 	ThinkingBlocks    []ThinkingBlock // every signed reasoning segment, in order (Anthropic, Responses)
 	ToolCalls         []ToolCall      // {ID, Name, Arguments, Signature (Gemini thoughtSignature)}
 	FinishReason      string          // stop | length | tool_calls | content_filter | ""
+	Refusal           string          // provider refusal text ("" when none); Content is never altered
 	Usage             Usage           // see "Usage" below
 }
 ```
+
+`Refusal` carries the provider's refusal text (OpenAI `message.refusal`, Responses `refusal` parts, Anthropic `stop_details.explanation`; Gemini has none) and is streamed as `DeltaRefusal`. A refusal on a `stop`/unmapped finish reports `content_filter`; `length`/`tool_calls` are kept. `AssistantMessage()` does not replay it.
 
 Finish reasons are canonical: anything a provider reports outside that vocabulary maps to `""` (unknown) rather than leaking provider-specific strings. A tool-call turn that ends normally (provider `stop`/`STOP`/`end_turn`, or the format's tool signal) finishes as `tool_calls` on every format (Gemini and OpenAI-format providers with a named `tool_choice` report `STOP`/`stop` for it; the SDK maps it). A truncation (`length`), filter (`content_filter`) or unmapped reason keeps that value (or `""`) even when calls are present, because the calls may be incomplete. A tool call with no arguments carries `{}` in `Arguments` on every format, buffered and streaming.
 

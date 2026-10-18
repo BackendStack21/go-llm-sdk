@@ -279,8 +279,9 @@ func buildResponsesInput(req *ChatRequest) (instructions string, input []any) {
 // ── response ─────────────────────────────────────────────────────────────
 
 type rsContentPart struct {
-	Type string `json:"type"`
-	Text string `json:"text"`
+	Type    string `json:"type"`
+	Text    string `json:"text"`
+	Refusal string `json:"refusal"`
 }
 
 type rsOutputItem struct {
@@ -375,6 +376,9 @@ func chatResultFromResponses(r *rsResponse) *ChatResult {
 				if p.Type == "output_text" && p.Text != "" {
 					res.Content += p.Text
 				}
+				if p.Type == "refusal" {
+					res.Refusal += p.Refusal
+				}
 			}
 		case "function_call":
 			args := item.Arguments
@@ -389,7 +393,7 @@ func chatResultFromResponses(r *rsResponse) *ChatResult {
 		}
 	}
 	res.ReasoningContent = strings.Join(summaries, "\n")
-	res.FinishReason = responsesFinishReason(r, len(res.ToolCalls) > 0)
+	res.FinishReason = refusalFinish(responsesFinishReason(r, len(res.ToolCalls) > 0), res.Refusal)
 	if r.Usage != nil {
 		res.Usage = usageFromResponses(r.Usage)
 	}
@@ -490,6 +494,11 @@ func mapResponsesStreamEvent(data []byte, acc *streamAccum) (deltas []Delta, don
 		if ev.Delta != "" {
 			acc.content.WriteString(ev.Delta)
 			deltas = append(deltas, Delta{Kind: DeltaContent, Text: ev.Delta})
+		}
+	case "response.refusal.delta":
+		if ev.Delta != "" {
+			acc.refusal.WriteString(ev.Delta)
+			deltas = append(deltas, Delta{Kind: DeltaRefusal, Text: ev.Delta})
 		}
 	case "response.function_call_arguments.delta":
 		call := acc.call(ev.OutputIndex)
