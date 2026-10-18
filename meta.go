@@ -1,7 +1,10 @@
 package llm
 
 import (
+	"context"
+	"fmt"
 	"net/http"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -87,4 +90,67 @@ func (r *ChatResult) withHeaderMeta(h http.Header) {
 	}
 	hm := parseResponseMeta(h)
 	r.Meta.RequestID, r.Meta.RateLimit = hm.RequestID, hm.RateLimit
+}
+
+// reservedHeaders are never settable per request (authentication and framing).
+var reservedHeaders = map[string]bool{
+	"Authorization": true, "Proxy-Authorization": true, "X-Api-Key": true,
+	"X-Goog-Api-Key": true, "Host": true, "Content-Length": true,
+	"Content-Type": true, "Transfer-Encoding": true,
+}
+
+type reqHeadersKey struct{}
+
+// validateReqHeaders checks per-request headers before any network I/O.
+// Errors name a reserved header but never echo values or malformed names.
+func validateReqHeaders(h map[string]string) error {
+	names := make([]string, 0, len(h))
+	for k := range h {
+		names = append(names, k)
+	}
+	sort.Strings(names)
+	for _, k := range names {
+		if !validHeaderToken(k) {
+			return &ConfigError{Msg: "Headers: invalid header name"}
+		}
+		if reservedHeaders[http.CanonicalHeaderKey(k)] {
+			return &ConfigError{Msg: fmt.Sprintf("Headers: %q is a reserved header", http.CanonicalHeaderKey(k))}
+		}
+		if strings.ContainsAny(h[k], "\r\n\x00") {
+			return &ConfigError{Msg: fmt.Sprintf("Headers: invalid value for header %q", http.CanonicalHeaderKey(k))}
+		}
+	}
+	return nil
+}
+
+func validHeaderToken(s string) bool {
+	if s == "" {
+		return false
+	}
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		switch {
+		case c >= 'a' && c <= 'z', c >= 'A' && c <= 'Z', c >= '0' && c <= '9':
+		case strings.IndexByte("!#$%&'*+-.^_`|~", c) >= 0:
+		default:
+			return false
+		}
+	}
+	return true
+}
+
+// withReqHeaders validates h and attaches it to ctx for this call only.
+func withReqHeaders(ctx context.Context, h map[string]string) (context.Context, error) {
+	if len(h) == 0 {
+		return ctx, nil
+	}
+	if err := validateReqHeaders(h); err != nil {
+		return ctx, err
+	}
+	return context.WithValue(ctx, reqHeadersKey{}, h), nil
+}
+
+func reqHeadersFrom(ctx context.Context) map[string]string {
+	h, _ := ctx.Value(reqHeadersKey{}).(map[string]string)
+	return h
 }

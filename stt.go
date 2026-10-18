@@ -30,12 +30,13 @@ const maxTranscribeAudioBytes = 25 << 20
 
 // TranscribeRequest describes one speech-to-text conversion.
 type TranscribeRequest struct {
-	Audio    []byte // required, non-empty: raw audio bytes (caller-owned)
-	Filename string // file part name for the audio (default "audio.wav")
-	MIMEType string // optional content type for the audio part
-	Language string // optional ISO-639-1 hint, OpenAI-compat only
-	Prompt   string // optional conditioning text, OpenAI-compat only
-	Format   string // optional response_format (provider default when empty)
+	Headers  map[string]string // per-request headers (SL03)
+	Audio    []byte            // required, non-empty: raw audio bytes (caller-owned)
+	Filename string            // file part name for the audio (default "audio.wav")
+	MIMEType string            // optional content type for the audio part
+	Language string            // optional ISO-639-1 hint, OpenAI-compat only
+	Prompt   string            // optional conditioning text, OpenAI-compat only
+	Format   string            // optional response_format (provider default when empty)
 }
 
 // TranscribeResult carries the recognized text. Fields the provider
@@ -131,6 +132,10 @@ func (pc *providerClient) buildTranscribeRequest(model string, req TranscribeReq
 // transcribe runs the STT request against one provider with the shared
 // retry ladder and whole-call budget of the buffered chat path.
 func (pc *providerClient) transcribe(ctx context.Context, model string, req TranscribeRequest) (*TranscribeResult, error) {
+	ctx, herr := withReqHeaders(ctx, req.Headers)
+	if herr != nil {
+		return nil, herr
+	}
 	body, url, err := pc.buildTranscribeRequest(model, req)
 	if err != nil {
 		return nil, err
@@ -220,7 +225,7 @@ func (pc *providerClient) postMultipart(ctx context.Context, url string, body []
 		return nil, nil, 0, &ConfigError{Msg: "build request: " + err.Error()}
 	}
 	req.Header.Set("Content-Type", ctype)
-	pc.setHeaders(req.Header)
+	pc.setHeaders(req.Header, reqHeadersFrom(ctx))
 
 	resp, err := pc.buffered().Do(req)
 	if err != nil {

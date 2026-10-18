@@ -25,8 +25,9 @@ import (
 
 // EmbedRequest describes one embeddings call.
 type EmbedRequest struct {
-	Inputs     []string // required: one or more non-empty texts
-	Dimensions int      // optional output dimensionality (0 = model default)
+	Headers    map[string]string // per-request headers (SL03)
+	Inputs     []string          // required: one or more non-empty texts
+	Dimensions int               // optional output dimensionality (0 = model default)
 }
 
 // EmbedResult carries one vector per input, in input order.
@@ -211,6 +212,10 @@ const (
 // embed runs the request in provider-sized batches, each with the shared
 // retry ladder, all under one whole-call budget.
 func (pc *providerClient) embed(ctx context.Context, model string, req EmbedRequest) (*EmbedResult, error) {
+	ctx, herr := withReqHeaders(ctx, req.Headers)
+	if herr != nil {
+		return nil, herr
+	}
 	model = strings.TrimPrefix(model, "models/") // Gemini ids as ListModels may echo them
 	batch := openAIEmbedBatch
 	if pc.cfg.Format == FormatGemini {

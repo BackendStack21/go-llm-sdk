@@ -257,14 +257,16 @@ func mergeExtra(body []byte, extra map[string]any) ([]byte, error) {
 // setHeaders applies format-specific authentication headers, then the
 // provider's custom Headers (last, so they can override; an empty value
 // removes the header). Keys and header values are never logged.
-func (pc *providerClient) setHeaders(h http.Header) {
+func (pc *providerClient) setHeaders(h http.Header, perReq map[string]string) {
 	pc.setAuthHeaders(h)
-	for k, v := range pc.cfg.Headers {
-		if v == "" {
-			h.Del(k)
-			continue
+	for _, m := range []map[string]string{pc.cfg.Headers, perReq} {
+		for k, v := range m {
+			if v == "" {
+				h.Del(k)
+				continue
+			}
+			h.Set(k, v)
 		}
-		h.Set(k, v)
 	}
 }
 
@@ -364,7 +366,7 @@ func (pc *providerClient) post(ctx context.Context, client *http.Client, url str
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Accept", "application/json")
-	pc.setHeaders(req.Header)
+	pc.setHeaders(req.Header, reqHeadersFrom(ctx))
 
 	resp, err := client.Do(req)
 	if err != nil {
@@ -459,6 +461,10 @@ func billingExhausted(e *APIError) bool {
 // contract as streaming — so a failing provider can never hold a caller for
 // timeout × attempts.
 func (pc *providerClient) call(ctx context.Context, req *ChatRequest, model string) (*ChatResult, error) {
+	ctx, herr := withReqHeaders(ctx, chatReqHeaders(req))
+	if herr != nil {
+		return nil, herr
+	}
 	ctx, cancel := context.WithTimeout(ctx, pc.requestTimeout())
 	defer cancel()
 	var res *ChatResult
@@ -553,6 +559,10 @@ func (pc *providerClient) mapper() streamEventMapper {
 func (pc *providerClient) callStream(ctx context.Context, req *ChatRequest, model string, onDelta func(Delta) error) (*ChatResult, error) {
 	if pc.learn.forceBuffered.Load() {
 		return pc.call(ctx, req, model)
+	}
+	ctx, herr := withReqHeaders(ctx, chatReqHeaders(req))
+	if herr != nil {
+		return nil, herr
 	}
 	deadlineCtx, cancel := context.WithTimeout(ctx, pc.requestTimeout())
 	defer cancel()
@@ -665,7 +675,7 @@ func (pc *providerClient) attemptStream(ctx context.Context, url string, body []
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Accept", "text/event-stream")
-	pc.setHeaders(req.Header)
+	pc.setHeaders(req.Header, reqHeadersFrom(ctx))
 
 	resp, derr := pc.streamHTTP.Do(req)
 	if derr != nil {
@@ -941,4 +951,12 @@ func streamErrorMessage(raw json.RawMessage) (string, bool) {
 		msg = "stream error"
 	}
 	return msg, true
+}
+
+// chatReqHeaders returns req.Headers, tolerating a nil request (rejected later).
+func chatReqHeaders(req *ChatRequest) map[string]string {
+	if req == nil {
+		return nil
+	}
+	return req.Headers
 }

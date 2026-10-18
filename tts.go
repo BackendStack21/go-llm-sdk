@@ -25,10 +25,11 @@ import (
 
 // SpeakRequest describes one text-to-speech conversion.
 type SpeakRequest struct {
-	Text   string  // required, non-empty
-	Voice  string  // provider voice id (no fallback tables — invariant #5)
-	Format string  // container for OpenAI-compat providers ("mp3" default)
-	Speed  float64 // optional playback speed, OpenAI-compat only (0 = omit)
+	Headers map[string]string // per-request headers (SL03)
+	Text    string            // required, non-empty
+	Voice   string            // provider voice id (no fallback tables — invariant #5)
+	Format  string            // container for OpenAI-compat providers ("mp3" default)
+	Speed   float64           // optional playback speed, OpenAI-compat only (0 = omit)
 }
 
 // SpeakResult carries the synthesized audio.
@@ -91,6 +92,10 @@ func (pc *providerClient) buildSpeakRequest(model string, req SpeakRequest) ([]b
 // ladder and whole-call budget of the buffered chat path (binary body, no
 // SSE).
 func (pc *providerClient) speak(ctx context.Context, model string, req SpeakRequest) (*SpeakResult, error) {
+	ctx, herr := withReqHeaders(ctx, req.Headers)
+	if herr != nil {
+		return nil, herr
+	}
 	body, url, mimeHint, err := pc.buildSpeakRequest(model, req)
 	if err != nil {
 		return nil, err
@@ -158,7 +163,7 @@ func (pc *providerClient) postAudio(ctx context.Context, url string, body []byte
 		return nil, "", nil, 0, &ConfigError{Msg: "build request: " + err.Error()}
 	}
 	req.Header.Set("Content-Type", "application/json")
-	pc.setHeaders(req.Header)
+	pc.setHeaders(req.Header, reqHeadersFrom(ctx))
 
 	resp, err := pc.buffered().Do(req)
 	if err != nil {

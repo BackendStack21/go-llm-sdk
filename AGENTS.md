@@ -30,7 +30,7 @@ go test -tags e2e -run 'TestE2E' -timeout 15m -v .   # LIVE provider e2e (see be
 | `responses.go` | OpenAI Responses API (`/v1/responses`) for GPT-5.6+ tools+reasoning |
 | `tts.go` | Text-to-speech: `Speak`/`SpeakRequest`/`SpeakResult` — OpenAI-compat `/audio/speech` + Gemini AUDIO modality, no transcoding |
 | `controls.go` | Request controls: `ToolChoice`, `ResponseFormat` (Anthropic JSON is native `output_config.format`; the forced-tool emulation + `foldAnthropicJSON` run only under `Quirks.AnthropicToolJSON`, off for the built-in provider), `ParallelToolCalls`, per-format mapping and boundary validation |
-| `meta.go` | `ResponseMeta`/`RateLimit` and `parseResponseMeta` (request-id + rate-limit headers from the successful attempt) |
+| `meta.go` | `ResponseMeta`/`RateLimit` and `parseResponseMeta` (request-id + rate-limit headers from the successful attempt); per-request `Headers` validation (reserved auth/framing names rejected, no values in errors) and ctx carriage |
 | `embed.go` | Embeddings: `Embed`/`EmbedRequest`/`EmbedResult` — OpenAI-compat `/embeddings` (requests `encoding_format: base64`, decodes float32 LE, accepts float arrays) + Gemini `batchEmbedContents` |
 | `stt.go` | Speech-to-text: `Transcribe`/`TranscribeRequest`/`TranscribeResult` — OpenAI-compat `/audio/transcriptions` (multipart), 25MB input cap |
 | `sse.go` | SSE parser (abort-safe via `done` channel) + idle-watchdog pump |

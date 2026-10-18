@@ -235,6 +235,10 @@ Caveats: DeepSeek accepts `json_object` only (`Quirks.NoJSONSchema`; `json_schem
 
 Controls are validated before any network I/O (`*ConfigError`): `ToolChoice` needs `Tools` and a known tool name; `json_schema` needs a JSON object schema; names match `[A-Za-z0-9_-]{1,64}`; `Extra` may not set the reserved keys above. Anthropic rejects forced tool use under budget-based extended thinking, so `ToolChoice` required/tool fails fast when `ThinkingBudget` > 0 (adaptive thinking passes a forced `ToolChoice` through; native JSON mode adds no tool, so it is unaffected).
 
+### Per-request Headers
+
+`ChatRequest`, `EmbedRequest`, `SpeakRequest` and `TranscribeRequest` carry `Headers map[string]string`, merged last (after auth and the provider's `WithHeaders`) for that call only, on every retry attempt. An empty value removes a non-reserved header for the call. Reserved names (case-insensitive) are always rejected with a `*ConfigError`: `Authorization`, `Proxy-Authorization`, `X-Api-Key`, `X-Goog-Api-Key`, `Host`, `Content-Length`, `Content-Type`, `Transfer-Encoding`. `anthropic-version` and `anthropic-beta` are not reserved. Names must be RFC 7230 tokens and neither names nor values may contain CR, LF or NUL; violations fail before any network I/O and the error never contains the value. `WithHeaders` is unchanged and not validated.
+
 ## Streaming semantics
 
 `CallStream` enforces four guarantees, each covered by regression tests:

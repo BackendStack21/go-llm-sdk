@@ -231,6 +231,8 @@ type ResponseFormat struct {
 // OpenAI Responses API has none, so it is not sent on requests diverted
 // there).
 type ChatRequest struct {
+	// Headers are per-request HTTP headers (stub; behaviour lands with SL03).
+	Headers        map[string]string
 	Model          string
 	Messages       []Message
 	System         []SystemBlock
