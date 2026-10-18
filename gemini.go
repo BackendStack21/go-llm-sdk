@@ -562,9 +562,9 @@ func geminiAttachment(p ContentPart) (gmPart, error) {
 		if p.MIMEType == "" {
 			return gmPart{}, &ConfigError{Msg: "Gemini image URL parts require a MIME type (use ImageURLPartMIME or WithMIME)"}
 		}
-		return gmPart{FileData: &gmFile{FileURI: p.URL, MIMEType: wireMIME(p.MIMEType)}}, nil
+		return gmPart{FileData: &gmFile{FileURI: p.URL, MIMEType: canonMIME(p.MIMEType)}}, nil
 	case ContentPartDocument:
-		return gmPart{InlineData: &gmBlob{MIMEType: p.MIMEType, Data: base64.StdEncoding.EncodeToString(p.Data)}}, nil
+		return gmPart{InlineData: &gmBlob{MIMEType: canonMIME(p.MIMEType), Data: base64.StdEncoding.EncodeToString(p.Data)}}, nil
 	}
 	return gmPart{InlineData: &gmBlob{MIMEType: wireMIME(p.MIMEType), Data: base64.StdEncoding.EncodeToString(p.Image)}}, nil
 }

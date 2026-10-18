@@ -92,7 +92,7 @@ var supportedDocumentMIME = map[string]bool{"application/pdf": true, "text/plain
 
 func validateDocumentPart(p ContentPart, index, j int) error {
 	media, params, err := mime.ParseMediaType(p.MIMEType)
-	if err != nil || len(params) != 0 || !supportedDocumentMIME[media] || media != strings.ToLower(media) {
+	if err != nil || len(params) != 0 || !supportedDocumentMIME[strings.ToLower(media)] {
 		return &ConfigError{Msg: fmt.Sprintf("message %d part %d: document MIMEType must be application/pdf or text/plain", index, j)}
 	}
 	if p.Text != "" || p.Image != nil || p.URL != "" {
@@ -117,7 +117,7 @@ func validateImageURLPart(p ContentPart, index, j int) error {
 	}
 	if p.MIMEType != "" {
 		media, params, err := mime.ParseMediaType(p.MIMEType)
-		if err != nil || len(params) != 0 || !supportedImageMIME[media] || media != strings.ToLower(media) {
+		if err != nil || len(params) != 0 || !supportedImageMIME[strings.ToLower(media)] {
 			return &ConfigError{Msg: fmt.Sprintf("message %d part %d: MIMEType must be an image type", index, j)}
 		}
 	}
@@ -168,6 +168,9 @@ func attachmentParts(m Message) []ContentPart {
 
 const defaultDocumentName = "document.pdf"
 
+// canonMIME is the canonical wire form of a (case-insensitive) MIME type.
+func canonMIME(m string) string { return wireMIME(strings.ToLower(m)) }
+
 func documentName(p ContentPart) string {
 	if p.Name == "" {
 		return defaultDocumentName
@@ -176,7 +179,8 @@ func documentName(p ContentPart) string {
 }
 
 // validateOpenAIFormatParts rejects documents the OpenAI-format wires cannot
-// carry. api names the endpoint in the tool-result error.
+// carry: documents in tool results, and any document that is not a PDF.
+// responses selects the endpoint named in the tool-result error.
 func validateOpenAIFormatParts(msgs []Message, responses bool) error {
 	for i, m := range msgs {
 		for j, p := range m.Parts {
@@ -189,7 +193,7 @@ func validateOpenAIFormatParts(msgs []Message, responses bool) error {
 				}
 				return &ConfigError{Msg: "tool results cannot carry documents on OpenAI-format providers"}
 			}
-			if p.MIMEType != "application/pdf" {
+			if strings.ToLower(p.MIMEType) != "application/pdf" {
 				return &ConfigError{Msg: fmt.Sprintf("message %d part %d: OpenAI-format documents support application/pdf only", i, j)}
 			}
 		}

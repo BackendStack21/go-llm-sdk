@@ -25,6 +25,7 @@ go test -tags e2e -run 'TestE2E' -timeout 15m -v .   # LIVE provider e2e (see be
 |---|---|
 | `llm.go` | `SDK` entrypoint: `New`, options (`WithProvider`, `FromEnv`, …), `Chat`, `Provider` (model cache, shared learn-once state) |
 | `message.go` | Canonical types: `ChatRequest`, `Message`, `ChatResult`, `Delta`, `Usage`, `ToolDef` |
+| `content.go` | Content-part boundary validation (text, image, image URL, document; MIME case-insensitive, canonical lower-case on the wire), aggregate inline cap, attachment helpers |
 | `chat.go` | `providerClient`: retry orchestration (buffered + streaming), error classification, learn-once consumption, SSE pump wiring, `httpError` parsing |
 | `openai.go` / `gemini.go` / `anthropic.go` | Per-format request builders, response/stream mappers, model listing |
 | `responses.go` | OpenAI Responses API (`/v1/responses`) for GPT-5.6+ tools+reasoning |

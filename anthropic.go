@@ -129,9 +129,9 @@ func anthropicPartBlocks(parts []ContentPart) []anBlock {
 		case ContentPartImageURL:
 			blocks = append(blocks, anBlock{Type: "image", Source: &anImageSource{Type: "url", URL: p.URL}})
 		case ContentPartDocument:
-			src := &anImageSource{Type: "base64", MediaType: p.MIMEType, Data: base64.StdEncoding.EncodeToString(p.Data)}
-			if p.MIMEType == "text/plain" {
-				src = &anImageSource{Type: "text", MediaType: p.MIMEType, Data: string(p.Data)}
+			src := &anImageSource{Type: "base64", MediaType: canonMIME(p.MIMEType), Data: base64.StdEncoding.EncodeToString(p.Data)}
+			if canonMIME(p.MIMEType) == "text/plain" {
+				src = &anImageSource{Type: "text", MediaType: "text/plain", Data: string(p.Data)}
 			}
 			blocks = append(blocks, anBlock{Type: "document", Source: src, Title: p.Name})
 		default:
