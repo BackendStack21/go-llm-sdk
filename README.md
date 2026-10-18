@@ -310,6 +310,8 @@ res, transcript, err := llm.RunTools(ctx, chat, req, map[string]llm.ToolHandler{
 
 `MaxTurns` bounds chat calls (default 8); `Parallel` runs one turn's handlers concurrently while results are appended in call order; `OnTurn` observes each turn. A handler error, panic or unknown tool becomes an `IsError` result and the loop continues. Assistant turns are replayed verbatim (thinking blocks, signatures). If the model still wants tools after `MaxTurns`, you get the last result, the transcript without the unanswered assistant turn, and `llm.ErrMaxToolTurns`. `req.Messages` is never mutated; the returned transcript is the full conversation.
 
+The context is checked before every chat call and before each handler. On cancellation `RunTools` stops starting handlers (those not yet started record an `IsError` result carrying the context error) and returns the last completed `*ChatResult`, the transcript so far, and the context error (`errors.Is(err, context.Canceled)` / `context.DeadlineExceeded`).
+
 On Gemini, a tool result's `ToolName` may be omitted — the SDK recovers the function name from the assistant `ToolCall` it answers, and errors loudly if it cannot.
 
 ## Extended thinking

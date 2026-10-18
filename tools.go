@@ -103,6 +103,10 @@ func runToolCall(ctx context.Context, call ToolCall, h ToolHandler) (msg Message
 		msg.Content, msg.IsError = "unknown tool", true
 		return msg
 	}
+	if err := ctx.Err(); err != nil { // cancelled: do not start another handler
+		msg.Content, msg.IsError = err.Error(), true
+		return msg
+	}
 	defer func() {
 		if r := recover(); r != nil {
 			msg.Content, msg.IsError = fmt.Sprintf("tool %s panicked: %v", call.Name, r), true
