@@ -411,10 +411,7 @@ func foldGeminiParts(parts []gmRespPart, acc *streamAccum) []Delta {
 			c := acc.call(idx)
 			c.id = fmt.Sprintf("call_%d", idx)
 			c.name = p.FunctionCall.Name
-			args := string(p.FunctionCall.Args)
-			if args == "" {
-				args = "{}"
-			}
+			args := toolArgsJSON(p.FunctionCall.Args)
 			c.args.WriteString(args)
 			c.sig = p.ThoughtSignature
 			deltas = append(deltas, Delta{
@@ -571,5 +568,5 @@ func geminiAttachment(p ContentPart) (gmPart, error) {
 	case ContentPartDocument:
 		return gmPart{InlineData: &gmBlob{MIMEType: canonMIME(p.MIMEType), Data: base64.StdEncoding.EncodeToString(p.Data)}}, nil
 	}
-	return gmPart{InlineData: &gmBlob{MIMEType: wireMIME(p.MIMEType), Data: base64.StdEncoding.EncodeToString(p.Image)}}, nil
+	return gmPart{InlineData: &gmBlob{MIMEType: canonMIME(p.MIMEType), Data: base64.StdEncoding.EncodeToString(p.Image)}}, nil
 }

@@ -354,27 +354,27 @@ func (pc *providerClient) httpError(status int, body []byte) *APIError {
 			msg, code = eb.Error.Message, eb.Error.Status
 		}
 	default:
-		// OpenAI's canonical envelope nests the error object; some
-		// gateways send the fields top-level. Try nested first.
-		var nested struct {
-			Error struct {
-				Message string `json:"message"`
-				Code    any    `json:"code"`
-			} `json:"error"`
+		// OpenAI's canonical envelope nests the error object; some gateways
+		// send the fields top-level, and framework defaults pair a bare
+		// status string with the detail ({"error":"Bad Request","message":
+		// "…"}). Precedence: the nested object's message, then the top-level
+		// message, then the bare string. Non-string fields are skipped.
+		var env struct {
+			Error   *oaErrorBody `json:"error"`
+			Message oaFlexString `json:"message"`
+			Code    any          `json:"code"`
 		}
-		if json.Unmarshal(body, &nested) == nil && nested.Error.Message != "" {
-			msg = nested.Error.Message
-			if s, ok := nested.Error.Code.(string); ok {
-				code = s
+		if json.Unmarshal(body, &env) == nil {
+			var c any
+			switch e := env.Error; {
+			case e != nil && e.Message != "" && !e.bare:
+				msg, c = string(e.Message), e.Code
+			case env.Message != "":
+				msg, c = string(env.Message), env.Code
+			case e != nil:
+				msg = string(e.Message)
 			}
-		} else {
-			var eb oaErrorBody
-			if json.Unmarshal(body, &eb) == nil && eb.Message != "" {
-				msg = eb.Message
-				if s, ok := eb.Code.(string); ok {
-					code = s
-				}
-			}
+			code, _ = c.(string)
 		}
 	}
 	if msg == "" && len(body) > 0 {
@@ -679,6 +679,11 @@ func (pc *providerClient) callStream(ctx context.Context, req *ChatRequest, mode
 		case out.apiErr != nil:
 			pc.emitAttempt(deadlineCtx, out.apiErr, 0)
 			return nil, out.apiErr
+		case out.err != nil && permanentError(out.err):
+			// Retrying cannot help (unbuildable request, certificate that
+			// does not verify): fail fast instead of backing off.
+			pc.emitAttempt(deadlineCtx, out.err, 0)
+			return nil, out.err
 		case out.err != nil && attempt < n-1:
 			lastErr = out.err
 			d := pc.retryDelay(0, attempt)
@@ -758,11 +763,34 @@ func (pc *providerClient) attemptStream(ctx context.Context, url string, body []
 		}
 	}
 
-	if ct := resp.Header.Get("Content-Type"); !strings.Contains(ct, "text/event-stream") {
-		// Learn buffered mode for later requests, but consume this generation
-		// now: discarding it would lose notes and tool calls, and bill twice.
+	// The Content-Type decides, case-insensitively; when a gateway drops or
+	// mislabels it, the body's own framing does (SSE can never be mistaken for
+	// a JSON document, nor the reverse).
+	rd := newSSEReader(resp.Body)
+	ctype := resp.Header.Get("Content-Type")
+	sse := isEventStream(ctype)
+	var sniffErr error
+	if !sse {
+		sse, sniffErr = sniffSSE(rd)
+	}
+	if !sse && (sniffErr == nil || strings.TrimSpace(ctype) != "") {
+		// Learn buffered mode for later requests: the provider declared
+		// another type, or the body itself is not SSE. A response with no
+		// Content-Type whose body ended or failed before a decisive byte
+		// says nothing about how the provider frames a real one.
 		pc.engageLearn(&pc.learn.forceBuffered, LearnBuffered, nil)
-		data, err := io.ReadAll(io.LimitReader(resp.Body, maxResponseSize+1))
+	}
+	if sniffErr != nil && sniffErr != io.EOF {
+		// The body failed before its first decisive byte. Surface that
+		// read's own error (a cancel or deadline keeps its identity) rather
+		// than reading a dead body again; terminal like any non-SSE read
+		// error.
+		return streamOutcome{bufferedResponse: true, err: sniffErr}
+	}
+	if !sse {
+		// Consume this generation now: discarding it would lose notes and
+		// tool calls, and bill twice.
+		data, err := io.ReadAll(io.LimitReader(rd, maxResponseSize+1))
 		if err != nil {
 			return streamOutcome{bufferedResponse: true, err: err}
 		}
@@ -776,7 +804,7 @@ func (pc *providerClient) attemptStream(ctx context.Context, url string, body []
 
 	acc := newStreamAccum()
 	acc.jsonTool = jsonTool
-	perr := pumpSSE(ctx, resp.Body, pc.idleTimeout(), func(data []byte) error {
+	perr := pumpSSE(ctx, rd, pc.idleTimeout(), func(data []byte) error {
 		if string(bytes.TrimSpace(data)) == "[DONE]" {
 			return errStreamStop
 		}
@@ -862,6 +890,8 @@ type streamAccum struct {
 	refusal           strings.Builder
 	calls             []*toolCallAccum
 	callIndex         map[int]*toolCallAccum
+	callByID          map[string]*toolCallAccum // Responses: call_id -> call (see setCallID)
+	nextCallKey       int                       // one past the highest callIndex key in use
 	thinking          []*thinkingAccum
 	thinkingIndex     map[int]*thinkingAccum
 	finishReason      string
@@ -895,12 +925,7 @@ func (a *streamAccum) openAIToolKey(index *int, id string) int {
 		key = *index
 	case id != "" && len(a.calls) > 0:
 		if cur, ok := a.callIndex[key]; ok && cur.id != "" && cur.id != id {
-			key = 0
-			for k := range a.callIndex {
-				if k >= key {
-					key = k + 1
-				}
-			}
+			key = a.nextCallKey
 		}
 	}
 	a.lastToolKey = key
@@ -916,8 +941,31 @@ func (a *streamAccum) call(idx int) *toolCallAccum {
 	c := &toolCallAccum{pos: len(a.calls)}
 	a.callIndex[idx] = c
 	a.calls = append(a.calls, c)
+	a.nextCallKey = max(a.nextCallKey, idx+1)
 	return c
 }
+
+// setCallID records a call's provider id and indexes it for callWithID. The
+// first call to claim an id keeps it; a call that changes id gives up its
+// old one.
+func (a *streamAccum) setCallID(c *toolCallAccum, id string) {
+	if c.id == id {
+		return
+	}
+	if a.callByID[c.id] == c {
+		delete(a.callByID, c.id)
+	}
+	c.id = id
+	if _, taken := a.callByID[id]; !taken && id != "" {
+		if a.callByID == nil {
+			a.callByID = make(map[string]*toolCallAccum)
+		}
+		a.callByID[id] = c
+	}
+}
+
+// callWithID returns the call recorded under a provider id by setCallID.
+func (a *streamAccum) callWithID(id string) *toolCallAccum { return a.callByID[id] }
 
 // block returns the thinking accumulator for provider index idx, creating
 // it in first-seen order.
@@ -973,6 +1021,15 @@ func (a *streamAccum) result() *ChatResult {
 		res.ToolCalls = append(res.ToolCalls, ToolCall{ID: c.id, Name: c.name, Arguments: args, Signature: c.sig})
 	}
 	return res
+}
+
+// toolArgsJSON is a provider's tool input as the canonical arguments string:
+// absent or null input is an empty object on every format.
+func toolArgsJSON(raw json.RawMessage) string {
+	if t := bytes.TrimSpace(raw); len(t) == 0 || string(t) == "null" {
+		return "{}"
+	}
+	return string(raw)
 }
 
 // refusalFinish maps a refusal that finished "stop" (or unmapped) to

@@ -33,7 +33,8 @@ type anBlock struct {
 	Text   string         `json:"text,omitempty"`
 	Source *anImageSource `json:"source,omitempty"`
 	Title  string         `json:"title,omitempty"` // document
-	// CacheControl is set on user text blocks when Message.Cache is true.
+	// CacheControl is set on the first block of a user message when
+	// Message.Cache is true.
 	CacheControl *anCacheControl `json:"cache_control,omitempty"`
 	// thinking / redacted_thinking (replayed assistant turns; they go
 	// FIRST, in response order, and carry the provider signature or the
@@ -126,7 +127,7 @@ func anthropicPartBlocks(parts []ContentPart) []anBlock {
 	for _, p := range parts {
 		switch p.Type {
 		case ContentPartImage:
-			blocks = append(blocks, anBlock{Type: "image", Source: &anImageSource{Type: "base64", MediaType: wireMIME(p.MIMEType), Data: base64.StdEncoding.EncodeToString(p.Image)}})
+			blocks = append(blocks, anBlock{Type: "image", Source: &anImageSource{Type: "base64", MediaType: canonMIME(p.MIMEType), Data: base64.StdEncoding.EncodeToString(p.Image)}})
 		case ContentPartImageURL:
 			blocks = append(blocks, anBlock{Type: "image", Source: &anImageSource{Type: "url", URL: p.URL}})
 		case ContentPartDocument:
@@ -315,7 +316,11 @@ func buildAnthropicRequestQ(req *ChatRequest, model string, stream bool, q Quirk
 			} else {
 				blocks = append(blocks, anthropicPartBlocks(m.Parts)...)
 			}
-			if m.Cache && len(blocks) > 0 && blocks[0].Type == "text" {
+			if m.Cache {
+				// The breakpoint goes on the message's FIRST block, whatever
+				// its type: a breakpoint caches the prefix through its block,
+				// so a stable leading part (a document, a long context) stays
+				// cached while the rest of the message varies per request.
 				blocks[0].CacheControl = &anCacheControl{Type: "ephemeral"}
 			}
 			appendMsg("user", blocks)
@@ -389,6 +394,11 @@ type anUsage struct {
 	OutputTokens        int `json:"output_tokens"`
 	CacheCreationTokens int `json:"cache_creation_input_tokens"`
 	CacheReadTokens     int `json:"cache_read_input_tokens"`
+	// OutputTokensDetails.ThinkingTokens is the reasoning subset of
+	// output_tokens, when the provider reports it.
+	OutputTokensDetails struct {
+		ThinkingTokens int `json:"thinking_tokens"`
+	} `json:"output_tokens_details"`
 }
 
 type anStopDetails struct {
@@ -412,6 +422,7 @@ func usageFromAnthropic(u anUsage) Usage {
 	out := Usage{
 		PromptTokens:        u.InputTokens,
 		CompletionTokens:    u.OutputTokens,
+		ReasoningTokens:     u.OutputTokensDetails.ThinkingTokens,
 		CacheCreationTokens: u.CacheCreationTokens,
 		CacheReadTokens:     u.CacheReadTokens,
 	}
@@ -429,15 +440,16 @@ func mapAnthropicStopReason(s string) string {
 			return ""
 		}
 		return FinishStop
-	case "max_tokens":
+	case "max_tokens", "model_context_window_exceeded":
+		// Both truncate the generation at a token limit.
 		return FinishLength
 	case "tool_use":
 		return FinishToolCalls
 	case "refusal":
 		return FinishContentFilter
 	default:
-		// Provider-specific reasons (pause_turn, model_context_window_exceeded,
-		// ...) stay out of the canonical vocabulary.
+		// Provider-specific reasons (pause_turn, ...) stay out of the
+		// canonical vocabulary.
 		return ""
 	}
 }
@@ -472,11 +484,7 @@ func parseAnthropicResponse(body []byte) (*ChatResult, error) {
 			// must be replayed verbatim for tool loops to stay valid.
 			res.ThinkingBlocks = append(res.ThinkingBlocks, ThinkingBlock{Redacted: b.Data})
 		case "tool_use":
-			args := string(b.Input)
-			if args == "" {
-				args = "{}"
-			}
-			res.ToolCalls = append(res.ToolCalls, ToolCall{ID: b.ID, Name: b.Name, Arguments: args})
+			res.ToolCalls = append(res.ToolCalls, ToolCall{ID: b.ID, Name: b.Name, Arguments: toolArgsJSON(b.Input)})
 		}
 	}
 	res.Content = strings.Join(content, "")
@@ -597,6 +605,9 @@ func mapAnthropicStreamEvent(data []byte, acc *streamAccum) ([]Delta, bool, erro
 		// what message_start reported.
 		if ev.Usage.OutputTokens > 0 {
 			acc.usage.CompletionTokens = ev.Usage.OutputTokens
+		}
+		if n := ev.Usage.OutputTokensDetails.ThinkingTokens; n > 0 {
+			acc.usage.ReasoningTokens = n
 		}
 		if ev.Usage.InputTokens > 0 {
 			acc.usage.PromptTokens = ev.Usage.InputTokens

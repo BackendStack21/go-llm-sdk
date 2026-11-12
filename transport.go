@@ -9,11 +9,20 @@ import (
 // Transport tuning defaults, shared by every provider client an SDK builds.
 const (
 	DefaultTimeout        = 120 * time.Second
-	defaultMaxIdleConns   = 20
-	defaultMaxIdlePerHost = 10
+	defaultMaxIdleConns   = 100
+	defaultMaxIdlePerHost = 32
 	defaultIdleTimeout    = 90 * time.Second
 	defaultKeepAlive      = 30 * time.Second
 	defaultDialTimeout    = 30 * time.Second
+	// defaultTLSHandshake bounds one TLS handshake so a stalled one fails
+	// (and is retried) instead of consuming the whole call budget.
+	defaultTLSHandshake = 10 * time.Second
+	// HTTP/2 health check: after defaultH2ReadIdle without a frame the
+	// transport pings, and closes the connection if no reply arrives within
+	// defaultH2PingTimeout. Without it a silently dropped connection (NAT
+	// timeout, dead peer) keeps being reused until the kernel gives up.
+	defaultH2ReadIdle    = 30 * time.Second
+	defaultH2PingTimeout = 15 * time.Second
 )
 
 // newPooledTransport builds a connection-pooled transport. Each SDK builds
@@ -25,6 +34,7 @@ func newPooledTransport() *http.Transport {
 		MaxIdleConns:        defaultMaxIdleConns,
 		MaxIdleConnsPerHost: defaultMaxIdlePerHost,
 		IdleConnTimeout:     defaultIdleTimeout,
+		TLSHandshakeTimeout: defaultTLSHandshake,
 		// API responses are typically already the payload the model sees;
 		// disabling compression avoids gzip buffering artifacts on SSE.
 		DisableCompression: true,
@@ -33,6 +43,13 @@ func newPooledTransport() *http.Transport {
 			KeepAlive: defaultKeepAlive,
 		}).DialContext,
 		ForceAttemptHTTP2: true,
+		// The field's doc comment still reads "does not yet have any
+		// effect", but since Go 1.24 the bundled HTTP/2 transport takes its
+		// ping settings from here (http2fillNetHTTPTransportConfig).
+		HTTP2: &http.HTTP2Config{
+			SendPingTimeout: defaultH2ReadIdle,
+			PingTimeout:     defaultH2PingTimeout,
+		},
 	}
 }
 

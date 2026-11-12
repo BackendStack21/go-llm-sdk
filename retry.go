@@ -2,6 +2,7 @@ package llm
 
 import (
 	"context"
+	"crypto/tls"
 	"errors"
 	"fmt"
 	"math/rand/v2"
@@ -172,6 +173,16 @@ func (p RetryPolicy) backoffCap() time.Duration {
 	return maxRetryBackoff
 }
 
+// permanentError reports a pre-response failure no retry can fix: a request
+// that cannot be built, or a TLS certificate that does not verify (unknown
+// authority, wrong host, expired). Everything else at the transport level
+// (DNS, dial, reset, timeout) stays retryable.
+func permanentError(err error) bool {
+	var ce *ConfigError
+	var cv *tls.CertificateVerificationError
+	return errors.As(err, &ce) || errors.As(err, &cv)
+}
+
 // terminalError marks an attempt failure that must never be retried
 // (request assembly or response parsing): withRetry unwraps and returns it.
 type terminalError struct{ err error }
@@ -232,6 +243,12 @@ func (pc *providerClient) withRetryN(ctx context.Context, n int, op func() (time
 				// Interrupted by deadline/cancel, not exhaustion.
 				pc.emitAttempt(ctx, err, 0)
 				return cerr
+			}
+			if permanentError(err) {
+				// E.g. a certificate that does not verify: backing off
+				// through the whole ladder only delays the same failure.
+				pc.emitAttempt(ctx, err, 0)
+				return err
 			}
 			if last {
 				pc.emitAttempt(ctx, err, 0)

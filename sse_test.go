@@ -34,8 +34,8 @@ func TestPumpSSEAbortDoesNotLeakParser(t *testing.T) {
 }
 
 // Regression: a single data line larger than the 64 KiB bufio buffer must
-// still be delivered (up to the 1 MiB line cap); anything larger must be
-// rejected with errSSEOversized.
+// still be delivered (a line may be as large as the 4 MiB event cap);
+// anything larger must be rejected with errSSEOversized.
 func TestParseSSEStreamLongLines(t *testing.T) {
 	line := strings.Repeat("a", 100*1024) // 100 KiB: over the bufio buffer, under the cap
 	done := make(chan struct{})
@@ -49,7 +49,7 @@ func TestParseSSEStreamLongLines(t *testing.T) {
 		t.Fatalf("data item = kind %v, %d bytes, want sseData with %d bytes", it.kind, len(it.data), len(line))
 	}
 
-	huge := strings.Repeat("b", (1<<20)+1) // 1 MiB + 1: over the line cap
+	huge := strings.Repeat("b", sseMaxLineSize+1) // over the line cap
 	ch2 := make(chan sseItem, 2)
 	go parseSSEStream(strings.NewReader("data: "+huge+"\n\n"), ch2, done)
 	it2 := <-ch2
