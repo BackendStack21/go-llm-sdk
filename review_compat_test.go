@@ -153,12 +153,21 @@ func TestReview_SniffSSE(t *testing.T) {
 	}
 	for body, want := range cases {
 		for _, wrap := range []func(io.Reader) io.Reader{func(r io.Reader) io.Reader { return r }, iotest.OneByteReader} {
-			if got := sniffSSE(newSSEReader(wrap(strings.NewReader(body)))); got != want {
+			got, err := sniffSSE(newSSEReader(wrap(strings.NewReader(body))))
+			if got != want {
 				t.Errorf("sniffSSE(%q) = %v, want %v", body, got, want)
+			}
+			// An error is reported exactly when the body ended undecided.
+			if undecided := undecidedSniff[body]; (err != nil) != undecided || (err != nil && err != io.EOF) {
+				t.Errorf("sniffSSE(%q) err = %v, undecided = %v", body, err, undecided)
 			}
 		}
 	}
 }
+
+// undecidedSniff lists the TestReview_SniffSSE bodies that end before a
+// decisive byte: empty, whitespace only, or a truncated field name.
+var undecidedSniff = map[string]bool{"": true, "   ": true, "data": true, "dat": true}
 
 // ── SSE reader ───────────────────────────────────────────────────────────
 
@@ -834,5 +843,103 @@ func TestReview_CanonMIMEMatchesValidation(t *testing.T) {
 		`{"type":"document","source":{"type":"text","media_type":"text/plain","data":"hello"},"title":"n.txt"}`)
 	if _, _, err := m6bBuild(FormatOpenAI, "gpt-4o", m6bUser(DocumentPart("application/pdf;", m6bPDF, "a.pdf"))); err != nil {
 		t.Errorf("openai rejected a PDF it had validated: %v", err)
+	}
+}
+
+// ── Panel review: streaming regressions ──────────────────────────────────
+
+// A cancel or deadline that lands while the SDK is still waiting for the
+// first body byte of an unlabelled 2xx keeps its identity: the sniff must
+// not swallow the read error and re-read a dead body.
+func TestReview_SniffKeepsContextErrorIdentity(t *testing.T) {
+	for _, ct := range []string{"", "application/json"} {
+		for _, mode := range []string{"deadline", "cancel"} {
+			t.Run(ct+"/"+mode, func(t *testing.T) {
+				release := make(chan struct{})
+				srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+					w.Header()["Content-Type"] = nil
+					if ct != "" {
+						w.Header().Set("Content-Type", ct)
+					}
+					w.WriteHeader(http.StatusOK)
+					w.(http.Flusher).Flush() // headers out, no body byte yet
+					select {
+					case <-r.Context().Done():
+					case <-release:
+					}
+				}))
+				t.Cleanup(srv.Close)
+				t.Cleanup(func() { close(release) })
+				cc := m1OpenAIClient(t, srv)
+				cc.pc.opts.retry = RetryPolicy{MaxAttempts: 1}
+
+				ctx, cancel := context.WithTimeout(context.Background(), 150*time.Millisecond)
+				want := context.DeadlineExceeded
+				if mode == "cancel" {
+					ctx, cancel = context.WithCancel(context.Background())
+					want = context.Canceled
+					time.AfterFunc(150*time.Millisecond, cancel)
+				}
+				defer cancel()
+				_, err := cc.CallStream(ctx, m1Req(), func(Delta) error { return nil })
+				if !errors.Is(err, want) {
+					t.Fatalf("err = %v, want errors.Is %v", err, want)
+				}
+				// A declared type teaches buffered mode by itself (as it
+				// always did); an unlabelled body that never produced a byte
+				// teaches nothing.
+				if got := cc.pc.learn.forceBuffered.Load(); got != (ct != "") {
+					t.Fatalf("forceBuffered = %v under Content-Type %q", got, ct)
+				}
+			})
+		}
+	}
+}
+
+// An unlabelled 2xx whose body is empty is still a terminal parse error (as
+// for any non-SSE body), but it decides nothing about the provider.
+func TestReview_EmptyUnlabelledBodyTeachesNothing(t *testing.T) {
+	srv := reviewServer(t, "", "")
+	cc := m1OpenAIClient(t, srv)
+	if _, err := cc.CallStream(context.Background(), m1Req(), func(Delta) error { return nil }); err == nil {
+		t.Fatal("empty body returned no error")
+	}
+	if cc.pc.learn.forceBuffered.Load() {
+		t.Fatal("an empty body must not teach buffered mode")
+	}
+}
+
+// Every line ending costs the same: a stream of bare-CR terminators must not
+// rescan the whole read buffer per line (it was ~170x slower than LF).
+func TestReview_SSEBareCRIsNotQuadratic(t *testing.T) {
+	const n = 2 << 20
+	read := func(term string) time.Duration {
+		lr := &sseLineReader{br: newSSEReader(strings.NewReader(strings.Repeat(term, n)))}
+		start := time.Now()
+		lines := 0
+		for {
+			if _, err := lr.readSSELine(); err != nil {
+				break
+			}
+			lines++
+		}
+		if lines != n {
+			t.Fatalf("%q: %d lines, want %d", term, lines, n)
+		}
+		return time.Since(start)
+	}
+	lf, cr := read("\n"), read("\r")
+	if cr > 20*lf+100*time.Millisecond {
+		t.Fatalf("bare CR took %v against %v for LF", cr, lf)
+	}
+	// A far LF behind many CRs is found once, not once per line.
+	lr := &sseLineReader{br: newSSEReader(strings.NewReader(strings.Repeat("\r", 60_000) + "\n" + "x\n"))}
+	for i := 0; i < 60_000; i++ {
+		if line, err := lr.readSSELine(); err != nil || len(line) != 0 {
+			t.Fatalf("line %d: %q %v", i, line, err)
+		}
+	}
+	if line, err := lr.readSSELine(); err != nil || string(line) != "x" {
+		t.Fatalf("after the CR run (CR LF pair skipped): %q %v", line, err)
 	}
 }

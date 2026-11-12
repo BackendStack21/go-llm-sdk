@@ -45,7 +45,12 @@ var sseFieldPrefixes = []string{"data:", "event:", "id:", "retry:"}
 // blank lines, an SSE stream opens with a comment (':') or a field name,
 // none of which can begin a JSON document. Anything else — JSON included —
 // is not SSE.
-func sniffSSE(br *bufio.Reader) bool {
+//
+// A non-nil error means the body ended (io.EOF) or failed before a decisive
+// byte arrived: nothing was learned about the body, and the error is the
+// read's own — a cancellation or deadline keeps its identity, which a second
+// read of the dead body would not return.
+func sniffSSE(br *bufio.Reader) (bool, error) {
 	const maxSniff = 256
 	for n := 1; n <= maxSniff; n++ {
 		s, err := br.Peek(n)
@@ -55,24 +60,24 @@ func sniffSSE(br *bufio.Reader) bool {
 		s = bytes.TrimLeft(bytes.TrimPrefix(s, []byte(sseBOM)), " \t\r\n")
 		if len(s) > 0 {
 			if s[0] == ':' {
-				return true
+				return true, nil
 			}
 			partial := false
 			for _, f := range sseFieldPrefixes {
 				if bytes.HasPrefix(s, []byte(f)) {
-					return true
+					return true, nil
 				}
 				partial = partial || strings.HasPrefix(f, string(s))
 			}
 			if !partial {
-				return false
+				return false, nil
 			}
 		}
 		if err != nil {
-			return false
+			return false, err
 		}
 	}
-	return false
+	return false, nil // nothing decisive within the window: not guessed
 }
 
 type sseItemKind byte
@@ -184,6 +189,16 @@ type sseLineReader struct {
 	skipLF  bool
 	pending int    // bytes of br backing the last returned line, consumed on the next call
 	buf     []byte // spill for a line that spans buffer refills; reused
+	// noLF counts the leading buffered bytes known to hold no LF, so the
+	// search for one never rescans them: without it a run of bare-CR lines
+	// would scan the whole read buffer once per line.
+	noLF int
+}
+
+// consume discards n buffered bytes (it cannot fail: they are buffered).
+func (lr *sseLineReader) consume(n int) {
+	_, _ = lr.br.Discard(n)
+	lr.noLF = max(lr.noLF-n, 0)
 }
 
 // readSSELine reads one line and returns it without its terminator. The
@@ -191,12 +206,14 @@ type sseLineReader struct {
 // sseMaxLineSize fail with errSSEOversized.
 func (lr *sseLineReader) readSSELine() ([]byte, error) {
 	if lr.pending > 0 {
-		_, _ = lr.br.Discard(lr.pending) // cannot fail: these bytes are buffered
+		lr.consume(lr.pending)
 		lr.pending = 0
 	}
 	lr.buf = lr.buf[:0]
 	for {
 		// Block for the next byte, then take everything already buffered.
+		// The buffer only refills once it is empty, so between refills the
+		// buffered data just shrinks from the front and noLF stays exact.
 		if _, err := lr.br.Peek(1); err != nil {
 			return lr.buf, err // EOF or read error; trailing line lacks a terminator
 		}
@@ -204,12 +221,18 @@ func (lr *sseLineReader) readSSELine() ([]byte, error) {
 		if lr.skipLF {
 			lr.skipLF = false
 			if chunk[0] == '\n' {
-				_, _ = lr.br.Discard(1)
+				lr.consume(1)
 				continue
 			}
 		}
 		// First terminator: an LF, or a CR that precedes it.
-		end := bytes.IndexByte(chunk, '\n')
+		end := -1
+		if i := bytes.IndexByte(chunk[lr.noLF:], '\n'); i >= 0 {
+			end = lr.noLF + i
+			lr.noLF = end
+		} else {
+			lr.noLF = len(chunk)
+		}
 		window := chunk
 		if end >= 0 {
 			window = chunk[:end]
@@ -223,7 +246,7 @@ func (lr *sseLineReader) readSSELine() ([]byte, error) {
 				return nil, errSSEOversized
 			}
 			lr.buf = append(lr.buf, chunk...)
-			_, _ = lr.br.Discard(len(chunk))
+			lr.consume(len(chunk))
 			continue
 		}
 		if len(lr.buf)+end > sseMaxLineSize {
@@ -237,7 +260,7 @@ func (lr *sseLineReader) readSSELine() ([]byte, error) {
 			return chunk[:end], nil
 		}
 		lr.buf = append(lr.buf, chunk[:end]...)
-		_, _ = lr.br.Discard(end + 1)
+		lr.consume(end + 1)
 		return lr.buf, nil
 	}
 }

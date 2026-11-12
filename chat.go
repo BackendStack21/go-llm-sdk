@@ -767,10 +767,29 @@ func (pc *providerClient) attemptStream(ctx context.Context, url string, body []
 	// mislabels it, the body's own framing does (SSE can never be mistaken for
 	// a JSON document, nor the reverse).
 	rd := newSSEReader(resp.Body)
-	if !isEventStream(resp.Header.Get("Content-Type")) && !sniffSSE(rd) {
-		// Learn buffered mode for later requests, but consume this generation
-		// now: discarding it would lose notes and tool calls, and bill twice.
+	ctype := resp.Header.Get("Content-Type")
+	sse := isEventStream(ctype)
+	var sniffErr error
+	if !sse {
+		sse, sniffErr = sniffSSE(rd)
+	}
+	if !sse && (sniffErr == nil || strings.TrimSpace(ctype) != "") {
+		// Learn buffered mode for later requests: the provider declared
+		// another type, or the body itself is not SSE. A response with no
+		// Content-Type whose body ended or failed before a decisive byte
+		// says nothing about how the provider frames a real one.
 		pc.engageLearn(&pc.learn.forceBuffered, LearnBuffered, nil)
+	}
+	if sniffErr != nil && sniffErr != io.EOF {
+		// The body failed before its first decisive byte. Surface that
+		// read's own error (a cancel or deadline keeps its identity) rather
+		// than reading a dead body again; terminal like any non-SSE read
+		// error.
+		return streamOutcome{bufferedResponse: true, err: sniffErr}
+	}
+	if !sse {
+		// Consume this generation now: discarding it would lose notes and
+		// tool calls, and bill twice.
 		data, err := io.ReadAll(io.LimitReader(rd, maxResponseSize+1))
 		if err != nil {
 			return streamOutcome{bufferedResponse: true, err: err}

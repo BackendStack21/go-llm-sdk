@@ -43,6 +43,9 @@ func newPooledTransport() *http.Transport {
 			KeepAlive: defaultKeepAlive,
 		}).DialContext,
 		ForceAttemptHTTP2: true,
+		// The field's doc comment still reads "does not yet have any
+		// effect", but since Go 1.24 the bundled HTTP/2 transport takes its
+		// ping settings from here (http2fillNetHTTPTransportConfig).
 		HTTP2: &http.HTTP2Config{
 			SendPingTimeout: defaultH2ReadIdle,
 			PingTimeout:     defaultH2PingTimeout,
