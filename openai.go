@@ -343,18 +343,20 @@ type oaRespToolCall struct {
 
 // oaFlexArgs decodes function-call arguments tolerantly. The contract is a
 // JSON string holding the arguments object, but some gateways send the
-// object itself: its JSON text is kept as is. Null (and any other shape)
-// decodes to "".
+// object itself: its JSON text is kept as is. Null decodes to "" (absent).
+// Any other value (array, number, bool) is kept as its JSON text too rather
+// than replaced: the caller's handler then rejects it, instead of a tool
+// silently running with invented empty input.
 type oaFlexArgs string
 
 func (a *oaFlexArgs) UnmarshalJSON(b []byte) error {
 	switch {
 	case len(b) > 0 && b[0] == '"':
 		return (*oaFlexString)(a).UnmarshalJSON(b)
-	case len(b) > 0 && b[0] == '{':
-		*a = oaFlexArgs(b)
-	default:
+	case string(b) == "null":
 		*a = ""
+	default:
+		*a = oaFlexArgs(b)
 	}
 	return nil
 }

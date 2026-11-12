@@ -11,6 +11,7 @@ import (
 	"math/rand/v2"
 	"net/http"
 	"net/http/httptest"
+	"runtime"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -26,7 +27,20 @@ import (
 // surrounding whitespace, as mime.ParseMediaType allows), so the wire must
 // carry the canonical form: providers reject "IMAGE/JPG".
 func TestReview_InlineImageMIMECanonicalOnWire(t *testing.T) {
-	cases := map[string]string{"IMAGE/PNG": "image/png", "Image/Jpeg": "image/jpeg", "IMAGE/JPG": "image/jpeg", " image/webp ": "image/webp"}
+	cases := map[string]string{"IMAGE/PNG": "image/png", "Image/Jpeg": "image/jpeg", "IMAGE/JPG": "image/jpeg", " image/webp ": "image/webp", "image/gif;": "image/gif"}
+	// Where each format carries the type, and the exact value expected there.
+	wire := map[string]func(m map[string]any) any{
+		"openai": func(m map[string]any) any {
+			return m6bGet(t, m, "messages", 0, "content", 0, "image_url", "url")
+		},
+		"responses": func(m map[string]any) any { return m6bGet(t, m, "input", 0, "content", 0, "image_url") },
+		"anthropic": func(m map[string]any) any {
+			return m6bGet(t, m, "messages", 0, "content", 0, "source", "media_type")
+		},
+		"gemini": func(m map[string]any) any {
+			return m6bGet(t, m, "contents", 0, "parts", 0, "inlineData", "mimeType")
+		},
+	}
 	for in, want := range cases {
 		for _, f := range m6bFormats {
 			m, _, err := m6bBuild(f.format, f.model, m6bUser(ImagePart(in, []byte{1, 2, 3})))
@@ -34,12 +48,12 @@ func TestReview_InlineImageMIMECanonicalOnWire(t *testing.T) {
 				t.Errorf("%s %q: %v", f.name, in, err)
 				continue
 			}
-			b, _ := json.Marshal(m)
-			if strings.Contains(string(b), strings.TrimSpace(in)) && strings.TrimSpace(in) != want {
-				t.Errorf("%s %q: non-canonical MIME reached the wire: %s", f.name, in, b)
+			exact := want
+			if f.name == "openai" || f.name == "responses" {
+				exact = "data:" + want + ";base64,AQID"
 			}
-			if !strings.Contains(string(b), want) {
-				t.Errorf("%s %q: wire lacks %q: %s", f.name, in, want, b)
+			if got := wire[f.name](m); got != exact {
+				t.Errorf("%s %q: wire MIME = %q, want %q", f.name, in, got, exact)
 			}
 		}
 	}
@@ -166,7 +180,7 @@ func TestReview_SSELineReaderMatchesReference(t *testing.T) {
 		"half":    iotest.HalfReader,
 		"dataerr": iotest.DataErrReader,
 	}
-	for i := 0; i < 300; i++ {
+	for i := 0; i < 60; i++ { // each round runs four readers, one of them byte by byte
 		var sb strings.Builder
 		for n := rng.IntN(12); n > 0; n-- {
 			sb.WriteString(alphabet[rng.IntN(len(alphabet))])
@@ -325,6 +339,13 @@ func TestReview_OpenAIToolArgumentsAsObject(t *testing.T) {
 	}
 	if len(res.ToolCalls) != 2 || res.ToolCalls[0].Arguments != `{"x":1}` || res.ToolCalls[1].Arguments != "{}" {
 		t.Fatalf("tool calls = %+v", res.ToolCalls)
+	}
+	// Any other value is surfaced as sent, never replaced by an invented "{}".
+	for _, v := range []string{`[1,2]`, `5`, `true`} {
+		res, err = parseOpenAIResponse([]byte(`{"choices":[{"message":{"tool_calls":[{"id":"a","type":"function","function":{"name":"f","arguments":` + v + `}}]},"finish_reason":"tool_calls"}]}`))
+		if err != nil || len(res.ToolCalls) != 1 || res.ToolCalls[0].Arguments != v {
+			t.Fatalf("arguments %s: res=%+v err=%v", v, res, err)
+		}
 	}
 	acc := newStreamAccum()
 	ds, _, err := mapOpenAIStreamEvent([]byte(`{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"a","function":{"name":"f","arguments":{"x":1}}}]},"finish_reason":"tool_calls"}]}`), acc)
@@ -687,6 +708,20 @@ func TestReview_ContentChunksNestingIsLinear(t *testing.T) {
 	}
 	if r := acc.result(); r.Content != "" || r.ReasoningContent != "" {
 		t.Fatalf("nested thinking below the first level leaked: %+v", r)
+	}
+	// A wide AND deep body (3 MiB nested 1000 levels) allocated gigabytes
+	// when every level re-copied the payload; it must stay proportional to
+	// the body.
+	big := strings.Repeat(`[{"type":"thinking","thinking":`, 1000) + `"` + strings.Repeat("x", 3<<20) + `"` + strings.Repeat(`}]`, 1000)
+	var before, after runtime.MemStats
+	runtime.ReadMemStats(&before)
+	start = time.Now()
+	if _, err := parseOpenAIResponse([]byte(`{"choices":[{"message":{"content":` + big + `},"finish_reason":"stop"}]}`)); err != nil {
+		t.Fatal(err)
+	}
+	runtime.ReadMemStats(&after)
+	if d, alloc := time.Since(start), after.TotalAlloc-before.TotalAlloc; d > 5*time.Second || alloc > 256<<20 {
+		t.Fatalf("3 MiB body nested 1000 deep: %v, %d MiB allocated", d, alloc>>20)
 	}
 	// One level (the documented Mistral shape) still folds.
 	res, err := parseOpenAIResponse([]byte(`{"choices":[{"message":{"content":[{"type":"thinking","thinking":[{"type":"text","text":"plan"},{"type":"thinking","thinking":"deeper"}]},{"type":"text","text":"x"}]},"finish_reason":"stop"}]}`))

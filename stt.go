@@ -30,7 +30,7 @@ const maxTranscribeAudioBytes = 25 << 20
 
 // TranscribeRequest describes one speech-to-text conversion.
 type TranscribeRequest struct {
-	Headers  map[string]string // per-request headers (SL03)
+	Headers  map[string]string // per-request headers (see ChatRequest.Headers)
 	Audio    []byte            // required, non-empty: raw audio bytes (caller-owned)
 	Filename string            // file part name for the audio (default "audio.wav")
 	MIMEType string            // optional content type for the audio part

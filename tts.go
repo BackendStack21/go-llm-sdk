@@ -25,7 +25,7 @@ import (
 
 // SpeakRequest describes one text-to-speech conversion.
 type SpeakRequest struct {
-	Headers map[string]string // per-request headers (SL03)
+	Headers map[string]string // per-request headers (see ChatRequest.Headers)
 	Text    string            // required, non-empty
 	Voice   string            // provider voice id (no fallback tables — invariant #5)
 	Format  string            // container for OpenAI-compat providers ("mp3" default)

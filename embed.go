@@ -25,7 +25,7 @@ import (
 
 // EmbedRequest describes one embeddings call.
 type EmbedRequest struct {
-	Headers    map[string]string // per-request headers (SL03)
+	Headers    map[string]string // per-request headers (see ChatRequest.Headers)
 	Inputs     []string          // required: one or more non-empty texts
 	Dimensions int               // optional output dimensionality (0 = model default)
 	TaskType   string            // Gemini taskType, e.g. RETRIEVAL_QUERY (OpenAI-format ignores it)
