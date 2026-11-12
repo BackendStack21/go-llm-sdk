@@ -577,15 +577,16 @@ func TestReview_PooledTransportBounds(t *testing.T) {
 
 // ── Anthropic ────────────────────────────────────────────────────────────
 
-// Message.Cache puts the breakpoint on the message's LAST block, whatever
-// its type: a breakpoint caches the prefix through its block, so marking the
-// first block left the rest of a multi-part message uncached, and a message
-// opening with an image or document got no marker at all.
-func TestReview_AnthropicCacheMarksLastBlock(t *testing.T) {
+// Message.Cache puts the breakpoint on the message's FIRST block, whatever
+// its type. A message opening with an image or document used to be left
+// unmarked silently; text-first messages keep their exact wire, so a stable
+// leading part stays cached while the rest of the message varies.
+func TestReview_AnthropicCacheMarksFirstBlock(t *testing.T) {
 	cases := map[string][]ContentPart{
 		"image then text":    {ImagePart("image/png", []byte{1}), TextPart("describe")},
 		"text then image":    {TextPart("describe"), ImagePart("image/png", []byte{1})},
 		"document then text": {DocumentPart("application/pdf", []byte{1}, "a.pdf"), TextPart("summarize")},
+		"context then query": {TextPart("big stable context"), TextPart("question")},
 		"single text part":   {TextPart("hello")},
 	}
 	for name, parts := range cases {
@@ -601,11 +602,9 @@ func TestReview_AnthropicCacheMarksLastBlock(t *testing.T) {
 		if err := json.Unmarshal(b, &wire); err != nil {
 			t.Fatal(err)
 		}
-		blocks := wire.Messages[0].Content
-		for i, blk := range blocks {
-			_, marked := blk["cache_control"]
-			if marked != (i == len(blocks)-1) {
-				t.Errorf("%s: block %d cache_control=%v, want the marker on the last block only: %s", name, i, marked, b)
+		for i, blk := range wire.Messages[0].Content {
+			if _, marked := blk["cache_control"]; marked != (i == 0) {
+				t.Errorf("%s: block %d cache_control=%v, want the marker on the first block only: %s", name, i, marked, b)
 			}
 		}
 	}

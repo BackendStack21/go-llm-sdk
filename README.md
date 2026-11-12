@@ -185,7 +185,7 @@ post-tool user message (OpenAI chat) or `function_call_output` (Responses).
 ```go
 type ChatRequest struct {
 	Model          string         // optional; ChatClient's model wins when both set
-	Messages       []Message      // RoleUser | RoleAssistant | RoleSystem | RoleTool; Message.Cache → Anthropic cache_control on the user message's last block
+	Messages       []Message      // RoleUser | RoleAssistant | RoleSystem | RoleTool; Message.Cache → Anthropic cache_control on the user message's first block
 	System         []SystemBlock  // {Text, Cache} — Cache marks Anthropic prompt-cache blocks
 	Tools          []ToolDef      // {Name, Description, Parameters json.RawMessage}
 	Thinking       string         // "", "enabled", "disabled", "low", "medium", "high", "max"
@@ -457,7 +457,7 @@ go test -tags e2e -run 'TestE2E' -timeout 15m -v .
 
 Credentials come from the environment or a repo-root `.env` file (`KEY=VALUE`); the file is gitignored and its contents are never logged. Override a target's model with `<ID>_E2E_MODEL` (e.g. `DEEPSEEK_E2E_MODEL`). Adding a provider is one `e2eTarget` entry in `e2e_test.go`.
 
-Coverage sits at **99.0%** of statements (unit suite, no e2e), including the streaming failure-orchestration paths (deadline, 429, premature close, partial-output) that are usually the blind spot of SDK test suites. The residual ~1% is unreachable defensive code (multipart writes into an in-memory buffer, `json.Marshal` of plain values, SSE shutdown races).
+Coverage sits at **98.6%** of statements (unit suite, no e2e), including the streaming failure-orchestration paths (deadline, 429, premature close, partial-output) that are usually the blind spot of SDK test suites. The residual ~1% is unreachable defensive code (multipart writes into an in-memory buffer, `json.Marshal` of plain values, SSE shutdown races).
 
 ## Repo guidance
 
@@ -469,8 +469,8 @@ A correctness, performance and compatibility pass. No exported API changed. Beha
 
 | Area | v1.1.0 | v1.1.1 | What to do |
 |---|---|---|---|
-| Anthropic `Message.Cache` | `cache_control` on the first block, and only if it was text | On the message's last block, whatever its type | Multi-part messages are now cached whole; a message opening with an image or document is now marked at all. Single-text messages are byte-identical |
-| Anthropic finish reason | `model_context_window_exceeded` → `""` | `length` | — |
+| Anthropic `Message.Cache` | `cache_control` on the first block, but only if it was text: a message opening with an image or document was silently left unmarked | On the first block, whatever its type | Text-first messages are byte-identical. Image- or document-first messages now carry a breakpoint (the stable-document-then-question pattern is cached): keep the request within Anthropic's 4 breakpoints |
+| Anthropic finish reason | `model_context_window_exceeded` → `""` | `length` | On Anthropic `length` now covers both the `max_tokens` cap and the context window: raising `MaxTokens` does not help the latter |
 | Anthropic usage | `ReasoningTokens` always 0 | `output_tokens_details.thinking_tokens` when reported | — |
 | Inline image MIME | Mixed-case types (`IMAGE/PNG`) passed validation but went to the wire verbatim | Canonical lower-case on the wire, as documents already were | — |
 | Streaming detection | Only a case-sensitive `text/event-stream` was streamed; SSE under another header failed as a JSON parse error | Case-insensitive, and SSE framing is recognized from the body | — |

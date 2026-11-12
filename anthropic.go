@@ -33,7 +33,7 @@ type anBlock struct {
 	Text   string         `json:"text,omitempty"`
 	Source *anImageSource `json:"source,omitempty"`
 	Title  string         `json:"title,omitempty"` // document
-	// CacheControl is set on the last block of a user message when
+	// CacheControl is set on the first block of a user message when
 	// Message.Cache is true.
 	CacheControl *anCacheControl `json:"cache_control,omitempty"`
 	// thinking / redacted_thinking (replayed assistant turns; they go
@@ -317,9 +317,11 @@ func buildAnthropicRequestQ(req *ChatRequest, model string, stream bool, q Quirk
 				blocks = append(blocks, anthropicPartBlocks(m.Parts)...)
 			}
 			if m.Cache {
-				// A breakpoint caches the prefix through its block, so it goes
-				// on the message's last block (any block type may carry one).
-				blocks[len(blocks)-1].CacheControl = &anCacheControl{Type: "ephemeral"}
+				// The breakpoint goes on the message's FIRST block, whatever
+				// its type: a breakpoint caches the prefix through its block,
+				// so a stable leading part (a document, a long context) stays
+				// cached while the rest of the message varies per request.
+				blocks[0].CacheControl = &anCacheControl{Type: "ephemeral"}
 			}
 			appendMsg("user", blocks)
 		case RoleAssistant:

@@ -147,10 +147,14 @@ type Message struct {
 	// tool_result is_error; Gemini functionResponse {"error": …}). OpenAI
 	// formats have no flag: describe the failure in Content.
 	IsError bool
-	// Cache marks this user message for Anthropic prompt caching: the
-	// conversation up to and including this message becomes a cached prefix
-	// (cache_control ephemeral on the message's last content block, whatever
-	// its type). Ignored on other formats and on non-user roles.
+	// Cache marks this user message for Anthropic prompt caching:
+	// cache_control ephemeral on the message's first content block, whatever
+	// its type. The cached prefix ends with that block, so with Parts put
+	// the stable content (a document, a long context) first and the part
+	// that varies per request after it; a plain-Content message is cached
+	// whole. Anthropic allows at most 4 breakpoints per request (system
+	// blocks and tools included). Ignored on other formats and on non-user
+	// roles.
 	Cache bool
 }
 
