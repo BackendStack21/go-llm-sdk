@@ -658,3 +658,146 @@ func TestReview_AnthropicThinkingTokens(t *testing.T) {
 		t.Fatalf("unreported thinking tokens = %d", res.Usage.ReasoningTokens)
 	}
 }
+
+// ── Panel review: wire-compat regressions ────────────────────────────────
+
+// Array-shaped content is folded in linear time: a hostile body nesting
+// thinking chunks thousands deep must not buy seconds of uncancellable CPU
+// (the request timeout is a whole-call budget). Only one level of nesting
+// carries reasoning prose, so deeper levels are not descended into.
+func TestReview_ContentChunksNestingIsLinear(t *testing.T) {
+	const depth = 4000
+	var b strings.Builder
+	for i := 0; i < depth; i++ {
+		b.WriteString(`[{"type":"thinking","thinking":`)
+	}
+	b.WriteString(`"x"`)
+	for i := 0; i < depth; i++ {
+		b.WriteString(`}]`)
+	}
+	start := time.Now()
+	acc := newStreamAccum()
+	if _, _, err := mapOpenAIStreamEvent([]byte(`{"choices":[{"delta":{"content":`+b.String()+`}}]}`), acc); err != nil {
+		t.Fatal(err)
+	}
+	// Quadratic folding took ~5s here; linear is a few milliseconds. The
+	// bound is loose enough for a loaded race-detector CI runner.
+	if d := time.Since(start); d > 2*time.Second {
+		t.Fatalf("deeply nested thinking chunks took %v", d)
+	}
+	if r := acc.result(); r.Content != "" || r.ReasoningContent != "" {
+		t.Fatalf("nested thinking below the first level leaked: %+v", r)
+	}
+	// One level (the documented Mistral shape) still folds.
+	res, err := parseOpenAIResponse([]byte(`{"choices":[{"message":{"content":[{"type":"thinking","thinking":[{"type":"text","text":"plan"},{"type":"thinking","thinking":"deeper"}]},{"type":"text","text":"x"}]},"finish_reason":"stop"}]}`))
+	if err != nil || res.ReasoningContent != "plan" || res.Content != "x" {
+		t.Fatalf("res=%+v err=%v", res, err)
+	}
+}
+
+// Framework-default error envelopes ({"error":"Bad Request","message":…})
+// keep their detail message: learn-once and billing classification read it.
+func TestReview_HTTPErrorBareStringDoesNotShadowMessage(t *testing.T) {
+	pc := newProviderClient(ProviderConfig{ID: "gw", Format: FormatOpenAI, BaseURL: "https://x"}, nil, nil)
+	e := pc.httpError(400, []byte(`{"error":"Bad Request","message":"stream_options is not supported","statusCode":400}`))
+	if e.Message != "stream_options is not supported" || !streamOptionsRejected(e) {
+		t.Errorf("stream_options: %+v", e)
+	}
+	e = pc.httpError(400, []byte(`{"statusCode":400,"message":"Streaming is not supported for this route","error":"Bad Request"}`))
+	if !streamRejected(e) {
+		t.Errorf("streaming: %+v", e)
+	}
+	e = pc.httpError(429, []byte(`{"timestamp":"t","status":429,"error":"Too Many Requests","message":"insufficient_quota for tenant","path":"/v1"}`))
+	if e.Retryable || !billingExhausted(e) {
+		t.Errorf("billing: %+v", e)
+	}
+	// A non-string type or code never costs the message.
+	e = pc.httpError(400, []byte(`{"error":{"message":"m","type":123,"code":7}}`))
+	if e.Message != "m" || e.Code != "" {
+		t.Errorf("typed: %+v", e)
+	}
+	e = pc.httpError(400, []byte(`{"error":{"message":"m","code":"c"}}`))
+	if e.Message != "m" || e.Code != "c" {
+		t.Errorf("nested code: %+v", e)
+	}
+	e = pc.httpError(400, []byte(`{"message":"top","code":"tc"}`))
+	if e.Message != "top" || e.Code != "tc" {
+		t.Errorf("top-level code: %+v", e)
+	}
+}
+
+// The backfill identifies a function call by its call_id, not by its
+// position in response.output: a gateway whose output_index differs from the
+// final array position must not end up with the call twice.
+func TestReview_ResponsesBackfillNeverDuplicatesCalls(t *testing.T) {
+	const c1 = `{"type":"function_call","call_id":"c1","name":"f","arguments":"{\"x\":1}"}`
+	const c2 = `{"type":"function_call","call_id":"c2","name":"g","arguments":"{\"y\":2}"}`
+	run := func(events ...string) (*ChatResult, []Delta) {
+		t.Helper()
+		acc := newStreamAccum()
+		var all []Delta
+		for _, ev := range events {
+			ds, _, err := mapResponsesStreamEvent([]byte(ev), acc)
+			if err != nil {
+				t.Fatalf("%s: %v", ev, err)
+			}
+			all = append(all, ds...)
+		}
+		return acc.result(), all
+	}
+	// Events carry no output_index (0); the final output has a reasoning item first.
+	res, ds := run(
+		`{"type":"response.output_item.added","item":{"type":"function_call","call_id":"c1","name":"f","arguments":""}}`,
+		`{"type":"response.function_call_arguments.delta","delta":"{\"x\":1}"}`,
+		`{"type":"response.output_item.done","item":`+c1+`}`,
+		`{"type":"response.completed","response":{"status":"completed","output":[{"type":"reasoning","summary":[]},`+c1+`]}}`,
+	)
+	if len(res.ToolCalls) != 1 || len(ds) != 1 {
+		t.Fatalf("mismatched index duplicated the call: calls=%+v deltas=%+v", res.ToolCalls, ds)
+	}
+	// A different call already sits at the final array position: the
+	// unstreamed call is appended, never merged into it or dropped.
+	res, ds = run(
+		`{"type":"response.output_item.added","output_index":1,"item":{"type":"function_call","call_id":"c1","name":"f","arguments":""}}`,
+		`{"type":"response.function_call_arguments.delta","output_index":1,"delta":"{\"x\":1}"}`,
+		`{"type":"response.completed","response":{"status":"completed","output":[`+c1+`,`+c2+`]}}`,
+	)
+	if len(res.ToolCalls) != 2 || res.ToolCalls[0].ID != "c1" || res.ToolCalls[1] != (ToolCall{ID: "c2", Name: "g", Arguments: `{"y":2}`}) {
+		t.Fatalf("calls = %+v", res.ToolCalls)
+	}
+	if len(ds) != 2 || ds[1].ToolIndex != 1 || ds[1].ToolID != "c2" {
+		t.Fatalf("deltas = %+v", ds)
+	}
+	// output_item.done for a call announced under another index.
+	res, _ = run(
+		`{"type":"response.output_item.added","output_index":3,"item":{"type":"function_call","call_id":"c1","name":"f","arguments":""}}`,
+		`{"type":"response.output_item.done","output_index":0,"item":`+c1+`}`,
+		`{"type":"response.completed","response":{"status":"completed","output":[`+c1+`]}}`,
+	)
+	if len(res.ToolCalls) != 1 || res.ToolCalls[0].Arguments != `{"x":1}` {
+		t.Fatalf("done under another index: %+v", res.ToolCalls)
+	}
+}
+
+// The wire MIME is the parsed media type: whatever validation accepts
+// (case, whitespace, a trailing ';') is normalized the same way.
+func TestReview_CanonMIMEMatchesValidation(t *testing.T) {
+	for in, want := range map[string]string{
+		"image/png;": "image/png", "image/jpg;": "image/jpeg", " IMAGE/PNG ; ": "image/png",
+		"application/pdf;": "application/pdf", "TEXT/Plain;": "text/plain", "image/webp": "image/webp",
+		"": "", " Not A Type ": "not a type", // unparseable input is only lower-cased and trimmed
+	} {
+		if got := canonMIME(in); got != want {
+			t.Errorf("canonMIME(%q) = %q, want %q", in, got, want)
+		}
+	}
+	m, _, err := m6bBuild(FormatAnthropic, "claude", m6bUser(DocumentPart("text/plain;", []byte("hello"), "n.txt")))
+	if err != nil {
+		t.Fatal(err)
+	}
+	jsonEq(t, "anthropic", m6bGet(t, m, "messages", 0, "content", 0),
+		`{"type":"document","source":{"type":"text","media_type":"text/plain","data":"hello"},"title":"n.txt"}`)
+	if _, _, err := m6bBuild(FormatOpenAI, "gpt-4o", m6bUser(DocumentPart("application/pdf;", m6bPDF, "a.pdf"))); err != nil {
+		t.Errorf("openai rejected a PDF it had validated: %v", err)
+	}
+}

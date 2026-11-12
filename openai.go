@@ -393,6 +393,11 @@ func (c *oaFlexContent) UnmarshalJSON(b []byte) error {
 
 // foldContentChunks appends the text of a chunk array to text and the text
 // of its thinking chunks to reasoning. Undecodable chunks contribute nothing.
+//
+// reasoning is nil for the chunks nested inside a thinking chunk: only their
+// text is reasoning prose, and a thinking chunk found there is skipped
+// rather than descended into. Nesting therefore stops at one level and the
+// fold stays linear in the size of the content, whatever a body nests.
 func foldContentChunks(raw []byte, text, reasoning *strings.Builder) {
 	var chunks []json.RawMessage
 	_ = json.Unmarshal(raw, &chunks) // raw is an already-validated JSON array
@@ -405,6 +410,9 @@ func foldContentChunks(raw []byte, text, reasoning *strings.Builder) {
 		case "text", "output_text":
 			text.WriteString(ch.Text)
 		case "thinking":
+			if reasoning == nil {
+				continue
+			}
 			switch t := bytes.TrimSpace(ch.Thinking); {
 			case len(t) > 0 && t[0] == '"':
 				var s string
@@ -412,9 +420,7 @@ func foldContentChunks(raw []byte, text, reasoning *strings.Builder) {
 					reasoning.WriteString(s)
 				}
 			case len(t) > 0 && t[0] == '[':
-				// Nested chunks: only their text is reasoning prose.
-				var ignored strings.Builder
-				foldContentChunks(t, reasoning, &ignored)
+				foldContentChunks(t, reasoning, nil)
 			}
 		}
 	}
@@ -650,9 +656,9 @@ type oaResponse struct {
 }
 
 type oaErrorBody struct {
-	Message string `json:"message"`
-	Type    string `json:"type"`
-	Code    any    `json:"code"`
+	Message oaFlexString `json:"message"`
+	Type    oaFlexString `json:"type"`
+	Code    any          `json:"code"`
 	// bare marks an "error" that was a JSON string rather than an object
 	// (Message holds it): only an error when nothing else was returned.
 	bare bool
@@ -670,7 +676,7 @@ func (e *oaErrorBody) UnmarshalJSON(b []byte) error {
 		return json.Unmarshal(b, (*plain)(e))
 	case len(b) > 0 && b[0] == '"':
 		e.bare = true
-		return json.Unmarshal(b, &e.Message)
+		return e.Message.UnmarshalJSON(b)
 	}
 	return nil
 }

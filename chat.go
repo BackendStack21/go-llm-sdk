@@ -354,25 +354,27 @@ func (pc *providerClient) httpError(status int, body []byte) *APIError {
 			msg, code = eb.Error.Message, eb.Error.Status
 		}
 	default:
-		// OpenAI's canonical envelope nests the error object; some
-		// gateways send the fields top-level. Try nested first.
-		// The nested value may also be a bare string ({"error":"…"}).
-		var nested struct {
-			Error *oaErrorBody `json:"error"`
+		// OpenAI's canonical envelope nests the error object; some gateways
+		// send the fields top-level, and framework defaults pair a bare
+		// status string with the detail ({"error":"Bad Request","message":
+		// "…"}). Precedence: the nested object's message, then the top-level
+		// message, then the bare string. Non-string fields are skipped.
+		var env struct {
+			Error   *oaErrorBody `json:"error"`
+			Message oaFlexString `json:"message"`
+			Code    any          `json:"code"`
 		}
-		if json.Unmarshal(body, &nested) == nil && nested.Error != nil && nested.Error.Message != "" {
-			msg = nested.Error.Message
-			if s, ok := nested.Error.Code.(string); ok {
-				code = s
+		if json.Unmarshal(body, &env) == nil {
+			var c any
+			switch e := env.Error; {
+			case e != nil && e.Message != "" && !e.bare:
+				msg, c = string(e.Message), e.Code
+			case env.Message != "":
+				msg, c = string(env.Message), env.Code
+			case e != nil:
+				msg = string(e.Message)
 			}
-		} else {
-			var eb oaErrorBody
-			if json.Unmarshal(body, &eb) == nil && eb.Message != "" {
-				msg = eb.Message
-				if s, ok := eb.Code.(string); ok {
-					code = s
-				}
-			}
+			code, _ = c.(string)
 		}
 	}
 	if msg == "" && len(body) > 0 {

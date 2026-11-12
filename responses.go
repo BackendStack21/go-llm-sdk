@@ -488,12 +488,34 @@ func addResponsesReasoning(acc *streamAccum, idx int, item *rsOutputItem) {
 	}
 }
 
+// responsesCall resolves the accumulator of a finished function-call item.
+// The call_id identifies it: a gateway's output_index need not match the
+// item's position in the final output, and keying by index alone would file
+// the same call twice. Without a match the call is new and takes key idx —
+// or a fresh key when idx already holds a different call.
+func responsesCall(acc *streamAccum, idx int, item *rsOutputItem) *toolCallAccum {
+	if item.CallID != "" {
+		for _, c := range acc.calls {
+			if c.id == item.CallID {
+				return c
+			}
+		}
+	}
+	if cur, ok := acc.callIndex[idx]; ok && cur.id != "" && item.CallID != "" {
+		idx = 0
+		for k := range acc.callIndex {
+			idx = max(idx, k+1)
+		}
+	}
+	return acc.call(idx)
+}
+
 // backfillResponsesCall completes a function call from its finished item.
 // The deltas normally carry everything; a gateway that delivers the call
 // only on the terminal item must not leave it with empty arguments. Nothing
 // already streamed is ever emitted twice.
 func backfillResponsesCall(acc *streamAccum, idx int, item *rsOutputItem, deltas []Delta) []Delta {
-	call := acc.call(idx)
+	call := responsesCall(acc, idx, item)
 	if call.id == "" {
 		call.id = item.CallID
 	}

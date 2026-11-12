@@ -168,10 +168,16 @@ func attachmentParts(m Message) []ContentPart {
 
 const defaultDocumentName = "document.pdf"
 
-// canonMIME is the canonical wire form of an accepted MIME type: media types
-// are case-insensitive and validation tolerates surrounding whitespace, so
-// both are normalized before the type reaches a provider.
-func canonMIME(m string) string { return wireMIME(strings.ToLower(strings.TrimSpace(m))) }
+// canonMIME is the canonical wire form of an accepted MIME type: the media
+// type exactly as validation parsed it (lower-case, without the surrounding
+// whitespace or trailing ';' that mime.ParseMediaType tolerates), so what a
+// provider receives never differs from what the boundary accepted.
+func canonMIME(m string) string {
+	if media, _, err := mime.ParseMediaType(m); err == nil {
+		return wireMIME(media)
+	}
+	return wireMIME(strings.ToLower(strings.TrimSpace(m)))
+}
 
 func documentName(p ContentPart) string {
 	if p.Name == "" {
