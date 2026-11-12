@@ -962,8 +962,9 @@ func TestReview_SSEBareCRIsNotQuadratic(t *testing.T) {
 
 // reviewScaling runs fn at size n and 4n and fails when the larger run costs
 // more than a linear algorithm could (4x, with 2x headroom plus a constant):
-// a quadratic one costs 16x. A ratio does not move with machine load the way
-// an absolute bound does.
+// a quadratic one costs 16x. Under CPU oversubscription one measurement can
+// be skewed (the short run finishing inside a scheduler burst), so any of
+// three attempts within the bound passes; a real regression fails them all.
 func reviewScaling(t *testing.T, name string, n int, fn func(n int)) {
 	t.Helper()
 	timed := func(n int) time.Duration {
@@ -975,9 +976,13 @@ func reviewScaling(t *testing.T, name string, n int, fn func(n int)) {
 		}
 		return best
 	}
-	if small, large := timed(n), timed(4*n); large > 8*small+100*time.Millisecond {
-		t.Fatalf("%s: %d items took %v, %d items took %v (super-linear)", name, n, small, 4*n, large)
+	var small, large time.Duration
+	for range 3 {
+		if small, large = timed(n), timed(4*n); large <= 8*small+100*time.Millisecond {
+			return
+		}
 	}
+	t.Fatalf("%s: %d items took %v, %d items took %v (super-linear)", name, n, small, 4*n, large)
 }
 
 // One terminal Responses event may list any number of function calls: each
