@@ -492,20 +492,16 @@ func addResponsesReasoning(acc *streamAccum, idx int, item *rsOutputItem) {
 // The call_id identifies it: a gateway's output_index need not match the
 // item's position in the final output, and keying by index alone would file
 // the same call twice. Without a match the call is new and takes key idx —
-// or a fresh key when idx already holds a different call.
+// or a fresh key when idx already holds a different call. Both lookups are
+// constant-time: one terminal event may list any number of calls.
 func responsesCall(acc *streamAccum, idx int, item *rsOutputItem) *toolCallAccum {
 	if item.CallID != "" {
-		for _, c := range acc.calls {
-			if c.id == item.CallID {
-				return c
-			}
+		if c := acc.callWithID(item.CallID); c != nil {
+			return c
 		}
 	}
 	if cur, ok := acc.callIndex[idx]; ok && cur.id != "" && item.CallID != "" {
-		idx = 0
-		for k := range acc.callIndex {
-			idx = max(idx, k+1)
-		}
+		idx = acc.nextCallKey
 	}
 	return acc.call(idx)
 }
@@ -517,7 +513,7 @@ func responsesCall(acc *streamAccum, idx int, item *rsOutputItem) *toolCallAccum
 func backfillResponsesCall(acc *streamAccum, idx int, item *rsOutputItem, deltas []Delta) []Delta {
 	call := responsesCall(acc, idx, item)
 	if call.id == "" {
-		call.id = item.CallID
+		acc.setCallID(call, item.CallID)
 	}
 	if call.name == "" {
 		call.name = item.Name
@@ -597,7 +593,7 @@ func mapResponsesStreamEvent(data []byte, acc *streamAccum) (deltas []Delta, don
 		if ev.Item != nil && ev.Item.Type == "function_call" {
 			call := acc.call(ev.OutputIndex)
 			if ev.Item.CallID != "" {
-				call.id = ev.Item.CallID
+				acc.setCallID(call, ev.Item.CallID)
 			}
 			if ev.Item.Name != "" {
 				call.name = ev.Item.Name

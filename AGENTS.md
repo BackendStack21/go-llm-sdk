@@ -63,7 +63,8 @@ The canonical type system is OpenAI-shaped; `gemini.go`/`anthropic.go` translate
 11. **Meta fields are provider-reported or zero, never guessed**; headers come from the successful attempt only. Attempt-observer panics are recovered and discarded; events never contain the API key.
 12. **Anthropic JSON mode is native `output_config.format`** unless the explicit registry quirk `Quirks.AnthropicToolJSON` is on (off for the built-in provider, set via `WithQuirks`); the quirk restores the pre-M4 forced-tool emulation byte-for-byte, including its ConfigErrors (also under any thinking mode). Never infer it from URL or model name.
 
-13. **A response-shape quirk never discards a generation.** OpenAI-format parsing is tolerant by construction (`oaFlexString`, `oaFlexContent`, `oaFlexArgs`, `oaInt`, the `oaErrorBody` / usage decoders): unknown shapes decode to zero values, never to a parse error. Keep new OpenAI-format response fields on that pattern.
+13. **A response-shape quirk never discards a generation.** OpenAI-format parsing is tolerant by construction (`oaFlexString`, `oaFlexContent`, `oaFlexArgs`, `oaInt`, the `oaErrorBody` / usage decoders): unknown shapes decode to zero values (or, for tool-call `arguments` that are not a string, to the JSON text as sent), never to a parse error. Keep new OpenAI-format response fields on that pattern.
+    Decoding provider data must stay linear in its size: no per-item rescans of what was already accumulated (`streamAccum.callByID` / `nextCallKey`), no recursion over nested payloads (`foldContentChunks` stops at one level) — the request timeout cannot interrupt CPU-bound parsing.
 14. **Only failures a retry could fix are retried.** `permanentError` (unbuildable request, TLS certificate that does not verify) fails fast on both ladders; DNS, dial, reset and timeout errors stay retryable.
 
 ## Testing conventions

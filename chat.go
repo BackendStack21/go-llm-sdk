@@ -890,6 +890,8 @@ type streamAccum struct {
 	refusal           strings.Builder
 	calls             []*toolCallAccum
 	callIndex         map[int]*toolCallAccum
+	callByID          map[string]*toolCallAccum // Responses: call_id -> call (see setCallID)
+	nextCallKey       int                       // one past the highest callIndex key in use
 	thinking          []*thinkingAccum
 	thinkingIndex     map[int]*thinkingAccum
 	finishReason      string
@@ -923,12 +925,7 @@ func (a *streamAccum) openAIToolKey(index *int, id string) int {
 		key = *index
 	case id != "" && len(a.calls) > 0:
 		if cur, ok := a.callIndex[key]; ok && cur.id != "" && cur.id != id {
-			key = 0
-			for k := range a.callIndex {
-				if k >= key {
-					key = k + 1
-				}
-			}
+			key = a.nextCallKey
 		}
 	}
 	a.lastToolKey = key
@@ -944,8 +941,31 @@ func (a *streamAccum) call(idx int) *toolCallAccum {
 	c := &toolCallAccum{pos: len(a.calls)}
 	a.callIndex[idx] = c
 	a.calls = append(a.calls, c)
+	a.nextCallKey = max(a.nextCallKey, idx+1)
 	return c
 }
+
+// setCallID records a call's provider id and indexes it for callWithID. The
+// first call to claim an id keeps it; a call that changes id gives up its
+// old one.
+func (a *streamAccum) setCallID(c *toolCallAccum, id string) {
+	if c.id == id {
+		return
+	}
+	if a.callByID[c.id] == c {
+		delete(a.callByID, c.id)
+	}
+	c.id = id
+	if _, taken := a.callByID[id]; !taken && id != "" {
+		if a.callByID == nil {
+			a.callByID = make(map[string]*toolCallAccum)
+		}
+		a.callByID[id] = c
+	}
+}
+
+// callWithID returns the call recorded under a provider id by setCallID.
+func (a *streamAccum) callWithID(id string) *toolCallAccum { return a.callByID[id] }
 
 // block returns the thinking accumulator for provider index idx, creating
 // it in first-seen order.

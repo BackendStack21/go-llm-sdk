@@ -707,41 +707,39 @@ func TestReview_AnthropicThinkingTokens(t *testing.T) {
 // (the request timeout is a whole-call budget). Only one level of nesting
 // carries reasoning prose, so deeper levels are not descended into.
 func TestReview_ContentChunksNestingIsLinear(t *testing.T) {
-	const depth = 4000
-	var b strings.Builder
-	for i := 0; i < depth; i++ {
-		b.WriteString(`[{"type":"thinking","thinking":`)
+	// Bounds are on allocated bytes, not wall-clock time: quadratic folding
+	// re-copied the payload at every level (gigabytes here), and an
+	// allocation count does not move with the load on a CI runner.
+	allocated := func(fn func()) uint64 {
+		var before, after runtime.MemStats
+		runtime.ReadMemStats(&before)
+		fn()
+		runtime.ReadMemStats(&after)
+		return after.TotalAlloc - before.TotalAlloc
 	}
-	b.WriteString(`"x"`)
-	for i := 0; i < depth; i++ {
-		b.WriteString(`}]`)
+	nest := func(depth int, leaf string) string {
+		return strings.Repeat(`[{"type":"thinking","thinking":`, depth) + `"` + leaf + `"` + strings.Repeat(`}]`, depth)
 	}
-	start := time.Now()
+
+	// Deep: one small chunk nested 4000 levels (132 KB).
 	acc := newStreamAccum()
-	if _, _, err := mapOpenAIStreamEvent([]byte(`{"choices":[{"delta":{"content":`+b.String()+`}}]}`), acc); err != nil {
-		t.Fatal(err)
-	}
-	// Quadratic folding took ~5s here; linear is a few milliseconds. The
-	// bound is loose enough for a loaded race-detector CI runner.
-	if d := time.Since(start); d > 2*time.Second {
-		t.Fatalf("deeply nested thinking chunks took %v", d)
+	if n := allocated(func() {
+		if _, _, err := mapOpenAIStreamEvent([]byte(`{"choices":[{"delta":{"content":`+nest(4000, "x")+`}}]}`), acc); err != nil {
+			t.Fatal(err)
+		}
+	}); n > 16<<20 {
+		t.Fatalf("132 KB chunk nested 4000 deep allocated %d MiB", n>>20)
 	}
 	if r := acc.result(); r.Content != "" || r.ReasoningContent != "" {
 		t.Fatalf("nested thinking below the first level leaked: %+v", r)
 	}
-	// A wide AND deep body (3 MiB nested 1000 levels) allocated gigabytes
-	// when every level re-copied the payload; it must stay proportional to
-	// the body.
-	big := strings.Repeat(`[{"type":"thinking","thinking":`, 1000) + `"` + strings.Repeat("x", 3<<20) + `"` + strings.Repeat(`}]`, 1000)
-	var before, after runtime.MemStats
-	runtime.ReadMemStats(&before)
-	start = time.Now()
-	if _, err := parseOpenAIResponse([]byte(`{"choices":[{"message":{"content":` + big + `},"finish_reason":"stop"}]}`)); err != nil {
-		t.Fatal(err)
-	}
-	runtime.ReadMemStats(&after)
-	if d, alloc := time.Since(start), after.TotalAlloc-before.TotalAlloc; d > 5*time.Second || alloc > 256<<20 {
-		t.Fatalf("3 MiB body nested 1000 deep: %v, %d MiB allocated", d, alloc>>20)
+	// Wide and deep: a 3 MiB body nested 1000 levels.
+	if n := allocated(func() {
+		if _, err := parseOpenAIResponse([]byte(`{"choices":[{"message":{"content":` + nest(1000, strings.Repeat("x", 3<<20)) + `},"finish_reason":"stop"}]}`)); err != nil {
+			t.Fatal(err)
+		}
+	}); n > 256<<20 {
+		t.Fatalf("3 MiB body nested 1000 deep allocated %d MiB", n>>20)
 	}
 	// One level (the documented Mistral shape) still folds.
 	res, err := parseOpenAIResponse([]byte(`{"choices":[{"message":{"content":[{"type":"thinking","thinking":[{"type":"text","text":"plan"},{"type":"thinking","thinking":"deeper"}]},{"type":"text","text":"x"}]},"finish_reason":"stop"}]}`))
@@ -921,26 +919,31 @@ func TestReview_EmptyUnlabelledBodyTeachesNothing(t *testing.T) {
 }
 
 // Every line ending costs the same: a stream of bare-CR terminators must not
-// rescan the whole read buffer per line (it was ~170x slower than LF).
+// rescan the whole read buffer per line.
 func TestReview_SSEBareCRIsNotQuadratic(t *testing.T) {
-	const n = 2 << 20
+	const n = 512 << 10
 	read := func(term string) time.Duration {
-		lr := &sseLineReader{br: newSSEReader(strings.NewReader(strings.Repeat(term, n)))}
-		start := time.Now()
-		lines := 0
-		for {
-			if _, err := lr.readSSELine(); err != nil {
-				break
+		best := time.Duration(1 << 62)
+		for range 3 { // best of three: a ratio of minimums shrugs off load spikes
+			lr := &sseLineReader{br: newSSEReader(strings.NewReader(strings.Repeat(term, n)))}
+			start := time.Now()
+			lines := 0
+			for {
+				if _, err := lr.readSSELine(); err != nil {
+					break
+				}
+				lines++
 			}
-			lines++
+			if lines != n {
+				t.Fatalf("%q: %d lines, want %d", term, lines, n)
+			}
+			best = min(best, time.Since(start))
 		}
-		if lines != n {
-			t.Fatalf("%q: %d lines, want %d", term, lines, n)
-		}
-		return time.Since(start)
+		return best
 	}
-	lf, cr := read("\n"), read("\r")
-	if cr > 20*lf+100*time.Millisecond {
+	// Rescanning the buffer per line made CR 3x slower than LF under the race
+	// detector and ~30x without it; the two now cost the same.
+	if lf, cr := read("\n"), read("\r"); cr > 2*lf+50*time.Millisecond {
 		t.Fatalf("bare CR took %v against %v for LF", cr, lf)
 	}
 	// A far LF behind many CRs is found once, not once per line.
@@ -953,4 +956,105 @@ func TestReview_SSEBareCRIsNotQuadratic(t *testing.T) {
 	if line, err := lr.readSSELine(); err != nil || string(line) != "x" {
 		t.Fatalf("after the CR run (CR LF pair skipped): %q %v", line, err)
 	}
+}
+
+// ── Panel review: per-call lookups stay constant-time ────────────────────
+
+// reviewScaling runs fn at size n and 4n and fails when the larger run costs
+// more than a linear algorithm could (4x, with 2x headroom plus a constant):
+// a quadratic one costs 16x. A ratio does not move with machine load the way
+// an absolute bound does.
+func reviewScaling(t *testing.T, name string, n int, fn func(n int)) {
+	t.Helper()
+	timed := func(n int) time.Duration {
+		best := time.Duration(1 << 62)
+		for range 2 {
+			start := time.Now()
+			fn(n)
+			best = min(best, time.Since(start))
+		}
+		return best
+	}
+	if small, large := timed(n), timed(4*n); large > 8*small+100*time.Millisecond {
+		t.Fatalf("%s: %d items took %v, %d items took %v (super-linear)", name, n, small, 4*n, large)
+	}
+}
+
+// One terminal Responses event may list any number of function calls: each
+// is resolved without rescanning the calls already known.
+func TestReview_ResponsesBackfillScalesLinearly(t *testing.T) {
+	event := func(n int, id func(i int) string) []byte {
+		var b strings.Builder
+		b.WriteString(`{"type":"response.completed","response":{"status":"completed","output":[`)
+		for i := 0; i < n; i++ {
+			if i > 0 {
+				b.WriteByte(',')
+			}
+			fmt.Fprintf(&b, `{"type":"function_call","call_id":%q,"name":"f","arguments":"{}"}`, id(i))
+		}
+		b.WriteString(`]}}`)
+		return []byte(b.String())
+	}
+	distinct := func(i int) string { return fmt.Sprintf("c%d", i) }
+	reviewScaling(t, "distinct call ids", 10_000, func(n int) {
+		acc := newStreamAccum()
+		if _, _, err := mapResponsesStreamEvent(event(n, distinct), acc); err != nil {
+			t.Fatal(err)
+		}
+		if len(acc.calls) != n {
+			t.Fatalf("%d calls, want %d", len(acc.calls), n)
+		}
+	})
+	// Every final item collides with a different identified call at its index.
+	reviewScaling(t, "colliding indices", 10_000, func(n int) {
+		acc := newStreamAccum()
+		for i := 0; i < n; i++ {
+			acc.setCallID(acc.call(i), fmt.Sprintf("s%d", i))
+		}
+		if _, _, err := mapResponsesStreamEvent(event(n, distinct), acc); err != nil {
+			t.Fatal(err)
+		}
+		if len(acc.calls) != 2*n {
+			t.Fatalf("%d calls, want %d", len(acc.calls), 2*n)
+		}
+	})
+
+	// The id index follows a call whose id changes after it was announced.
+	acc := newStreamAccum()
+	for _, ev := range []string{
+		`{"type":"response.output_item.added","output_index":0,"item":{"type":"function_call","call_id":"tmp","name":"f","arguments":""}}`,
+		`{"type":"response.output_item.added","output_index":0,"item":{"type":"function_call","call_id":"c1","name":"f","arguments":""}}`,
+		`{"type":"response.output_item.done","output_index":5,"item":{"type":"function_call","call_id":"c1","name":"f","arguments":"{\"x\":1}"}}`,
+		`{"type":"response.completed","response":{"status":"completed","output":[{"type":"function_call","call_id":"c1","name":"f","arguments":"{\"x\":1}"}]}}`,
+	} {
+		if _, _, err := mapResponsesStreamEvent([]byte(ev), acc); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if r := acc.result(); len(r.ToolCalls) != 1 || r.ToolCalls[0] != (ToolCall{ID: "c1", Name: "f", Arguments: `{"x":1}`}) {
+		t.Fatalf("re-identified call: %+v", r.ToolCalls)
+	}
+}
+
+// Index-less chat-completions tool-call deltas with new ids each start a
+// call; finding the next free key must not rescan every call so far.
+func TestReview_OpenAIIndexlessToolCallsScaleLinearly(t *testing.T) {
+	reviewScaling(t, "index-less tool calls", 10_000, func(n int) {
+		var b strings.Builder
+		b.WriteString(`{"choices":[{"delta":{"tool_calls":[`)
+		for i := 0; i < n; i++ {
+			if i > 0 {
+				b.WriteByte(',')
+			}
+			fmt.Fprintf(&b, `{"id":"c%d","function":{"name":"f","arguments":"{}"}}`, i)
+		}
+		b.WriteString(`]}}]}`)
+		acc := newStreamAccum()
+		if _, _, err := mapOpenAIStreamEvent([]byte(b.String()), acc); err != nil {
+			t.Fatal(err)
+		}
+		if len(acc.calls) != n || acc.calls[n-1].id != fmt.Sprintf("c%d", n-1) || acc.calls[n-1].pos != n-1 {
+			t.Fatalf("%d calls, last %+v", len(acc.calls), acc.calls[len(acc.calls)-1])
+		}
+	})
 }
