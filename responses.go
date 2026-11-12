@@ -49,7 +49,7 @@ func responsesContent(m Message) any {
 	for _, p := range m.Parts {
 		switch p.Type {
 		case ContentPartImage:
-			parts = append(parts, rsInputContentPart{Type: "input_image", ImageURL: "data:" + wireMIME(p.MIMEType) + ";base64," + base64.StdEncoding.EncodeToString(p.Image)})
+			parts = append(parts, rsInputContentPart{Type: "input_image", ImageURL: "data:" + canonMIME(p.MIMEType) + ";base64," + base64.StdEncoding.EncodeToString(p.Image)})
 		case ContentPartImageURL:
 			parts = append(parts, rsInputContentPart{Type: "input_image", ImageURL: p.URL})
 		case ContentPartDocument:
@@ -488,6 +488,55 @@ func addResponsesReasoning(acc *streamAccum, idx int, item *rsOutputItem) {
 	}
 }
 
+// backfillResponsesCall completes a function call from its finished item.
+// The deltas normally carry everything; a gateway that delivers the call
+// only on the terminal item must not leave it with empty arguments. Nothing
+// already streamed is ever emitted twice.
+func backfillResponsesCall(acc *streamAccum, idx int, item *rsOutputItem, deltas []Delta) []Delta {
+	call := acc.call(idx)
+	if call.id == "" {
+		call.id = item.CallID
+	}
+	if call.name == "" {
+		call.name = item.Name
+	}
+	if call.args.Len() > 0 || item.Arguments == "" {
+		return deltas
+	}
+	call.args.WriteString(item.Arguments)
+	return append(deltas, Delta{Kind: DeltaToolArgs, Text: item.Arguments, ToolIndex: call.pos, ToolID: call.id, ToolName: call.name})
+}
+
+// backfillResponsesOutput reconciles the accumulator with the final
+// response's output array: whatever was not streamed as deltas (reasoning
+// items, function calls, the answer text, a refusal) is taken from it.
+func backfillResponsesOutput(acc *streamAccum, output []rsOutputItem, deltas []Delta) []Delta {
+	noReasoning, noContent, noRefusal := len(acc.thinking) == 0, acc.content.Len() == 0, acc.refusal.Len() == 0
+	for i := range output {
+		item := &output[i]
+		switch item.Type {
+		case "reasoning":
+			if noReasoning {
+				addResponsesReasoning(acc, i, item)
+			}
+		case "function_call":
+			deltas = backfillResponsesCall(acc, i, item, deltas)
+		case "message":
+			for _, p := range item.Content {
+				if noContent && p.Type == "output_text" && p.Text != "" {
+					acc.content.WriteString(p.Text)
+					deltas = append(deltas, Delta{Kind: DeltaContent, Text: p.Text})
+				}
+				if noRefusal && p.Type == "refusal" && p.Refusal != "" {
+					acc.refusal.WriteString(p.Refusal)
+					deltas = append(deltas, Delta{Kind: DeltaRefusal, Text: p.Refusal})
+				}
+			}
+		}
+	}
+	return deltas
+}
+
 func mapResponsesStreamEvent(data []byte, acc *streamAccum) (deltas []Delta, done bool, err error) {
 	var ev rsStreamEvent
 	if err := json.Unmarshal(data, &ev); err != nil {
@@ -533,8 +582,13 @@ func mapResponsesStreamEvent(data []byte, acc *streamAccum) (deltas []Delta, don
 			}
 		}
 	case "response.output_item.done":
-		if ev.Item != nil && ev.Item.Type == "reasoning" {
-			addResponsesReasoning(acc, ev.OutputIndex, ev.Item)
+		if ev.Item != nil {
+			switch ev.Item.Type {
+			case "reasoning":
+				addResponsesReasoning(acc, ev.OutputIndex, ev.Item)
+			case "function_call":
+				deltas = backfillResponsesCall(acc, ev.OutputIndex, ev.Item, deltas)
+			}
 		}
 	case "response.completed", "response.incomplete":
 		acc.sawFinish = true
@@ -542,17 +596,9 @@ func mapResponsesStreamEvent(data []byte, acc *streamAccum) (deltas []Delta, don
 			if ev.Response.Usage != nil {
 				acc.usage = usageFromResponses(ev.Response.Usage)
 			}
+			deltas = backfillResponsesOutput(acc, ev.Response.Output, deltas)
 			hasTools := len(acc.calls) > 0
 			acc.finishReason = responsesFinishReason(ev.Response, hasTools)
-			if len(acc.thinking) == 0 {
-				// Items not announced via output_item.done: take them from
-				// the final response.
-				for i := range ev.Response.Output {
-					if item := &ev.Response.Output[i]; item.Type == "reasoning" {
-						addResponsesReasoning(acc, i, item)
-					}
-				}
-			}
 		} else if acc.finishReason == "" {
 			if len(acc.calls) > 0 {
 				acc.finishReason = FinishToolCalls

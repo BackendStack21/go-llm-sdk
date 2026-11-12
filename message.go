@@ -147,9 +147,10 @@ type Message struct {
 	// tool_result is_error; Gemini functionResponse {"error": …}). OpenAI
 	// formats have no flag: describe the failure in Content.
 	IsError bool
-	// Cache marks this user message for Anthropic prompt caching
-	// (cache_control ephemeral on the text block). Ignored on other
-	// formats and on non-user roles.
+	// Cache marks this user message for Anthropic prompt caching: the
+	// conversation up to and including this message becomes a cached prefix
+	// (cache_control ephemeral on the message's last content block, whatever
+	// its type). Ignored on other formats and on non-user roles.
 	Cache bool
 }
 
@@ -260,7 +261,9 @@ type ResponseFormat struct {
 // OpenAI Responses API has none, so it is not sent on requests diverted
 // there).
 type ChatRequest struct {
-	// Headers are per-request HTTP headers (stub; behaviour lands with SL03).
+	// Headers are per-request HTTP headers, applied after the provider's own
+	// (an empty value removes that header). Authentication and framing
+	// headers are reserved: setting one is a ConfigError.
 	Headers        map[string]string
 	Model          string
 	Messages       []Message

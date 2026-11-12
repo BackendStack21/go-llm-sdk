@@ -1,9 +1,12 @@
 package llm
 
 import (
+	"bytes"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"math"
+	"strconv"
 	"strings"
 )
 
@@ -74,7 +77,7 @@ func openAIContent(m Message) []oaContentPart {
 	for _, p := range m.Parts {
 		switch p.Type {
 		case ContentPartImage:
-			parts = append(parts, oaContentPart{Type: "image_url", ImageURL: &oaImageURL{URL: "data:" + wireMIME(p.MIMEType) + ";base64," + base64.StdEncoding.EncodeToString(p.Image)}})
+			parts = append(parts, oaContentPart{Type: "image_url", ImageURL: &oaImageURL{URL: "data:" + canonMIME(p.MIMEType) + ";base64," + base64.StdEncoding.EncodeToString(p.Image)}})
 		case ContentPartImageURL:
 			parts = append(parts, oaContentPart{Type: "image_url", ImageURL: &oaImageURL{URL: p.URL}})
 		case ContentPartDocument:
@@ -333,9 +336,111 @@ type oaRespToolCall struct {
 	ID       string `json:"id"`
 	Type     string `json:"type"`
 	Function struct {
-		Name      string `json:"name"`
-		Arguments string `json:"arguments"`
+		Name      string     `json:"name"`
+		Arguments oaFlexArgs `json:"arguments"`
 	} `json:"function"`
+}
+
+// oaFlexArgs decodes function-call arguments tolerantly. The contract is a
+// JSON string holding the arguments object, but some gateways send the
+// object itself: its JSON text is kept as is. Null (and any other shape)
+// decodes to "".
+type oaFlexArgs string
+
+func (a *oaFlexArgs) UnmarshalJSON(b []byte) error {
+	switch {
+	case len(b) > 0 && b[0] == '"':
+		return (*oaFlexString)(a).UnmarshalJSON(b)
+	case len(b) > 0 && b[0] == '{':
+		*a = oaFlexArgs(b)
+	default:
+		*a = ""
+	}
+	return nil
+}
+
+// oaFlexContent decodes assistant content tolerantly: a string (the
+// contract), or an array of typed chunks as Mistral and some gateways send
+// it — text chunks concatenate into Text, thinking chunks into Reasoning.
+// Null and unknown shapes or chunk types are skipped, never fatal: a shape
+// quirk must not discard a generation that was already produced.
+type oaFlexContent struct {
+	Text      string
+	Reasoning string
+}
+
+// oaContentChunk is one element of array-shaped content. Thinking is a
+// string or a nested chunk array ({"type":"thinking","thinking":[{"type":
+// "text","text":…}]}).
+type oaContentChunk struct {
+	Type     string          `json:"type"`
+	Text     string          `json:"text"`
+	Thinking json.RawMessage `json:"thinking"`
+}
+
+func (c *oaFlexContent) UnmarshalJSON(b []byte) error {
+	*c = oaFlexContent{}
+	switch {
+	case len(b) > 0 && b[0] == '"':
+		return json.Unmarshal(b, &c.Text)
+	case len(b) > 0 && b[0] == '[':
+		var text, reasoning strings.Builder
+		foldContentChunks(b, &text, &reasoning)
+		c.Text, c.Reasoning = text.String(), reasoning.String()
+	}
+	return nil
+}
+
+// foldContentChunks appends the text of a chunk array to text and the text
+// of its thinking chunks to reasoning. Undecodable chunks contribute nothing.
+func foldContentChunks(raw []byte, text, reasoning *strings.Builder) {
+	var chunks []json.RawMessage
+	_ = json.Unmarshal(raw, &chunks) // raw is an already-validated JSON array
+	for _, rc := range chunks {
+		var ch oaContentChunk
+		if json.Unmarshal(rc, &ch) != nil {
+			continue
+		}
+		switch ch.Type {
+		case "text", "output_text":
+			text.WriteString(ch.Text)
+		case "thinking":
+			switch t := bytes.TrimSpace(ch.Thinking); {
+			case len(t) > 0 && t[0] == '"':
+				var s string
+				if json.Unmarshal(t, &s) == nil {
+					reasoning.WriteString(s)
+				}
+			case len(t) > 0 && t[0] == '[':
+				// Nested chunks: only their text is reasoning prose.
+				var ignored strings.Builder
+				foldContentChunks(t, reasoning, &ignored)
+			}
+		}
+	}
+}
+
+// oaInt decodes a token count tolerantly: an integer (the contract), a
+// float or a numeric string as some gateways send it. Anything else —
+// including negative and out-of-range values — decodes to 0 (unknown).
+type oaInt int
+
+func (n *oaInt) UnmarshalJSON(b []byte) error {
+	*n = 0
+	s := string(b)
+	if len(s) >= 2 && s[0] == '"' {
+		s = s[1 : len(s)-1]
+	}
+	if v, err := strconv.Atoi(s); err == nil {
+		if v > 0 {
+			*n = oaInt(v)
+		}
+		return nil
+	}
+	if f, err := strconv.ParseFloat(s, 64); err == nil && f > 0 && f <= math.MaxInt32 {
+		*n = oaInt(f)
+	}
+	return nil
 }
 
 // oaFlexString decodes a JSON string tolerantly. Gateways in the wild send
@@ -359,8 +464,8 @@ func (s *oaFlexString) UnmarshalJSON(b []byte) error {
 
 type oaRespMessage struct {
 	Role             string              `json:"role"`
-	Content          string              `json:"content"`
-	Refusal          string              `json:"refusal"`
+	Content          oaFlexContent       `json:"content"`
+	Refusal          oaFlexString        `json:"refusal"`
 	ReasoningContent oaFlexString        `json:"reasoning_content"`
 	Reasoning        oaFlexString        `json:"reasoning"`
 	ReasoningDetails []oaReasoningDetail `json:"reasoning_details"`
@@ -379,8 +484,9 @@ type oaReasoningDetail struct {
 // foldReasoning reconciles the documented OpenAI-format reasoning response
 // shapes into one string: reasoning_content (LiteLLM standardized) wins, then
 // the reasoning string alias, then the reasoning_details fold in array order
-// (reasoning.text → text, reasoning.summary → summary, encrypted skipped).
-func foldReasoning(content, reasoning string, details []oaReasoningDetail) string {
+// (reasoning.text → text, reasoning.summary → summary, encrypted skipped),
+// then typed thinking chunks inside array-shaped content (Mistral).
+func foldReasoning(content, reasoning string, details []oaReasoningDetail, chunks string) string {
 	if content != "" {
 		return content
 	}
@@ -401,7 +507,10 @@ func foldReasoning(content, reasoning string, details []oaReasoningDetail) strin
 		}
 		b.WriteString(part)
 	}
-	return b.String()
+	if b.Len() > 0 {
+		return b.String()
+	}
+	return chunks
 }
 
 type oaRespChoice struct {
@@ -427,6 +536,52 @@ type oaRespUsage struct {
 	PromptCacheHitTokens    int              `json:"prompt_cache_hit_tokens"`
 	PromptCacheMissTokens   int              `json:"prompt_cache_miss_tokens"`
 	TopCachedTokens         int              `json:"cached_tokens"` // Moonshot/Kimi: top-level, subset of prompt_tokens
+}
+
+// UnmarshalJSON decodes usage tolerantly (see oaInt): a malformed usage
+// object yields zero counts instead of failing the response it rides on.
+func (u *oaRespUsage) UnmarshalJSON(b []byte) error {
+	type details struct {
+		ReasoningTokens oaInt `json:"reasoning_tokens"`
+		CachedTokens    oaInt `json:"cached_tokens"`
+	}
+	var w struct {
+		PromptTokens            oaInt           `json:"prompt_tokens"`
+		CompletionTokens        oaInt           `json:"completion_tokens"`
+		CompletionTokensDetails json.RawMessage `json:"completion_tokens_details"`
+		CacheCreationTokens     oaInt           `json:"cache_creation_input_tokens"`
+		CacheReadTokens         oaInt           `json:"cache_read_input_tokens"`
+		PromptTokensDetails     json.RawMessage `json:"prompt_tokens_details"`
+		PromptCacheHitTokens    oaInt           `json:"prompt_cache_hit_tokens"`
+		PromptCacheMissTokens   oaInt           `json:"prompt_cache_miss_tokens"`
+		TopCachedTokens         oaInt           `json:"cached_tokens"`
+	}
+	*u = oaRespUsage{}
+	if json.Unmarshal(b, &w) != nil {
+		return nil
+	}
+	*u = oaRespUsage{
+		PromptTokens:          int(w.PromptTokens),
+		CompletionTokens:      int(w.CompletionTokens),
+		CacheCreationTokens:   int(w.CacheCreationTokens),
+		CacheReadTokens:       int(w.CacheReadTokens),
+		PromptCacheHitTokens:  int(w.PromptCacheHitTokens),
+		PromptCacheMissTokens: int(w.PromptCacheMissTokens),
+		TopCachedTokens:       int(w.TopCachedTokens),
+	}
+	var d details
+	if json.Unmarshal(w.CompletionTokensDetails, &d) == nil {
+		u.CompletionTokensDetails.ReasoningTokens = int(d.ReasoningTokens)
+	}
+	// A details object (not null, not another shape) means caching was
+	// reported, even at zero.
+	if t := bytes.TrimSpace(w.PromptTokensDetails); len(t) > 0 && t[0] == '{' {
+		d = details{}
+		if json.Unmarshal(t, &d) == nil {
+			u.PromptTokensDetails = &oaPromptDetails{CachedTokens: int(d.CachedTokens)}
+		}
+	}
+	return nil
 }
 
 // usageFromOpenAI maps a chat-completions usage object onto canonical
@@ -498,6 +653,26 @@ type oaErrorBody struct {
 	Message string `json:"message"`
 	Type    string `json:"type"`
 	Code    any    `json:"code"`
+	// bare marks an "error" that was a JSON string rather than an object
+	// (Message holds it): only an error when nothing else was returned.
+	bare bool
+}
+
+// UnmarshalJSON tolerates a non-object "error" value: "", false, 0 and null
+// are not provider errors and must not fail an otherwise-good response; a
+// non-empty string is kept as the message.
+func (e *oaErrorBody) UnmarshalJSON(b []byte) error {
+	*e = oaErrorBody{}
+	b = bytes.TrimSpace(b)
+	switch {
+	case len(b) > 0 && b[0] == '{':
+		type plain oaErrorBody
+		return json.Unmarshal(b, (*plain)(e))
+	case len(b) > 0 && b[0] == '"':
+		e.bare = true
+		return json.Unmarshal(b, &e.Message)
+	}
+	return nil
 }
 
 // mapOpenAIFinishReason maps OpenAI finish_reason to canonical values.
@@ -525,7 +700,7 @@ func parseOpenAIResponse(body []byte) (*ChatResult, error) {
 	if err := json.Unmarshal(body, &r); err != nil {
 		return nil, fmt.Errorf("llm: parse response: %w", err)
 	}
-	if r.Error != nil && r.Error.Message != "" {
+	if r.Error != nil && r.Error.Message != "" && (!r.Error.bare || len(r.Choices) == 0) {
 		return nil, fmt.Errorf("llm: provider error: %s", r.Error.Message)
 	}
 	if len(r.Choices) == 0 {
@@ -533,14 +708,14 @@ func parseOpenAIResponse(body []byte) (*ChatResult, error) {
 	}
 	ch := r.Choices[0]
 	res := &ChatResult{
-		Content:          ch.Message.Content,
-		ReasoningContent: foldReasoning(string(ch.Message.ReasoningContent), string(ch.Message.Reasoning), ch.Message.ReasoningDetails),
+		Content:          ch.Message.Content.Text,
+		ReasoningContent: foldReasoning(string(ch.Message.ReasoningContent), string(ch.Message.Reasoning), ch.Message.ReasoningDetails, ch.Message.Content.Reasoning),
 		FinishReason:     mapOpenAIFinishReason(ch.FinishReason),
-		Refusal:          ch.Message.Refusal,
+		Refusal:          string(ch.Message.Refusal),
 		Meta:             ResponseMeta{ID: r.ID, Model: r.Model},
 	}
 	for _, tc := range ch.Message.ToolCalls {
-		args := tc.Function.Arguments
+		args := string(tc.Function.Arguments)
 		if args == "" {
 			args = "{}"
 		}
@@ -564,8 +739,8 @@ func parseOpenAIResponse(body []byte) (*ChatResult, error) {
 // ── streaming ────────────────────────────────────────────────────────────
 
 type oaStreamDelta struct {
-	Content          string              `json:"content"`
-	Refusal          string              `json:"refusal"`
+	Content          oaFlexContent       `json:"content"`
+	Refusal          oaFlexString        `json:"refusal"`
 	ReasoningContent oaFlexString        `json:"reasoning_content"`
 	Reasoning        oaFlexString        `json:"reasoning"`
 	ReasoningDetails []oaReasoningDetail `json:"reasoning_details"`
@@ -576,8 +751,8 @@ type oaStreamToolCall struct {
 	Index    *int   `json:"index"` // OpenAI sends it; default 0 when absent
 	ID       string `json:"id"`
 	Function struct {
-		Name      string `json:"name"`
-		Arguments string `json:"arguments"`
+		Name      string     `json:"name"`
+		Arguments oaFlexArgs `json:"arguments"`
 	} `json:"function"`
 }
 
@@ -610,17 +785,17 @@ func mapOpenAIStreamEvent(data []byte, acc *streamAccum) (deltas []Delta, done b
 	}
 	for _, ch := range c.Choices {
 		d := ch.Delta
-		if r := foldReasoning(string(d.ReasoningContent), string(d.Reasoning), d.ReasoningDetails); r != "" {
+		if r := foldReasoning(string(d.ReasoningContent), string(d.Reasoning), d.ReasoningDetails, d.Content.Reasoning); r != "" {
 			acc.reasoning.WriteString(r)
 			deltas = append(deltas, Delta{Kind: DeltaReasoning, Text: r})
 		}
-		if d.Content != "" {
-			acc.content.WriteString(d.Content)
-			deltas = append(deltas, Delta{Kind: DeltaContent, Text: d.Content})
+		if text := d.Content.Text; text != "" {
+			acc.content.WriteString(text)
+			deltas = append(deltas, Delta{Kind: DeltaContent, Text: text})
 		}
-		if d.Refusal != "" {
-			acc.refusal.WriteString(d.Refusal)
-			deltas = append(deltas, Delta{Kind: DeltaRefusal, Text: d.Refusal})
+		if refusal := string(d.Refusal); refusal != "" {
+			acc.refusal.WriteString(refusal)
+			deltas = append(deltas, Delta{Kind: DeltaRefusal, Text: refusal})
 		}
 		for _, tc := range d.ToolCalls {
 			idx := acc.openAIToolKey(tc.Index, tc.ID)
@@ -631,9 +806,9 @@ func mapOpenAIStreamEvent(data []byte, acc *streamAccum) (deltas []Delta, done b
 			if tc.Function.Name != "" {
 				call.name = tc.Function.Name
 			}
-			accDelta := Delta{Kind: DeltaToolArgs, Text: tc.Function.Arguments, ToolIndex: call.pos, ToolID: call.id, ToolName: call.name}
-			call.args.WriteString(tc.Function.Arguments)
-			deltas = append(deltas, accDelta)
+			args := string(tc.Function.Arguments)
+			call.args.WriteString(args)
+			deltas = append(deltas, Delta{Kind: DeltaToolArgs, Text: args, ToolIndex: call.pos, ToolID: call.id, ToolName: call.name})
 		}
 		if ch.FinishReason != "" {
 			acc.finishReason = mapOpenAIFinishReason(ch.FinishReason)

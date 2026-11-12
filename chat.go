@@ -356,13 +356,11 @@ func (pc *providerClient) httpError(status int, body []byte) *APIError {
 	default:
 		// OpenAI's canonical envelope nests the error object; some
 		// gateways send the fields top-level. Try nested first.
+		// The nested value may also be a bare string ({"error":"…"}).
 		var nested struct {
-			Error struct {
-				Message string `json:"message"`
-				Code    any    `json:"code"`
-			} `json:"error"`
+			Error *oaErrorBody `json:"error"`
 		}
-		if json.Unmarshal(body, &nested) == nil && nested.Error.Message != "" {
+		if json.Unmarshal(body, &nested) == nil && nested.Error != nil && nested.Error.Message != "" {
 			msg = nested.Error.Message
 			if s, ok := nested.Error.Code.(string); ok {
 				code = s
@@ -679,6 +677,11 @@ func (pc *providerClient) callStream(ctx context.Context, req *ChatRequest, mode
 		case out.apiErr != nil:
 			pc.emitAttempt(deadlineCtx, out.apiErr, 0)
 			return nil, out.apiErr
+		case out.err != nil && permanentError(out.err):
+			// Retrying cannot help (unbuildable request, certificate that
+			// does not verify): fail fast instead of backing off.
+			pc.emitAttempt(deadlineCtx, out.err, 0)
+			return nil, out.err
 		case out.err != nil && attempt < n-1:
 			lastErr = out.err
 			d := pc.retryDelay(0, attempt)
@@ -758,11 +761,15 @@ func (pc *providerClient) attemptStream(ctx context.Context, url string, body []
 		}
 	}
 
-	if ct := resp.Header.Get("Content-Type"); !strings.Contains(ct, "text/event-stream") {
+	// The Content-Type decides, case-insensitively; when a gateway drops or
+	// mislabels it, the body's own framing does (SSE can never be mistaken for
+	// a JSON document, nor the reverse).
+	rd := newSSEReader(resp.Body)
+	if !isEventStream(resp.Header.Get("Content-Type")) && !sniffSSE(rd) {
 		// Learn buffered mode for later requests, but consume this generation
 		// now: discarding it would lose notes and tool calls, and bill twice.
 		pc.engageLearn(&pc.learn.forceBuffered, LearnBuffered, nil)
-		data, err := io.ReadAll(io.LimitReader(resp.Body, maxResponseSize+1))
+		data, err := io.ReadAll(io.LimitReader(rd, maxResponseSize+1))
 		if err != nil {
 			return streamOutcome{bufferedResponse: true, err: err}
 		}
@@ -776,7 +783,7 @@ func (pc *providerClient) attemptStream(ctx context.Context, url string, body []
 
 	acc := newStreamAccum()
 	acc.jsonTool = jsonTool
-	perr := pumpSSE(ctx, resp.Body, pc.idleTimeout(), func(data []byte) error {
+	perr := pumpSSE(ctx, rd, pc.idleTimeout(), func(data []byte) error {
 		if string(bytes.TrimSpace(data)) == "[DONE]" {
 			return errStreamStop
 		}
@@ -973,6 +980,15 @@ func (a *streamAccum) result() *ChatResult {
 		res.ToolCalls = append(res.ToolCalls, ToolCall{ID: c.id, Name: c.name, Arguments: args, Signature: c.sig})
 	}
 	return res
+}
+
+// toolArgsJSON is a provider's tool input as the canonical arguments string:
+// absent or null input is an empty object on every format.
+func toolArgsJSON(raw json.RawMessage) string {
+	if t := bytes.TrimSpace(raw); len(t) == 0 || string(t) == "null" {
+		return "{}"
+	}
+	return string(raw)
 }
 
 // refusalFinish maps a refusal that finished "stop" (or unmapped) to

@@ -17,7 +17,7 @@ go test -tags e2e -run 'TestE2E' -timeout 15m -v .   # LIVE provider e2e (see be
 ```
 
 - Always run tests with `-count=1` and an explicit `-timeout` (house rule: no unbounded runs).
-- Coverage sits at ~99.0% of statements (unit suite). The residual is documented unreachable defensive code — do not pad with fake tests to move the number.
+- Coverage sits at ~98.6% of statements (unit suite). The residual is documented unreachable defensive code — do not pad with fake tests to move the number.
 
 ## Architecture (flat package)
 
@@ -37,11 +37,11 @@ go test -tags e2e -run 'TestE2E' -timeout 15m -v .   # LIVE provider e2e (see be
 | `count.go` | `ChatClient.CountTokens`: Anthropic `/v1/messages/count_tokens` + Gemini `:countTokens` through the shared ladder (op `count_tokens`); OpenAI-format/Responses -> `UnsupportedError` (`ErrUnsupported`), no I/O, never an estimate |
 | `embed.go` | Embeddings: `Embed`/`EmbedRequest`/`EmbedResult` — OpenAI-compat `/embeddings` (requests `encoding_format: base64`, decodes float32 LE, accepts float arrays) + Gemini `batchEmbedContents` |
 | `stt.go` | Speech-to-text: `Transcribe`/`TranscribeRequest`/`TranscribeResult` — OpenAI-compat `/audio/transcriptions` (multipart), 25MB input cap |
-| `sse.go` | SSE parser (abort-safe via `done` channel) + idle-watchdog pump |
+| `sse.go` | SSE parser (abort-safe via `done` channel; chunk-scanning line reader that hands lines out in place — a line is valid only until the next read) + idle-watchdog pump; `isEventStream` / `sniffSSE` decide whether a 2xx body is a stream |
 | `retry.go` | `RetryPolicy` + the single buffered ladder `withRetry` (chat, tts, stt, embed); backoff/jitter/`Retry-After`/`retrySleep` (default 8 attempts, cap 30s) |
 | `provider.go` | Built-in registry, quirks flags, config validation |
 | `models.go` | `ListModels` orchestration (shared `withRetryN` ladder: `WithRetryPolicy` attempts, default 3, Retry-After, request-timeout budget; deep-copied cache, empty lists cached) |
-| `auth.go`, `transport.go`, `errors.go` | Env resolution, pooled HTTP clients, typed errors |
+| `auth.go`, `transport.go`, `errors.go` | Env resolution, pooled HTTP clients (TLS handshake timeout, HTTP/2 health pings), typed errors |
 
 The canonical type system is OpenAI-shaped; `gemini.go`/`anthropic.go` translate both directions. Provider quirks are **explicit registry flags** — never URL sniffing.
 
@@ -51,7 +51,8 @@ The canonical type system is OpenAI-shaped; `gemini.go`/`anthropic.go` translate
    Refusal text surfaces in `ChatResult.Refusal` / `DeltaRefusal` (never in `Content`); a refusal on `stop`/unmapped finishes `content_filter`.
 2. **API keys never appear** in error text, `String()`, or any typed error.
 3. **Streaming**: retries only before the first emitted delta; a failure after partial output returns the partial `*ChatResult` + wrapped error and is **never retried**; a premature close (no completion signal — on every format, Gemini included; an unmapped finish reason still counts as one) is an error, never a silent empty or partial success; the parser goroutine is always released (abort-safe `done` protocol).
-   A successful non-SSE response is parsed directly with the usual body cap and format mapper. It learns buffered mode for future requests, but never discards the current generation or makes a replacement request; parse/read errors remain terminal for that response.
+   A 2xx body is a stream when its `Content-Type` is `text/event-stream` (case-insensitive) or, failing that, when the body itself is SSE framing (`sniffSSE`: a comment or field line can never begin a JSON document). A successful non-SSE response is parsed directly with the usual body cap and format mapper. It learns buffered mode for future requests, but never discards the current generation or makes a replacement request; parse/read errors remain terminal for that response.
+   On the Responses API, items a gateway delivers only on terminal events (`output_item.done` / `response.completed`) are backfilled once and never re-emitted when deltas already carried them.
 4. **Unknown message roles are rejected** at the SDK boundary (`ConfigError`) — never dropped or reinterpreted per format.
 5. **Unknown provider data stays unknown** (zero values) — no static guesses, no fallback model tables.
 6. **Learn-once fallback state is per-`Provider`**, monotonic, atomic, shared by every `ChatClient` — never move it back to per-client.
@@ -61,6 +62,9 @@ The canonical type system is OpenAI-shaped; `gemini.go`/`anthropic.go` translate
 10. **The request timeout is a whole-call budget**, retries included, on every entry point (buffered, streaming, speech, transcription, embeddings).
 11. **Meta fields are provider-reported or zero, never guessed**; headers come from the successful attempt only. Attempt-observer panics are recovered and discarded; events never contain the API key.
 12. **Anthropic JSON mode is native `output_config.format`** unless the explicit registry quirk `Quirks.AnthropicToolJSON` is on (off for the built-in provider, set via `WithQuirks`); the quirk restores the pre-M4 forced-tool emulation byte-for-byte, including its ConfigErrors (also under any thinking mode). Never infer it from URL or model name.
+
+13. **A response-shape quirk never discards a generation.** OpenAI-format parsing is tolerant by construction (`oaFlexString`, `oaFlexContent`, `oaFlexArgs`, `oaInt`, the `oaErrorBody` / usage decoders): unknown shapes decode to zero values, never to a parse error. Keep new OpenAI-format response fields on that pattern.
+14. **Only failures a retry could fix are retried.** `permanentError` (unbuildable request, TLS certificate that does not verify) fails fast on both ladders; DNS, dial, reset and timeout errors stay retryable.
 
 ## Testing conventions
 

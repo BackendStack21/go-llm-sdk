@@ -168,8 +168,10 @@ func attachmentParts(m Message) []ContentPart {
 
 const defaultDocumentName = "document.pdf"
 
-// canonMIME is the canonical wire form of a (case-insensitive) MIME type.
-func canonMIME(m string) string { return wireMIME(strings.ToLower(m)) }
+// canonMIME is the canonical wire form of an accepted MIME type: media types
+// are case-insensitive and validation tolerates surrounding whitespace, so
+// both are normalized before the type reaches a provider.
+func canonMIME(m string) string { return wireMIME(strings.ToLower(strings.TrimSpace(m))) }
 
 func documentName(p ContentPart) string {
 	if p.Name == "" {
@@ -193,7 +195,7 @@ func validateOpenAIFormatParts(msgs []Message, responses bool) error {
 				}
 				return &ConfigError{Msg: "tool results cannot carry documents on OpenAI-format providers"}
 			}
-			if strings.ToLower(p.MIMEType) != "application/pdf" {
+			if canonMIME(p.MIMEType) != "application/pdf" {
 				return &ConfigError{Msg: fmt.Sprintf("message %d part %d: OpenAI-format documents support application/pdf only", i, j)}
 			}
 		}
