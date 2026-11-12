@@ -166,8 +166,19 @@ func TestReview_SniffSSE(t *testing.T) {
 }
 
 // undecidedSniff lists the TestReview_SniffSSE bodies that end before a
-// decisive byte: empty, whitespace only, or a truncated field name.
-var undecidedSniff = map[string]bool{"": true, "   ": true, "data": true, "dat": true}
+// decisive byte: empty, whitespace only, inside a BOM, or a truncated field name.
+var undecidedSniff = map[string]bool{"": true, "   ": true, "data": true, "dat": true, "\xef\xbb": true}
+
+// A read error that lands inside a partial BOM is returned, not swallowed.
+func TestReview_SniffSSEKeepsErrorInsideBOM(t *testing.T) {
+	boom := errors.New("socket gone")
+	for _, lead := range []string{"", "\xef", "\xef\xbb", " \n", "dat"} {
+		sse, err := sniffSSE(newSSEReader(io.MultiReader(strings.NewReader(lead), iotest.ErrReader(boom))))
+		if sse || !errors.Is(err, boom) {
+			t.Errorf("lead %q: sse=%v err=%v, want the read error", lead, sse, err)
+		}
+	}
+}
 
 // ── SSE reader ───────────────────────────────────────────────────────────
 

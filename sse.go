@@ -54,7 +54,10 @@ func sniffSSE(br *bufio.Reader) (bool, error) {
 	const maxSniff = 256
 	for n := 1; n <= maxSniff; n++ {
 		s, err := br.Peek(n)
-		if err == nil && len(s) < len(sseBOM) && strings.HasPrefix(sseBOM, string(s)) {
+		if len(s) < len(sseBOM) && strings.HasPrefix(sseBOM, string(s)) {
+			if err != nil {
+				return false, err // ended empty or inside a BOM: undecided
+			}
 			continue // possibly a partial BOM
 		}
 		s = bytes.TrimLeft(bytes.TrimPrefix(s, []byte(sseBOM)), " \t\r\n")
